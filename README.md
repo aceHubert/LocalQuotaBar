@@ -1,11 +1,12 @@
 # CodexTouchBarQuota
 
-一个 Swift/AppKit macOS 菜单栏 + Touch Bar 小应用，用本机 Codex app-server 读取 `account/rateLimits/read`，不抓网页。
+一个 Swift/AppKit macOS 菜单栏 + Touch Bar 小应用，用本机 ChatGPT.app 内置的 Codex app-server 读取 `account/rateLimits/read`，不抓网页。
 
 ## 功能
 
-- 启动本机 Codex：`/Applications/Codex.app/Contents/Resources/codex app-server --listen stdio://`
+- 启动 ChatGPT.app 内置 app-server：`/Applications/ChatGPT.app/Contents/Resources/codex app-server --listen stdio://`
 - 通过 JSONL / JSON-RPC 调用：`initialize` → `initialized` → `account/rateLimits/read`
+- 每次额度同步都从同一 RPC 响应保存可用重置次数及每张重置卡的发放、过期时间；点击“过期时间”只显示已同步数据，不再发起查询
 - 显示两行额度，窗口标题按时长自动识别：小时级（如 `5小时`）、`周限额`、`月限额`（free 账号）或 `N天`
 - 剩余额度按 `100 - usedPercent` 计算
 - 刷新时保留旧 UI，只有新数据成功返回后才替换旧数据
@@ -43,13 +44,13 @@ open /Applications/CodexTouchBarQuota.app
 
 - 系统设置 → 键盘 → Touch Bar 显示内容：选择“App 控件”或包含 App 控件的模式
 - 机器需要是带 Touch Bar 的 MacBook Pro
-- Codex 需要已登录 ChatGPT 账号，否则 app-server 可能返回空或认证错误
+- ChatGPT.app 需要已登录 ChatGPT 账号，否则 app-server 可能返回空或认证错误
 
 ## 可调整参数
 
 在 `Sources/CodexTouchBarQuota/main.swift` 中：
 
-- `CodexRateLimitClient.codexExecutablePath`：Codex 可执行文件路径
+- `CodexRateLimitClient.appServerExecutablePath`：ChatGPT.app 内置 Codex 可执行文件路径
 - `RateLimitStore.refreshInterval`：自动刷新间隔，默认 5 分钟；手动刷新按钮有 60 秒防重保护
 - `CodexRateLimitClient.requestTimeout`：单次 RPC 超时，默认 30 秒（rateLimits 读取走网络，延迟波动大）
 - `TouchBarAlertPresenter.displayDuration`：主动弹出 Touch Bar 的显示时长，默认 12 秒

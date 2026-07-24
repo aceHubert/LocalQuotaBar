@@ -52,6 +52,7 @@ struct QuotaSnapshot: Equatable, Codable {
     let fiveHour: QuotaBucket?
     let weekly: QuotaBucket?
     let resetCreditCount: Int?
+    let resetCreditCards: [ResetCreditCard]?
     let fetchedAt: Date
 
     var primaryStatusTitle: String {
@@ -63,6 +64,11 @@ struct QuotaSnapshot: Equatable, Codable {
         }
         return "Codex --%"
     }
+}
+
+struct ResetCreditCard: Equatable, Codable {
+    let issuedAt: Date?
+    let expiresAt: Date?
 }
 
 enum ReminderLevel: Int, Comparable {
@@ -242,7 +248,7 @@ final class CodexAuthManager {
         return (accounts, currentAccountId)
     }
 
-    func switchAccount(to fileName: String, now: Date = Date()) throws {
+    func switchAccount(to fileName: String) throws {
         guard isSwitchableAuthFileName(fileName) else {
             throw CodexAuthSwitchError.invalidSelection(fileName)
         }
@@ -254,13 +260,13 @@ final class CodexAuthManager {
 
         try syncCurrentAuthIfRefreshed()
 
-        let backupURL = uniqueBackupURL(now)
+        let backupURL = try currentAuthBackupURL()
         let temporaryURL = authDirectoryURL.appendingPathComponent("auth_switch_tmp_\(UUID().uuidString).json")
 
         do {
             try fileManager.copyItem(at: selectedURL, to: temporaryURL)
-            if fileManager.fileExists(atPath: authJSONURL.path) {
-                try fileManager.copyItem(at: authJSONURL, to: backupURL)
+            if let backupURL {
+                try replaceFile(at: backupURL, withContentsOf: authJSONURL, operationName: "备份当前账号")
                 try fileManager.removeItem(at: authJSONURL)
             }
             try fileManager.moveItem(at: temporaryURL, to: authJSONURL)
@@ -268,7 +274,8 @@ final class CodexAuthManager {
             if fileManager.fileExists(atPath: temporaryURL.path) {
                 try? fileManager.removeItem(at: temporaryURL)
             }
-            if !fileManager.fileExists(atPath: authJSONURL.path),
+            if let backupURL,
+               !fileManager.fileExists(atPath: authJSONURL.path),
                fileManager.fileExists(atPath: backupURL.path) {
                 try? fileManager.copyItem(at: backupURL, to: authJSONURL)
             }
@@ -394,26 +401,19 @@ final class CodexAuthManager {
             && !fileName.hasPrefix("auth_switch_tmp_")
     }
 
-    private func backupTimestamp(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = "yyyyMMddHHmmss"
-        return formatter.string(from: date)
-    }
-
-    private func uniqueBackupURL(_ date: Date) -> URL {
-        let baseName = "auth.json.bak-codexswitch-\(backupTimestamp(date))"
-        let baseURL = authDirectoryURL.appendingPathComponent(baseName)
-        guard fileManager.fileExists(atPath: baseURL.path) else { return baseURL }
-
-        for index in 2...999 {
-            let candidateURL = authDirectoryURL.appendingPathComponent("\(baseName)-\(index)")
-            if !fileManager.fileExists(atPath: candidateURL.path) {
-                return candidateURL
-            }
+    private func currentAuthBackupURL() throws -> URL? {
+        guard fileManager.fileExists(atPath: authJSONURL.path) else { return nil }
+        guard let object = jsonObject(from: authJSONURL),
+              let accountId = authStringValue("account_id", in: object)
+        else {
+            throw CodexAuthSwitchError.copyFailed("无法读取当前账号 ID")
         }
 
-        return authDirectoryURL.appendingPathComponent("\(baseName)-\(UUID().uuidString)")
+        let fileName = "auth.json.bak-codexswitch-\(accountId)"
+        guard fileName == (fileName as NSString).lastPathComponent else {
+            throw CodexAuthSwitchError.copyFailed("当前账号 ID 不能用于备份文件名")
+        }
+        return authDirectoryURL.appendingPathComponent(fileName)
     }
 }
 
@@ -428,7 +428,7 @@ private struct ParsedWindow {
 // MARK: - Errors
 
 enum CodexRateLimitError: LocalizedError {
-    case codexNotFound(String)
+    case appServerNotFound(String)
     case processLaunchFailed(String)
     case timeout
     case serverError(String)
@@ -437,56 +437,57 @@ enum CodexRateLimitError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .codexNotFound(let path):
-            return "找不到 Codex 可执行文件：\(path)"
+        case .appServerNotFound(let path):
+            return "找不到 ChatGPT.app 内置的 Codex 可执行文件：\(path)"
         case .processLaunchFailed(let detail):
-            return "启动 Codex app-server 失败：\(detail)"
+            return "启动 ChatGPT app-server 失败：\(detail)"
         case .timeout:
-            return "读取 Codex app-server 超时"
+            return "读取 ChatGPT app-server 超时"
         case .serverError(let message):
-            return "Codex app-server 返回错误：\(message)"
+            return "ChatGPT app-server 返回错误：\(message)"
         case .malformedResponse:
-            return "Codex app-server 返回格式不符合预期"
+            return "ChatGPT app-server 返回格式不符合预期"
         case .noRateLimitWindows:
-            return "没有从 Codex app-server 读到额度窗口"
+            return "没有从 ChatGPT app-server 读到额度窗口"
         }
     }
 }
 
-// MARK: - Codex app-server RPC client
+// MARK: - ChatGPT app-server RPC client
 
 final class CodexRateLimitClient {
-    let codexExecutablePath: String
+    let appServerExecutablePath: String
     let requestTimeout: TimeInterval
 
     init(
-        codexExecutablePath: String = "/Applications/Codex.app/Contents/Resources/codex",
+        appServerExecutablePath: String = "/Applications/ChatGPT.app/Contents/Resources/codex",
         // rateLimits/read 背后有网络请求，延迟波动大（实测 2s ~ 15s+），超时不能太紧。
         requestTimeout: TimeInterval = 30
     ) {
-        self.codexExecutablePath = codexExecutablePath
+        self.appServerExecutablePath = appServerExecutablePath
         self.requestTimeout = requestTimeout
     }
 
     func readRateLimits() async throws -> QuotaSnapshot {
-        try await Task.detached(priority: .userInitiated) { [codexExecutablePath, requestTimeout] in
-            try Self.readRateLimitsBlocking(
-                codexExecutablePath: codexExecutablePath,
+        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
+            let result = try Self.readRateLimitsResultBlocking(
+                appServerExecutablePath: appServerExecutablePath,
                 requestTimeout: requestTimeout
             )
+            return try Self.parseSnapshot(from: result)
         }.value
     }
 
-    private static func readRateLimitsBlocking(
-        codexExecutablePath: String,
+    private static func readRateLimitsResultBlocking(
+        appServerExecutablePath: String,
         requestTimeout: TimeInterval
-    ) throws -> QuotaSnapshot {
-        guard FileManager.default.isExecutableFile(atPath: codexExecutablePath) else {
-            throw CodexRateLimitError.codexNotFound(codexExecutablePath)
+    ) throws -> [String: Any] {
+        guard FileManager.default.isExecutableFile(atPath: appServerExecutablePath) else {
+            throw CodexRateLimitError.appServerNotFound(appServerExecutablePath)
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: codexExecutablePath)
+        process.executableURL = URL(fileURLWithPath: appServerExecutablePath)
         process.arguments = ["app-server", "--listen", "stdio://"]
 
         let stdinPipe = Pipe()
@@ -534,7 +535,7 @@ final class CodexRateLimitClient {
             [
                 "id": 2,
                 "method": "account/rateLimits/read",
-                "params": [:]
+                "params": NSNull()
             ]
         ]
 
@@ -575,7 +576,7 @@ final class CodexRateLimitClient {
             throw CodexRateLimitError.malformedResponse
         }
 
-        return try parseSnapshot(from: result)
+        return result
     }
 
     private static func writeJSONLines(_ messages: [[String: Any]], to handle: FileHandle) throws {
@@ -605,6 +606,7 @@ final class CodexRateLimitClient {
         let weeklyWindow = chooseWeeklyWindow(from: windows)
         let resetCreditCount = (result["rateLimitResetCredits"] as? [String: Any])
             .flatMap { intValue($0["availableCount"]) }
+        let resetCreditCards = parseResetCreditCards(from: result)
 
         return QuotaSnapshot(
             fiveHour: fiveHourWindow.map {
@@ -624,6 +626,7 @@ final class CodexRateLimitClient {
                 )
             },
             resetCreditCount: resetCreditCount,
+            resetCreditCards: resetCreditCards,
             fetchedAt: Date()
         )
     }
@@ -711,6 +714,22 @@ final class CodexRateLimitClient {
         // app-server docs describe seconds. Accept milliseconds defensively.
         let seconds = raw > 10_000_000_000 ? raw / 1000 : raw
         return Date(timeIntervalSince1970: seconds)
+    }
+
+    private static func parseResetCreditCards(from result: [String: Any]) -> [ResetCreditCard]? {
+        guard let summary = result["rateLimitResetCredits"] as? [String: Any],
+              let credits = summary["credits"] as? [[String: Any]]
+        else {
+            return nil
+        }
+
+        return credits.compactMap { credit in
+            guard let grantedAt = dateValue(credit["grantedAt"]) else { return nil }
+            return ResetCreditCard(
+                issuedAt: grantedAt,
+                expiresAt: dateValue(credit["expiresAt"])
+            )
+        }
     }
 }
 
@@ -1279,8 +1298,11 @@ final class QuotaViewController: NSViewController {
     private let weeklyRow = QuotaRowView(title: "周限额")
     private let resetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
     private let resetCreditsValueLabel = NSTextField(labelWithString: "--")
+    private let resetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private var refreshCooldownTimer: Timer?
+    private var currentResetCreditCount = 0
+    private var currentResetCreditCards: [ResetCreditCard]?
     private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动 Touch Bar 提醒", target: nil, action: nil)
     private let warningPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let resetSoonPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -1328,6 +1350,18 @@ final class QuotaViewController: NSViewController {
         accountLabel.isHidden = text == nil
     }
 
+    private func showResetCreditExpirations(_ cards: [ResetCreditCard]) {
+        let alert = NSAlert()
+        alert.messageText = "重置卡过期时间"
+        if cards.isEmpty {
+            alert.informativeText = "没有查到可展示的重置卡过期时间。"
+        } else {
+            alert.accessoryView = Self.makeResetCreditExpirationList(cards)
+        }
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
     func apply(
         snapshot: QuotaSnapshot?,
         isRefreshing: Bool,
@@ -1337,7 +1371,7 @@ final class QuotaViewController: NSViewController {
         if let snapshot {
             fiveHourRow.update(bucket: snapshot.fiveHour)
             weeklyRow.update(bucket: snapshot.weekly)
-            resetCreditsValueLabel.stringValue = snapshot.resetCreditCount.map(String.init) ?? "--"
+            updateResetCredits(snapshot.resetCreditCount, cards: snapshot.resetCreditCards)
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
 
@@ -1345,7 +1379,7 @@ final class QuotaViewController: NSViewController {
             if let snapshot {
                 statusLabel.stringValue = "刷新中（上次更新 \(Self.formatFetchedAt(snapshot.fetchedAt))）…"
             } else {
-                statusLabel.stringValue = "正在读取 Codex app-server…"
+                statusLabel.stringValue = "正在读取 ChatGPT app-server…"
             }
         } else if let error {
             if let snapshot {
@@ -1376,6 +1410,13 @@ final class QuotaViewController: NSViewController {
         resetCreditsValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         resetCreditsValueLabel.textColor = .labelColor
         resetCreditsValueLabel.alignment = .left
+
+        resetCreditsExpirationButton.bezelStyle = .rounded
+        resetCreditsExpirationButton.controlSize = .small
+        resetCreditsExpirationButton.font = .systemFont(ofSize: 11)
+        resetCreditsExpirationButton.target = self
+        resetCreditsExpirationButton.action = #selector(showResetCreditExpirationsTapped)
+        updateResetCreditsExpirationButton()
 
         refreshButton.bezelStyle = .rounded
         refreshButton.toolTip = "手动刷新（60 秒内只能刷新一次）"
@@ -1439,7 +1480,7 @@ final class QuotaViewController: NSViewController {
     }
 
     private func makeResetCreditsRow() -> NSStackView {
-        let row = NSStackView(views: [resetCreditsTitleLabel, resetCreditsValueLabel, NSView()])
+        let row = NSStackView(views: [resetCreditsTitleLabel, resetCreditsValueLabel, resetCreditsExpirationButton, NSView()])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
@@ -1448,10 +1489,26 @@ final class QuotaViewController: NSViewController {
         NSLayoutConstraint.activate([
             row.heightAnchor.constraint(equalToConstant: 20),
             resetCreditsTitleLabel.widthAnchor.constraint(equalToConstant: 108),
-            resetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 112)
+            resetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 32),
+            resetCreditsExpirationButton.widthAnchor.constraint(equalToConstant: 76)
         ])
 
         return row
+    }
+
+    private func updateResetCredits(_ count: Int?, cards: [ResetCreditCard]?) {
+        currentResetCreditCount = count ?? 0
+        currentResetCreditCards = cards
+        resetCreditsValueLabel.stringValue = count.map(String.init) ?? "--"
+        updateResetCreditsExpirationButton()
+    }
+
+    private func updateResetCreditsExpirationButton() {
+        resetCreditsExpirationButton.isHidden = currentResetCreditCount <= 0
+    }
+
+    @objc private func showResetCreditExpirationsTapped() {
+        showResetCreditExpirations(currentResetCreditCards ?? [])
     }
 
     @objc private func refreshTapped() {
@@ -1489,6 +1546,64 @@ final class QuotaViewController: NSViewController {
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm:ss" : "MM-dd HH:mm"
         return formatter.string(from: date)
+    }
+
+    private static func formatDateTime(_ date: Date?) -> String {
+        formatDate(date, dateFormat: "yyyy-MM-dd HH:mm:ss")
+    }
+
+    private static func formatCompactDateTime(_ date: Date?) -> String {
+        formatDate(date, dateFormat: "MM-dd HH:mm:ss")
+    }
+
+    private static func formatDate(_ date: Date?, dateFormat: String) -> String {
+        guard let date else { return "--" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = dateFormat
+        return formatter.string(from: date)
+    }
+
+    private static func makeResetCreditExpirationList(_ cards: [ResetCreditCard]) -> NSView {
+        let now = Date()
+        let warningInterval: TimeInterval = 7 * 24 * 60 * 60
+        let listWidth: CGFloat = 320
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        for (index, card) in cards.enumerated() {
+            let line = "\(index + 1). 发放 \(formatCompactDateTime(card.issuedAt))  过期 \(formatCompactDateTime(card.expiresAt))"
+            let expiresSoon = card.expiresAt.map { $0.timeIntervalSince(now) < warningInterval } ?? false
+            let label = NSTextField(labelWithString: line)
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.textColor = expiresSoon ? .systemRed : .labelColor
+            label.alignment = .center
+            label.lineBreakMode = .byClipping
+            label.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(label)
+            label.widthAnchor.constraint(equalToConstant: listWidth).isActive = true
+        }
+
+        let listHeight = min(CGFloat(cards.count * 22), 180)
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: listWidth, height: listHeight))
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.contentView.drawsBackground = false
+        scrollView.hasVerticalScroller = cards.count > 8
+        scrollView.hasHorizontalScroller = false
+        scrollView.documentView = stack
+
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalToConstant: listWidth),
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: CGFloat(cards.count * 20))
+        ])
+
+        return scrollView
     }
 
     func applyReminderConfiguration(_ configuration: ReminderConfiguration) {
