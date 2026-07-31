@@ -53,6 +53,7 @@ struct QuotaSnapshot: Equatable, Codable {
     let weekly: QuotaBucket?
     let resetCreditCount: Int?
     let resetCreditCards: [ResetCreditCard]?
+    let planType: String?
     let fetchedAt: Date
 
     var primaryStatusTitle: String {
@@ -166,6 +167,29 @@ enum SnapshotCache {
     static func save(_ snapshot: QuotaSnapshot) {
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+enum AccountPlanCache {
+    private static let key = "local.codex.touchbar.quota.planTypesByAccountID"
+    private static let noPlan = ""
+
+    static func contains(_ accountID: String) -> Bool {
+        values[accountID] != nil
+    }
+
+    static func planType(for accountID: String) -> String? {
+        values[accountID].flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    static func save(_ planType: String?, for accountID: String) {
+        var next = values
+        next[accountID] = planType ?? noPlan
+        UserDefaults.standard.set(next, forKey: key)
+    }
+
+    private static var values: [String: String] {
+        UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
     }
 }
 
@@ -468,20 +492,44 @@ final class CodexRateLimitClient {
         self.requestTimeout = requestTimeout
     }
 
-    func readRateLimits() async throws -> QuotaSnapshot {
+    func readRateLimits(planType: String?) async throws -> QuotaSnapshot {
         try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
-            let result = try Self.readRateLimitsResultBlocking(
+            let results = try Self.readAppServerResultsBlocking(
                 appServerExecutablePath: appServerExecutablePath,
-                requestTimeout: requestTimeout
+                requestTimeout: requestTimeout,
+                shouldReadAccount: false,
+                shouldReadRateLimits: true
             )
-            return try Self.parseSnapshot(from: result)
+            return try Self.parseSnapshot(
+                rateLimits: results.rateLimits ?? [:],
+                planType: planType
+            )
         }.value
     }
 
-    private static func readRateLimitsResultBlocking(
+    func readAccountPlanType() async throws -> String? {
+        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
+            let results = try Self.readAppServerResultsBlocking(
+                appServerExecutablePath: appServerExecutablePath,
+                requestTimeout: requestTimeout,
+                shouldReadAccount: true,
+                shouldReadRateLimits: false
+            )
+            return results.account.flatMap(Self.planType(from:))
+        }.value
+    }
+
+    private struct AppServerResults {
+        let rateLimits: [String: Any]?
+        let account: [String: Any]?
+    }
+
+    private static func readAppServerResultsBlocking(
         appServerExecutablePath: String,
-        requestTimeout: TimeInterval
-    ) throws -> [String: Any] {
+        requestTimeout: TimeInterval,
+        shouldReadAccount: Bool,
+        shouldReadRateLimits: Bool
+    ) throws -> AppServerResults {
         guard FileManager.default.isExecutableFile(atPath: appServerExecutablePath) else {
             throw CodexRateLimitError.appServerNotFound(appServerExecutablePath)
         }
@@ -497,7 +545,10 @@ final class CodexRateLimitClient {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
-        let collector = JSONLineResponseCollector(targetId: 2)
+        var targetIDs = Set<Int>()
+        if shouldReadAccount { targetIDs.insert(2) }
+        if shouldReadRateLimits { targetIDs.insert(3) }
+        let collector = JSONLineResponseCollector(targetIDs: targetIDs)
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if !data.isEmpty {
@@ -516,7 +567,7 @@ final class CodexRateLimitClient {
             throw CodexRateLimitError.processLaunchFailed(error.localizedDescription)
         }
 
-        let messages: [[String: Any]] = [
+        var messages: [[String: Any]] = [
             [
                 "id": 1,
                 "method": "initialize",
@@ -532,12 +583,21 @@ final class CodexRateLimitClient {
                 "method": "initialized",
                 "params": [:]
             ],
-            [
+        ]
+        if shouldReadAccount {
+            messages.append([
                 "id": 2,
+                "method": "account/read",
+                "params": [:]
+            ])
+        }
+        if shouldReadRateLimits {
+            messages.append([
+                "id": 3,
                 "method": "account/rateLimits/read",
                 "params": NSNull()
-            ]
-        ]
+            ])
+        }
 
         do {
             try writeJSONLines(messages, to: stdinPipe.fileHandleForWriting)
@@ -555,13 +615,24 @@ final class CodexRateLimitClient {
             throw CodexRateLimitError.timeout
         }
 
-        guard let response = collector.response else {
+        if shouldReadRateLimits, collector.response(for: 3) == nil {
+            cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
+            throw CodexRateLimitError.malformedResponse
+        }
+        if shouldReadAccount, collector.response(for: 2) == nil {
             cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
             throw CodexRateLimitError.malformedResponse
         }
 
         cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
 
+        return AppServerResults(
+            rateLimits: try collector.response(for: 3).map(result(from:)),
+            account: try collector.response(for: 2).map(result(from:))
+        )
+    }
+
+    private static func result(from response: [String: Any]) throws -> [String: Any] {
         if let error = response["error"] as? [String: Any] {
             let code = (error["code"] as? NSNumber)?.intValue
             let message = error["message"] as? String ?? "unknown error"
@@ -575,7 +646,6 @@ final class CodexRateLimitClient {
         guard let result = response["result"] as? [String: Any] else {
             throw CodexRateLimitError.malformedResponse
         }
-
         return result
     }
 
@@ -596,7 +666,12 @@ final class CodexRateLimitClient {
         }
     }
 
-    private static func parseSnapshot(from result: [String: Any]) throws -> QuotaSnapshot {
+    private static func planType(from account: [String: Any]) -> String? {
+        ((account["account"] as? [String: Any])?["planType"] as? String)
+            ?? (account["planType"] as? String)
+    }
+
+    private static func parseSnapshot(rateLimits result: [String: Any], planType: String?) throws -> QuotaSnapshot {
         let windows = extractRateLimitWindows(from: result)
         guard !windows.isEmpty else {
             throw CodexRateLimitError.noRateLimitWindows
@@ -627,6 +702,7 @@ final class CodexRateLimitClient {
             },
             resetCreditCount: resetCreditCount,
             resetCreditCards: resetCreditCards,
+            planType: planType,
             fetchedAt: Date()
         )
     }
@@ -734,18 +810,19 @@ final class CodexRateLimitClient {
 }
 
 private final class JSONLineResponseCollector {
-    private let targetId: Int
+    private let targetIDs: Set<Int>
     private let queue = DispatchQueue(label: "local.codex.touchbar.quota.jsonline")
     private let semaphore = DispatchSemaphore(value: 0)
     private var buffer = Data()
-    private var storedResponse: [String: Any]?
+    private var storedResponses: [Int: [String: Any]] = [:]
+    private var didSignal = false
 
-    init(targetId: Int) {
-        self.targetId = targetId
+    init(targetIDs: Set<Int>) {
+        self.targetIDs = targetIDs
     }
 
-    var response: [String: Any]? {
-        queue.sync { storedResponse }
+    func response(for id: Int) -> [String: Any]? {
+        queue.sync { storedResponses[id] }
     }
 
     func append(_ data: Data) {
@@ -769,10 +846,12 @@ private final class JSONLineResponseCollector {
                   let message = object as? [String: Any]
             else { continue }
 
-            if let id = message["id"] as? NSNumber, id.intValue == targetId {
-                storedResponse = message
-                semaphore.signal()
-                return
+            if let id = message["id"] as? NSNumber, targetIDs.contains(id.intValue) {
+                storedResponses[id.intValue] = message
+                if !didSignal && storedResponses.count == targetIDs.count {
+                    didSignal = true
+                    semaphore.signal()
+                }
             }
         }
     }
@@ -789,6 +868,10 @@ final class RateLimitStore {
     private(set) var snapshot: QuotaSnapshot?
     private(set) var isRefreshing = false
     private(set) var reminder: ReminderPresentation = .inactive
+    private var hasReadAccountPlan = false
+    private var isReadingAccountPlan = false
+    private var accountID = "unknown"
+    private var cachedPlanType: String?
     private var timer: Timer?
 
     var onChange: ((QuotaSnapshot?, Bool, String?, ReminderPresentation) -> Void)?
@@ -820,14 +903,26 @@ final class RateLimitStore {
         timer = nil
     }
 
+    func setAccountID(_ accountID: String?) {
+        self.accountID = accountID ?? "unknown"
+        hasReadAccountPlan = AccountPlanCache.contains(self.accountID)
+        cachedPlanType = AccountPlanCache.planType(for: self.accountID)
+        if hasReadAccountPlan {
+            applyPlanType(cachedPlanType)
+        } else {
+            readAccountPlan()
+        }
+    }
+
     func refresh(force: Bool) {
         guard !isRefreshing else { return }
         isRefreshing = true
         onChange?(snapshot, true, nil, reminder)
+        let cachedPlanType = self.cachedPlanType
 
         Task { @MainActor in
             do {
-                let newSnapshot = try await client.readRateLimits()
+                let newSnapshot = try await client.readRateLimits(planType: cachedPlanType)
                 snapshot = newSnapshot
                 SnapshotCache.save(newSnapshot)
                 reminder = evaluateReminder(for: newSnapshot, now: Date())
@@ -841,6 +936,43 @@ final class RateLimitStore {
             }
         }
     }
+
+    private func readAccountPlan() {
+        guard !hasReadAccountPlan, !isReadingAccountPlan else { return }
+        isReadingAccountPlan = true
+        let requestedAccountID = accountID
+
+        Task { @MainActor in
+            defer { isReadingAccountPlan = false }
+            let planType: String?
+            do {
+                planType = try await client.readAccountPlanType()
+            } catch {
+                return
+            }
+            guard accountID == requestedAccountID else { return }
+            hasReadAccountPlan = true
+            cachedPlanType = planType
+            AccountPlanCache.save(planType, for: accountID)
+            applyPlanType(planType)
+        }
+    }
+
+    private func applyPlanType(_ planType: String?) {
+        guard let snapshot else { return }
+        let updatedSnapshot = QuotaSnapshot(
+            fiveHour: snapshot.fiveHour,
+            weekly: snapshot.weekly,
+            resetCreditCount: snapshot.resetCreditCount,
+            resetCreditCards: snapshot.resetCreditCards,
+            planType: planType,
+            fetchedAt: snapshot.fetchedAt
+        )
+        self.snapshot = updatedSnapshot
+        SnapshotCache.save(updatedSnapshot)
+        onChange?(updatedSnapshot, isRefreshing, nil, reminder)
+    }
+
 
     func muteCurrentReminder() {
         guard reminder.isActive, let snapshot else { return }
@@ -1106,6 +1238,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private let quotaViewController = QuotaViewController()
     private let store = RateLimitStore()
+    private let zaiStore = ZAIQuotaStore()
     private let authManager = CodexAuthManager()
     private let alertPresenter = TouchBarAlertPresenter()
     private var accountOptions: [CodexAuthAccount] = []
@@ -1126,11 +1259,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.animates = true
-        popover.contentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 248 : 158)
         popover.contentViewController = quotaViewController
+        quotaViewController.onPreferredContentSizeChange = { [weak self] in
+            guard let self else { return }
+            self.popover.contentSize = self.quotaViewController.preferredContentSize
+        }
+        updateZAISectionVisibility()
 
         quotaViewController.onRefresh = { [weak self] in
             self?.store.refresh(force: true)
+        }
+        quotaViewController.onZAIRefresh = { [weak self] in
+            self?.zaiStore.refresh()
         }
         quotaViewController.onMuteReminder = { [weak self] in
             self?.store.muteCurrentReminder()
@@ -1148,6 +1288,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         quotaViewController.applyReminderConfiguration(store.reminderConfiguration)
         initializeAccountSwitcher()
+
+        zaiStore.onChange = { [weak self] snapshot, account, isRefreshing, error in
+            self?.quotaViewController.applyZAI(
+                snapshot: snapshot,
+                account: account,
+                isRefreshing: isRefreshing,
+                error: error
+            )
+        }
+        quotaViewController.applyZAI(
+            snapshot: zaiStore.snapshot,
+            account: zaiStore.account,
+            isRefreshing: zaiStore.isRefreshing,
+            error: zaiStore.lastError
+        )
 
         store.onChange = { [weak self] snapshot, isRefreshing, error, reminder in
             guard let self else { return }
@@ -1176,11 +1331,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = try authManager.loadAccounts()
             accountOptions = result.accounts
             selectedAccountId = result.selectedAccountId
+            store.setAccountID(selectedAccountId)
             quotaViewController.setAccountLabel(currentAccountLabel())
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             accountOptions = []
             selectedAccountId = nil
+            store.setAccountID(nil)
             quotaViewController.setAccountLabel(nil)
             quotaViewController.showAccountSwitchStatus(message)
         }
@@ -1277,15 +1434,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showPopover(relativeTo button: NSStatusBarButton) {
         NSApp.activate(ignoringOtherApps: true)
+        updateZAISectionVisibility()
         if !popover.isShown {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            // NSPopover 首次加载 view 后会重新取一次 preferredContentSize，这里再设一次避免底部被裁切。
+            popover.contentSize = quotaViewController.preferredContentSize
+        }
+        if ZAISettings.isZAIDomain() {
+            zaiStore.refreshIfNeeded()
         }
         quotaViewController.focusTouchBarHost()
+    }
+
+    private func updateZAISectionVisibility() {
+        quotaViewController.setZAISectionVisible(ZAISettings.isZAIDomain())
+        popover.contentSize = quotaViewController.preferredContentSize
     }
 }
 
 final class QuotaViewController: NSViewController {
     var onRefresh: (() -> Void)?
+    var onZAIRefresh: (() -> Void)?
+    var onPreferredContentSizeChange: (() -> Void)?
     var onMuteReminder: (() -> Void)?
     var onUnmuteAll: (() -> Void)?
     var onReminderConfigurationChange: ((ReminderConfiguration) -> Void)?
@@ -1293,14 +1463,28 @@ final class QuotaViewController: NSViewController {
     private let rootView = TouchBarHostingVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Codex 余额")
     private let accountLabel = NSTextField(labelWithString: "")
+    private let accountPlanTag = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "等待刷新")
     private let fiveHourRow = QuotaRowView(title: "5小时")
     private let weeklyRow = QuotaRowView(title: "周限额")
+    private let zaiTitleLabel = NSTextField(labelWithString: "Z.AI 余额")
+    private let zaiEmailLabel = NSTextField(labelWithString: "")
+    private let zaiLevelTag = NSTextField(labelWithString: "")
+    private let zaiStatusLabel = NSTextField(labelWithString: "等待刷新")
+    private let zaiRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
+    private let zaiRows = [
+        QuotaRowView(title: "小时"),
+        QuotaRowView(title: "周")
+    ]
+    private lazy var zaiSection = makeZAISection()
+    private var shouldShowZAISection = false
+    private var contentStack: NSStackView?
     private let resetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
     private let resetCreditsValueLabel = NSTextField(labelWithString: "--")
     private let resetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private var refreshCooldownTimer: Timer?
+    private var zaiRefreshCooldownTimer: Timer?
     private var currentResetCreditCount = 0
     private var currentResetCreditCards: [ResetCreditCard]?
     private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动 Touch Bar 提醒", target: nil, action: nil)
@@ -1322,7 +1506,7 @@ final class QuotaViewController: NSViewController {
         }
         view = rootView
         // 无 Touch Bar 机型只显示额度，不显示提醒设置。
-        preferredContentSize = NSSize(width: 460, height: TouchBarCapability.hasTouchBar ? 248 : 158)
+        preferredContentSize = quotaContentSize
 
         configureSubviews()
     }
@@ -1339,6 +1523,40 @@ final class QuotaViewController: NSViewController {
 
     func setUnmuteButtonVisible(_ visible: Bool) {
         unmuteButton.isHidden = !visible
+    }
+
+    func setZAISectionVisible(_ visible: Bool) {
+        shouldShowZAISection = visible
+        if isViewLoaded {
+            zaiSection.isHidden = !visible
+        }
+        updatePreferredContentSize()
+    }
+
+    func applyZAI(snapshot: ZAIQuotaSnapshot?, account: ZAIAccount?, isRefreshing: Bool, error: String?) {
+        guard shouldShowZAISection else { return }
+
+        zaiEmailLabel.stringValue = account?.email ?? snapshot?.email ?? ""
+        zaiEmailLabel.isHidden = zaiEmailLabel.stringValue.isEmpty
+        zaiLevelTag.stringValue = snapshot?.level ?? ""
+        zaiLevelTag.isHidden = zaiLevelTag.stringValue.isEmpty
+
+        let limits = snapshot?.limits ?? []
+        let zaiUnits: [ZAILimit.WindowUnit] = [.hourly, .weekly]
+        for (unit, row) in zip(zaiUnits, zaiRows) {
+            row.update(limit: limits.first { $0.unit == unit })
+        }
+
+        if isRefreshing {
+            zaiStatusLabel.stringValue = snapshot.map { "刷新中（上次更新 \(Self.formatFetchedAt($0.fetchedAt))）…" } ?? "刷新中…"
+        } else if let error {
+            zaiStatusLabel.stringValue = snapshot.map { "刷新失败，显示 \(Self.formatFetchedAt($0.fetchedAt)) 数据 · \(error)" } ?? "刷新失败：\(error)"
+        } else if let snapshot {
+            zaiStatusLabel.stringValue = "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))"
+        } else {
+            zaiStatusLabel.stringValue = "暂无数据"
+        }
+        updatePreferredContentSize()
     }
 
     func showAccountSwitchStatus(_ message: String) {
@@ -1374,6 +1592,8 @@ final class QuotaViewController: NSViewController {
             updateResetCredits(snapshot.resetCreditCount, cards: snapshot.resetCreditCards)
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
+        accountPlanTag.stringValue = snapshot?.planType ?? ""
+        accountPlanTag.isHidden = accountPlanTag.stringValue.isEmpty
 
         if isRefreshing {
             if let snapshot {
@@ -1401,6 +1621,16 @@ final class QuotaViewController: NSViewController {
         accountLabel.lineBreakMode = .byTruncatingMiddle
         accountLabel.isHidden = accountLabel.stringValue.isEmpty
 
+        accountPlanTag.font = .systemFont(ofSize: 10, weight: .semibold)
+        accountPlanTag.textColor = .white
+        accountPlanTag.alignment = .center
+        accountPlanTag.drawsBackground = true
+        accountPlanTag.backgroundColor = .systemBlue
+        accountPlanTag.wantsLayer = true
+        accountPlanTag.layer?.cornerRadius = 4
+        accountPlanTag.layer?.masksToBounds = true
+        accountPlanTag.isHidden = true
+
         statusLabel.font = .systemFont(ofSize: 11, weight: .regular)
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.lineBreakMode = .byTruncatingTail
@@ -1427,7 +1657,7 @@ final class QuotaViewController: NSViewController {
             configureReminderControls()
         }
 
-        let titleLine = NSStackView(views: [titleLabel, accountLabel])
+        let titleLine = NSStackView(views: [titleLabel, accountLabel, accountPlanTag])
         titleLine.orientation = .horizontal
         titleLine.alignment = .lastBaseline
         titleLine.spacing = 8
@@ -1457,12 +1687,14 @@ final class QuotaViewController: NSViewController {
         if TouchBarCapability.hasTouchBar {
             contentViews.append(makeSettingsView())
         }
+        contentViews.append(zaiSection)
 
         let content = NSStackView(views: contentViews)
         content.orientation = .vertical
         content.alignment = .leading
         content.spacing = 10
         content.translatesAutoresizingMaskIntoConstraints = false
+        contentStack = content
 
         rootView.addSubview(content)
 
@@ -1473,10 +1705,95 @@ final class QuotaViewController: NSViewController {
             content.bottomAnchor.constraint(lessThanOrEqualTo: rootView.bottomAnchor, constant: -12),
             content.widthAnchor.constraint(equalToConstant: 424),
             rows.widthAnchor.constraint(equalTo: content.widthAnchor),
+            zaiSection.widthAnchor.constraint(equalTo: content.widthAnchor),
             resetCreditsRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
             titleLine.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
-            accountLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 210)
+            accountLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
+            accountPlanTag.widthAnchor.constraint(greaterThanOrEqualToConstant: 28)
         ])
+        updatePreferredContentSize()
+    }
+
+    private var quotaContentSize: NSSize {
+        let fallbackHeight: CGFloat = TouchBarCapability.hasTouchBar ? 248 : 158
+        let contentHeight = contentStack.map { ceil($0.fittingSize.height) + 24 } ?? fallbackHeight
+        return NSSize(width: 460, height: contentHeight)
+    }
+
+    private func updatePreferredContentSize() {
+        guard isViewLoaded else {
+            preferredContentSize = quotaContentSize
+            return
+        }
+        rootView.layoutSubtreeIfNeeded()
+        preferredContentSize = quotaContentSize
+        onPreferredContentSizeChange?()
+    }
+
+    private func makeZAISection() -> NSView {
+        zaiTitleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
+        zaiEmailLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        zaiEmailLabel.textColor = .secondaryLabelColor
+        zaiEmailLabel.lineBreakMode = .byTruncatingMiddle
+
+        zaiLevelTag.font = .systemFont(ofSize: 10, weight: .semibold)
+        zaiLevelTag.textColor = .white
+        zaiLevelTag.alignment = .center
+        zaiLevelTag.drawsBackground = true
+        zaiLevelTag.backgroundColor = .systemBlue
+        zaiLevelTag.wantsLayer = true
+        zaiLevelTag.layer?.cornerRadius = 4
+        zaiLevelTag.layer?.masksToBounds = true
+
+        zaiStatusLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        zaiStatusLabel.textColor = .secondaryLabelColor
+        zaiStatusLabel.lineBreakMode = .byTruncatingTail
+
+        zaiRefreshButton.bezelStyle = .rounded
+        zaiRefreshButton.toolTip = "手动刷新（60 秒内只能刷新一次）"
+        zaiRefreshButton.target = self
+        zaiRefreshButton.action = #selector(zaiRefreshTapped)
+
+        let titleLine = NSStackView(views: [zaiTitleLabel, zaiEmailLabel, zaiLevelTag, NSView()])
+        titleLine.orientation = .horizontal
+        titleLine.alignment = .lastBaseline
+        titleLine.spacing = 8
+
+        let headerLeft = NSStackView(views: [titleLine, zaiStatusLabel])
+        headerLeft.orientation = .vertical
+        headerLeft.alignment = .leading
+        headerLeft.spacing = 2
+
+        let header = NSStackView(views: [headerLeft, NSView(), zaiRefreshButton])
+        header.orientation = .horizontal
+        header.alignment = .centerY
+        header.spacing = 12
+
+        let rows = NSStackView(views: zaiRows)
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 4
+
+        let divider = NSBox()
+        divider.boxType = .separator
+
+        let section = NSStackView(views: [divider, header, rows])
+        section.orientation = .vertical
+        section.alignment = .leading
+        section.spacing = 6
+        section.isHidden = !shouldShowZAISection
+
+        NSLayoutConstraint.activate([
+            divider.widthAnchor.constraint(equalToConstant: 424),
+            header.widthAnchor.constraint(equalToConstant: 424),
+            titleLine.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
+            zaiEmailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 210),
+            zaiLevelTag.widthAnchor.constraint(greaterThanOrEqualToConstant: 28),
+            zaiRefreshButton.widthAnchor.constraint(equalToConstant: 64),
+            rows.widthAnchor.constraint(equalToConstant: 424)
+        ])
+
+        return section
     }
 
     private func makeResetCreditsRow() -> NSStackView {
@@ -1522,6 +1839,19 @@ final class QuotaViewController: NSViewController {
             }
         }
         onRefresh?()
+    }
+
+    @objc private func zaiRefreshTapped() {
+        guard zaiRefreshButton.isEnabled else { return }
+        // 与 Codex 刷新一致：手动请求也在 60 秒内防重。
+        zaiRefreshButton.isEnabled = false
+        zaiRefreshCooldownTimer?.invalidate()
+        zaiRefreshCooldownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.zaiRefreshButton.isEnabled = true
+            }
+        }
+        onZAIRefresh?()
     }
 
     @objc fileprivate func muteReminderTapped() {
@@ -1792,11 +2122,13 @@ final class TouchBarHostingVisualEffectView: NSVisualEffectView, NSTouchBarDeleg
 }
 
 final class QuotaRowView: NSView {
+    private let placeholderTitle: String
     private let titleLabel: NSTextField
     private let barView = SegmentedBatteryBarView(segmentCount: 28)
     private let detailLabel = NSTextField(labelWithString: "--% · --")
 
     init(title: String) {
+        self.placeholderTitle = title
         self.titleLabel = NSTextField(labelWithString: title)
         super.init(frame: .zero)
         setup()
@@ -1809,6 +2141,7 @@ final class QuotaRowView: NSView {
 
     func update(bucket: QuotaBucket?) {
         guard let bucket else {
+            titleLabel.stringValue = placeholderTitle
             barView.percent = 0
             detailLabel.stringValue = "--% · --"
             return
@@ -1817,6 +2150,19 @@ final class QuotaRowView: NSView {
         titleLabel.stringValue = bucket.title
         barView.percent = bucket.remainingPercent
         detailLabel.stringValue = "\(bucket.roundedRemainingPercent)% · \(formatReset(bucket.resetsAt))"
+    }
+
+    func update(limit: ZAILimit?) {
+        guard let limit else {
+            titleLabel.stringValue = placeholderTitle
+            barView.percent = 0
+            detailLabel.stringValue = "--% · --"
+            return
+        }
+
+        titleLabel.stringValue = limit.title
+        barView.percent = limit.remainingPercent
+        detailLabel.stringValue = "\(limit.roundedRemainingPercent)% · \(formatReset(limit.nextResetTime))"
     }
 
     private func setup() {

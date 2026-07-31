@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "CodexTouchBarQuota",
-            path: "Sources/CodexTouchBarQuota"
+            path: "Sources/CodexTouchBarQuota",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"])
+            ]
         )
     ]
 )
