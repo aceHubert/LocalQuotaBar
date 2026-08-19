@@ -1473,8 +1473,9 @@ final class QuotaViewController: NSViewController {
     private let zaiStatusLabel = NSTextField(labelWithString: "等待刷新")
     private let zaiRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private let zaiRows = [
-        QuotaRowView(title: "小时"),
-        QuotaRowView(title: "周")
+        // 标题列加宽以容纳模型名（如 GLM-5-Turbo），放不下时截断并靠 tooltip 显示全名。
+        QuotaRowView(title: "小时", titleWidth: 80, detailWidth: 160, barMinWidth: 156),
+        QuotaRowView(title: "周", titleWidth: 80, detailWidth: 160, barMinWidth: 156)
     ]
     private lazy var zaiSection = makeZAISection()
     private var shouldShowZAISection = false
@@ -1536,36 +1537,77 @@ final class QuotaViewController: NSViewController {
     func applyZAI(snapshot: ZAIQuotaSnapshot?, account: ZAIAccount?, isRefreshing: Bool, error: String?) {
         guard shouldShowZAISection else { return }
 
-        zaiEmailLabel.stringValue = account?.email ?? snapshot?.email ?? ""
+        // setting.json 是当前事实；快照可能还是切换账号/套餐前的旧缓存，
+        // 刷新失败展示旧数据时 tag 也要跟本地配置走。
+        let selection = ZAISettings.resolveProviderSelection()
+        let kind = selection?.kind ?? snapshot?.kind ?? .codingPlan
+
+        setLabelText(zaiTitleLabel, selection?.domain == "bigmodel" ? "BigModel 余额" : "Z.AI 余额")
+        setLabelText(zaiEmailLabel, account?.email ?? snapshot?.email ?? "")
         zaiEmailLabel.isHidden = zaiEmailLabel.stringValue.isEmpty
-        zaiLevelTag.stringValue = snapshot?.level ?? ""
+
+        switch kind {
+        case .apiKey:
+            let suffix = snapshot?.apiKeySuffix.map { " ····\($0)" } ?? ""
+            setLabelText(zaiLevelTag, "API Key\(suffix)")
+            zaiLevelTag.backgroundColor = .systemGray
+            zaiLevelTag.toolTip = "API Key 模式，无余额数据"
+            zaiRows.forEach { $0.isHidden = true }
+        case .startPlan:
+            // tag 显示 name（如 "ZCode Start Plan"）；description（如 "GLM-5.3 周末活动"）可能过长，放 tooltip。
+            let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
+            setLabelText(zaiLevelTag, planName)
+            zaiLevelTag.backgroundColor = .systemGreen
+            zaiLevelTag.toolTip = snapshot?.planDescription.flatMap { $0.isEmpty ? nil : $0 }
+                ?? snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 }
+            let balances = (snapshot?.balances ?? []).prefix(zaiRows.count)
+            for (index, row) in zaiRows.enumerated() {
+                if index < balances.count {
+                    row.update(balance: balances[index])
+                    row.isHidden = false
+                } else {
+                    row.isHidden = true
+                }
+            }
+        case .codingPlan:
+            setLabelText(zaiLevelTag, snapshot?.level ?? "")
+            zaiLevelTag.backgroundColor = .systemBlue
+            let limits = snapshot?.limits ?? []
+            let zaiUnits: [ZAILimit.WindowUnit] = [.hourly, .weekly]
+            for (unit, row) in zip(zaiUnits, zaiRows) {
+                row.update(limit: limits.first { $0.unit == unit })
+                row.isHidden = false
+            }
+        }
         zaiLevelTag.isHidden = zaiLevelTag.stringValue.isEmpty
 
-        let limits = snapshot?.limits ?? []
-        let zaiUnits: [ZAILimit.WindowUnit] = [.hourly, .weekly]
-        for (unit, row) in zip(zaiUnits, zaiRows) {
-            row.update(limit: limits.first { $0.unit == unit })
-        }
-
-        if isRefreshing {
-            zaiStatusLabel.stringValue = snapshot.map { "刷新中（上次更新 \(Self.formatFetchedAt($0.fetchedAt))）…" } ?? "刷新中…"
+        if kind == .apiKey {
+            setLabelText(zaiStatusLabel, "API Key 模式，无余额数据")
+        } else if isRefreshing {
+            setLabelText(zaiStatusLabel, snapshot.map { "刷新中（上次更新 \(Self.formatFetchedAt($0.fetchedAt))）…" } ?? "刷新中…")
         } else if let error {
-            zaiStatusLabel.stringValue = snapshot.map { "刷新失败，显示 \(Self.formatFetchedAt($0.fetchedAt)) 数据 · \(error)" } ?? "刷新失败：\(error)"
+            setLabelText(zaiStatusLabel, snapshot.map { "刷新失败，显示 \(Self.formatFetchedAt($0.fetchedAt)) 数据 · \(error)" } ?? "刷新失败：\(error)")
         } else if let snapshot {
-            zaiStatusLabel.stringValue = "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))"
+            setLabelText(zaiStatusLabel, "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))")
         } else {
-            zaiStatusLabel.stringValue = "暂无数据"
+            setLabelText(zaiStatusLabel, "暂无数据")
         }
         updatePreferredContentSize()
     }
 
     func showAccountSwitchStatus(_ message: String) {
-        statusLabel.stringValue = message
+        setLabelText(statusLabel, message)
     }
 
     func setAccountLabel(_ text: String?) {
-        accountLabel.stringValue = text ?? ""
+        setLabelText(accountLabel, text ?? "")
         accountLabel.isHidden = text == nil
+    }
+
+    /// 设置文本并同步 toolTip：文本被截断时，鼠标悬停可查看完整内容（类似 Web 的 title）。
+    private func setLabelText(_ label: NSTextField, _ text: String) {
+        label.stringValue = text
+        label.toolTip = text
     }
 
     private func showResetCreditExpirations(_ cards: [ResetCreditCard]) {
@@ -1597,20 +1639,20 @@ final class QuotaViewController: NSViewController {
 
         if isRefreshing {
             if let snapshot {
-                statusLabel.stringValue = "刷新中（上次更新 \(Self.formatFetchedAt(snapshot.fetchedAt))）…"
+                setLabelText(statusLabel, "刷新中（上次更新 \(Self.formatFetchedAt(snapshot.fetchedAt))）…")
             } else {
-                statusLabel.stringValue = "正在读取 ChatGPT app-server…"
+                setLabelText(statusLabel, "正在读取 ChatGPT app-server…")
             }
         } else if let error {
             if let snapshot {
-                statusLabel.stringValue = "刷新失败，显示 \(Self.formatFetchedAt(snapshot.fetchedAt)) 数据 · \(error)"
+                setLabelText(statusLabel, "刷新失败，显示 \(Self.formatFetchedAt(snapshot.fetchedAt)) 数据 · \(error)")
             } else {
-                statusLabel.stringValue = "刷新失败：\(error)"
+                setLabelText(statusLabel, "刷新失败：\(error)")
             }
         } else if let snapshot {
-            statusLabel.stringValue = "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))"
+            setLabelText(statusLabel, "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))")
         } else {
-            statusLabel.stringValue = "暂无数据"
+            setLabelText(statusLabel, "暂无数据")
         }
     }
 
@@ -2125,11 +2167,18 @@ final class QuotaRowView: NSView {
     private let placeholderTitle: String
     private let titleLabel: NSTextField
     private let barView = SegmentedBatteryBarView(segmentCount: 28)
-    private let detailLabel = NSTextField(labelWithString: "--% · --")
+    private let detailLabel: NSTextField
+    private let titleWidth: CGFloat
+    private let detailWidth: CGFloat
+    private let barMinWidth: CGFloat
 
-    init(title: String) {
+    init(title: String, titleWidth: CGFloat = 52, detailWidth: CGFloat = 112, barMinWidth: CGFloat = 220) {
         self.placeholderTitle = title
         self.titleLabel = NSTextField(labelWithString: title)
+        self.detailLabel = NSTextField(labelWithString: "--% · --")
+        self.titleWidth = titleWidth
+        self.detailWidth = detailWidth
+        self.barMinWidth = barMinWidth
         super.init(frame: .zero)
         setup()
         update(bucket: nil)
@@ -2139,30 +2188,67 @@ final class QuotaRowView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// 标题可能被截断（如 GLM-5-Turbo），悬停显示完整文本。
+    private func setRowTitle(_ text: String) {
+        titleLabel.stringValue = text
+        titleLabel.toolTip = text
+    }
+
     func update(bucket: QuotaBucket?) {
         guard let bucket else {
-            titleLabel.stringValue = placeholderTitle
+            setRowTitle(placeholderTitle)
             barView.percent = 0
             detailLabel.stringValue = "--% · --"
+            detailLabel.toolTip = nil
             return
         }
 
-        titleLabel.stringValue = bucket.title
+        setRowTitle(bucket.title)
         barView.percent = bucket.remainingPercent
         detailLabel.stringValue = "\(bucket.roundedRemainingPercent)% · \(formatReset(bucket.resetsAt))"
     }
 
     func update(limit: ZAILimit?) {
         guard let limit else {
-            titleLabel.stringValue = placeholderTitle
+            setRowTitle(placeholderTitle)
             barView.percent = 0
             detailLabel.stringValue = "--% · --"
+            detailLabel.toolTip = nil
             return
         }
 
-        titleLabel.stringValue = limit.title
+        setRowTitle(limit.title)
         barView.percent = limit.remainingPercent
         detailLabel.stringValue = "\(limit.roundedRemainingPercent)% · \(formatReset(limit.nextResetTime))"
+    }
+
+    /// 体验套餐余额行：电量条按剩余/总量，detail 显示绝对 token 数与到期时间。
+    func update(balance: ZAIBalance?) {
+        guard let balance else {
+            setRowTitle(placeholderTitle)
+            barView.percent = 0
+            detailLabel.stringValue = "-- · --"
+            detailLabel.toolTip = nil
+            return
+        }
+
+        setRowTitle(balance.title)
+        barView.percent = balance.remainingFraction * 100
+        detailLabel.stringValue = "\(Self.formatTokenCount(balance.remainingUnits))/\(Self.formatTokenCount(balance.totalUnits)) · \(formatReset(balance.expiresAt))"
+        let used = Self.formatTokenCount(max(balance.totalUnits - balance.remainingUnits, 0))
+        let periodText = balance.isDaily ? "每日额度" : "一次性额度"
+        let verb = balance.isDaily ? "重置" : "到期"
+        detailLabel.toolTip = "\(balance.title) · \(periodText)，\(formatReset(balance.expiresAt)) \(verb)（已用 \(used)）"
+    }
+
+    /// token 数格式化：100000000 → "100.0M"。
+    static func formatTokenCount(_ value: Double) -> String {
+        switch value {
+        case 1e9...: return String(format: "%.1fB", value / 1e9)
+        case 1e6...: return String(format: "%.1fM", value / 1e6)
+        case 1e3...: return String(format: "%.1fK", value / 1e3)
+        default: return String(format: "%.0f", value)
+        }
     }
 
     private func setup() {
@@ -2171,6 +2257,9 @@ final class QuotaRowView: NSView {
         titleLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
         titleLabel.textColor = .labelColor
         titleLabel.alignment = .left
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.cell?.truncatesLastVisibleLine = true
+        titleLabel.cell?.wraps = false
 
         detailLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         detailLabel.textColor = .labelColor
@@ -2193,10 +2282,10 @@ final class QuotaRowView: NSView {
             row.topAnchor.constraint(equalTo: topAnchor),
             row.bottomAnchor.constraint(equalTo: bottomAnchor),
             heightAnchor.constraint(equalToConstant: 22),
-            titleLabel.widthAnchor.constraint(equalToConstant: 52),
-            detailLabel.widthAnchor.constraint(equalToConstant: 112),
+            titleLabel.widthAnchor.constraint(equalToConstant: titleWidth),
+            detailLabel.widthAnchor.constraint(equalToConstant: detailWidth),
             barView.heightAnchor.constraint(equalToConstant: 12),
-            barView.widthAnchor.constraint(greaterThanOrEqualToConstant: 220)
+            barView.widthAnchor.constraint(greaterThanOrEqualToConstant: barMinWidth)
         ])
     }
 }

@@ -3,6 +3,23 @@ import Foundation
 
 // MARK: - ZAI 配额数据模型
 
+/// 账号当前使用的 Z.AI/BigModel 接入形态。
+enum ZAIPlanKind: String, Codable {
+    /// 体验套餐（如注册赠送、周末活动包），走 zcode.z.ai 的 billing/balance。
+    case startPlan
+    /// 个人付费 Coding Plan，走 api.z.ai 的 monitor 接口。
+    case codingPlan
+    /// 平台 API Key 模式，无余额可查。
+    case apiKey
+}
+
+/// 从 ~/.zcode setting.json 解析出的当前渠道与所选 provider。
+struct ZAIProviderSelection: Equatable {
+    let domain: String
+    let kind: ZAIPlanKind
+    let selectedKey: String?
+}
+
 struct ZAILimit: Equatable, Codable {
     enum WindowUnit: Int, Codable {
         case hourly = 3
@@ -48,12 +65,68 @@ struct ZAILimit: Equatable, Codable {
     }
 }
 
+/// start-plan（体验套餐）里单个模型的余额桶，对应 billing/balance 的 balances[] 条目。
+struct ZAIBalance: Equatable, Codable {
+    let title: String
+    let totalUnits: Double
+    let remainingUnits: Double
+    let expiresAt: Date?
+    let period: String
+
+    var isDaily: Bool {
+        period.caseInsensitiveCompare("daily") == .orderedSame
+    }
+
+    var remainingFraction: Double {
+        guard totalUnits > 0 else { return 0 }
+        return min(max(remainingUnits / totalUnits, 0), 1)
+    }
+}
+
 struct ZAIQuotaSnapshot: Equatable, Codable {
+    let kind: ZAIPlanKind?
     let limits: [ZAILimit]
+    let balances: [ZAIBalance]
     let level: String?
+    let planName: String?
+    let planDescription: String?
+    let apiKeySuffix: String?
     let email: String?
     let fetchedAt: Date
 
+    init(kind: ZAIPlanKind? = nil,
+         limits: [ZAILimit] = [],
+         balances: [ZAIBalance] = [],
+         level: String? = nil,
+         planName: String? = nil,
+         planDescription: String? = nil,
+         apiKeySuffix: String? = nil,
+         email: String? = nil,
+         fetchedAt: Date = Date()) {
+        self.kind = kind
+        self.limits = limits
+        self.balances = balances
+        self.level = level
+        self.planName = planName
+        self.planDescription = planDescription
+        self.apiKeySuffix = apiKeySuffix
+        self.email = email
+        self.fetchedAt = fetchedAt
+    }
+
+    /// 新增字段用 decodeIfPresent，保证 UserDefaults 里的旧缓存仍能解码。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decodeIfPresent(ZAIPlanKind.self, forKey: .kind)
+        limits = try container.decodeIfPresent([ZAILimit].self, forKey: .limits) ?? []
+        balances = try container.decodeIfPresent([ZAIBalance].self, forKey: .balances) ?? []
+        level = try container.decodeIfPresent(String.self, forKey: .level)
+        planName = try container.decodeIfPresent(String.self, forKey: .planName)
+        planDescription = try container.decodeIfPresent(String.self, forKey: .planDescription)
+        apiKeySuffix = try container.decodeIfPresent(String.self, forKey: .apiKeySuffix)
+        email = try container.decodeIfPresent(String.self, forKey: .email)
+        fetchedAt = try container.decode(Date.self, forKey: .fetchedAt)
+    }
 }
 
 struct ZAIAccount: Equatable {
@@ -84,12 +157,42 @@ enum ZAIQuotaError: LocalizedError {
 
 enum ZAISettings {
     /// 优先读 ~/.zcode/setting.json；兼容当前 zcode 的 v2 子目录。
+    /// zai / bigmodel 两个渠道都属于 GLM 家族，都展示余额区块。
     static func isZAIDomain() -> Bool {
+        resolveProviderSelection() != nil
+    }
+
+    /// 从 setting.json 解析当前渠道（zai/bigmodel）与所选 provider 对应的账号形态。
+    /// selectedKey 形如 "coding-plan:builtin:zai-start-plan" / "api-key:builtin:zai"。
+    static func resolveProviderSelection() -> ZAIProviderSelection? {
         guard let url = settingURLs.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
               let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return false }
-        return (object["providerFamilyDomain"] as? String) == "zai"
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let domain = object["providerFamilyDomain"] as? String,
+              domain == "zai" || domain == "bigmodel"
+        else { return nil }
+
+        let selectedKey = (object["modelProviderFamilySelectedKeys"] as? [String: String])?[domain]
+        let kind: ZAIPlanKind
+        if let key = selectedKey?.lowercased() {
+            if key.contains("start-plan") {
+                kind = .startPlan
+            } else if key.contains("coding-plan") {
+                kind = .codingPlan
+            } else if key.hasPrefix("api-key") {
+                kind = .apiKey
+            } else {
+                kind = fallbackKind(object: object, domain: domain)
+            }
+        } else {
+            kind = fallbackKind(object: object, domain: domain)
+        }
+        return ZAIProviderSelection(domain: domain, kind: kind, selectedKey: selectedKey)
+    }
+
+    private static func fallbackKind(object: [String: Any], domain: String) -> ZAIPlanKind {
+        let mode = (object["modelProviderFamilyModes"] as? [String: String])?[domain]
+        return mode == "oauth" ? .codingPlan : .apiKey
     }
 
     private static var zcodeV2URL: URL? {
@@ -109,7 +212,8 @@ enum ZAISettings {
     }
 
     /// 从 credentials.json 解密出 OAuth access token 与用户信息。
-    static func loadCredentials() throws -> (accessToken: String, userInfo: [String: Any]?) {
+    /// bigmodel 渠道优先找 oauth:bigmodel:*，回退 oauth:zai:*（两渠道共用 zai OAuth 的历史布局）。
+    static func loadCredentials(domain: String = "zai") throws -> (accessToken: String, userInfo: [String: Any]?) {
         guard let v2 = zcodeV2URL else { throw ZAIQuotaError.credentialsMissing }
         let credsURL = v2.appendingPathComponent("credentials.json")
         guard let data = try? Data(contentsOf: credsURL),
@@ -118,12 +222,14 @@ enum ZAISettings {
 
         let cipher = ZAICredentialCipher()
 
-        let encryptedToken = object["oauth:zai:access_token"] ?? ""
+        let encryptedToken = object["oauth:\(domain):access_token"]
+            ?? object["oauth:zai:access_token"] ?? ""
         guard !encryptedToken.isEmpty else { throw ZAIQuotaError.credentialsMissing }
         let token = try cipher.decrypt(encryptedToken)
 
         var userInfo: [String: Any]?
-        if let encryptedUser = object["oauth:zai:user_info"], !encryptedUser.isEmpty {
+        let encryptedUser = object["oauth:\(domain):user_info"] ?? object["oauth:zai:user_info"]
+        if let encryptedUser, !encryptedUser.isEmpty {
             if let plain = try? cipher.decrypt(encryptedUser),
                let jsonData = plain.data(using: .utf8),
                let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
@@ -136,11 +242,56 @@ enum ZAISettings {
 
     /// 账号信息来自本地加密的 user_info，不依赖额度接口。
     static func loadAccount() -> ZAIAccount? {
-        guard let userInfo = try? loadCredentials().userInfo else { return nil }
+        let domain = resolveProviderSelection()?.domain ?? "zai"
+        guard let userInfo = try? loadCredentials(domain: domain).userInfo else { return nil }
         let nestedUser = userInfo["user"] as? [String: Any]
         return ZAIAccount(
             email: (userInfo["email"] as? String) ?? (nestedUser?["email"] as? String)
         )
+    }
+
+    // MARK: config.json（provider 明文配置）
+
+    /// 读取 config.json 中某个 provider 的配置块。
+    private static func providerConfig(_ providerID: String) -> [String: Any]? {
+        guard let v2 = zcodeV2URL,
+              let data = try? Data(contentsOf: v2.appendingPathComponent("config.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let provider = object["provider"] as? [String: Any]
+        else { return nil }
+        return provider[providerID] as? [String: Any]
+    }
+
+    /// provider 配置里的明文 apiKey（zai-start-plan 存的是 JWT，api-key 模式存的是平台 Key）。
+    static func providerAPIKey(_ providerID: String) -> String? {
+        guard let config = providerConfig(providerID),
+              let apiKey = (config["options"] as? [String: Any])?["apiKey"] as? String,
+              !apiKey.isEmpty
+        else { return nil }
+        return apiKey
+    }
+
+    /// start-plan 计费查询凭证：优先 config.json 里体验套餐 provider 的明文 JWT，
+    /// 回退解密 credentials.json 的 zcodejwttoken。
+    static func loadStartPlanToken(domain: String) throws -> String {
+        if let jwt = providerAPIKey("builtin:\(domain)-start-plan"),
+           jwt.split(separator: ".").count == 3 {
+            return jwt
+        }
+        guard let v2 = zcodeV2URL,
+              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+              let encrypted = object["zcodejwttoken"], !encrypted.isEmpty
+        else { throw ZAIQuotaError.credentialsMissing }
+        return try ZAICredentialCipher().decrypt(encrypted)
+    }
+
+    /// selectedKey（"api-key:builtin:zai"）里去掉首个模式前缀后的 provider id。
+    static func providerID(fromSelectedKey selectedKey: String?, domain: String) -> String {
+        guard let selectedKey else { return "builtin:\(domain)" }
+        let parts = selectedKey.split(separator: ":").map(String.init)
+        guard parts.count >= 2 else { return "builtin:\(domain)" }
+        return parts[1...].joined(separator: ":")
     }
 }
 
@@ -196,10 +347,24 @@ private extension Data {
 // MARK: - ZAI 额度 HTTP 客户端
 
 enum ZAIQuotaEndpoint {
-    private static let baseURL = URL(string: "https://api.z.ai")!
+    /// 个人付费 Coding Plan 用 api.z.ai，bigmodel 渠道用 open.bigmodel.cn。
+    private static func codingPlanBaseURL(domain: String) -> URL {
+        URL(string: domain == "bigmodel" ? "https://open.bigmodel.cn" : "https://api.z.ai")!
+    }
 
-    static func makeRequest(token: String) -> URLRequest {
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/monitor/usage/quota/limit"))
+    static func makeCodingPlanRequest(token: String, domain: String) -> URLRequest {
+        var request = URLRequest(url: codingPlanBaseURL(domain: domain)
+            .appendingPathComponent("api/monitor/usage/quota/limit"))
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        return request
+    }
+
+    /// start-plan（体验套餐）计费余额，凭证是套餐 JWT 而非 OAuth token。
+    static func makeStartPlanBalanceRequest(token: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://zcode.z.ai/api/v1/zcode-plan/billing/balance")!)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -265,17 +430,109 @@ final class ZAIQuotaStore {
     }
 
     private func fetchSnapshot() async throws -> ZAIQuotaSnapshot {
-        let (token, userInfo) = try ZAISettings.loadCredentials()
-        let request = ZAIQuotaEndpoint.makeRequest(token: token)
+        guard let selection = ZAISettings.resolveProviderSelection() else {
+            throw ZAIQuotaError.credentialsMissing
+        }
+        switch selection.kind {
+        case .apiKey:
+            return makeAPIKeySnapshot(selection: selection)
+        case .startPlan:
+            return try await fetchStartPlanSnapshot(selection: selection)
+        case .codingPlan:
+            return try await fetchCodingPlanSnapshot(selection: selection)
+        }
+    }
+
+    /// API Key 模式没有余额接口，本地组装快照供 UI 区分展示。
+    private func makeAPIKeySnapshot(selection: ZAIProviderSelection) -> ZAIQuotaSnapshot {
+        let providerID = ZAISettings.providerID(fromSelectedKey: selection.selectedKey, domain: selection.domain)
+        let apiKey = ZAISettings.providerAPIKey(providerID)
+            ?? ZAISettings.providerAPIKey("builtin:\(selection.domain)")
+        return ZAIQuotaSnapshot(
+            kind: .apiKey,
+            apiKeySuffix: apiKey.map { String($0.suffix(4)) },
+            email: ZAISettings.loadAccount()?.email
+        )
+    }
+
+    /// 体验套餐：GET zcode.z.ai/api/v1/zcode-plan/billing/balance（Bearer 套餐 JWT）。
+    private func fetchStartPlanSnapshot(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
+        let token = try ZAISettings.loadStartPlanToken(domain: selection.domain)
+        let request = ZAIQuotaEndpoint.makeStartPlanBalanceRequest(token: token)
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             throw ZAIQuotaError.requestFailed("HTTP \(status)")
         }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw ZAIQuotaError.malformedResponse }
+        try Self.checkBusinessError(object)
 
-        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataPayload = object["data"] as? [String: Any]
+        guard let dataPayload = object["data"] as? [String: Any]
+        else { throw ZAIQuotaError.malformedResponse }
+
+        // plans[] 提供套餐名；entitlements[] 的 period 需按 entitlement_id 关联到 balances[]。
+        let plans = (dataPayload["plans"] as? [[String: Any]]) ?? []
+        let activePlan = plans.first { ($0["status"] as? String) == "active" } ?? plans.first
+        var periodByEntitlement: [String: String] = [:]
+        for plan in plans {
+            for entitlement in (plan["entitlements"] as? [[String: Any]]) ?? [] {
+                if let id = entitlement["entitlement_id"] as? String,
+                   let period = entitlement["period"] as? String {
+                    periodByEntitlement[id] = period
+                }
+            }
+        }
+
+        let balances: [(priority: Int, balance: ZAIBalance)] = ((dataPayload["balances"] as? [[String: Any]]) ?? []).compactMap { balance in
+            let totalUnits = (balance["total_units"] as? NSNumber)?.doubleValue ?? 0
+            guard totalUnits > 0 else { return nil }
+            let entitlementID = balance["entitlement_id"] as? String
+            // period 缺失时按周期跨度推断：跨天视为 one_time，当天内视为 daily。
+            let period = entitlementID.flatMap { periodByEntitlement[$0] }
+                ?? Self.inferPeriod(start: (balance["period_start"] as? NSNumber)?.doubleValue,
+                                    end: (balance["period_end"] as? NSNumber)?.doubleValue)
+            return (
+                priority: (balance["priority"] as? NSNumber)?.intValue ?? 0,
+                balance: ZAIBalance(
+                    title: (balance["show_name"] as? String) ?? "额度",
+                    totalUnits: totalUnits,
+                    remainingUnits: (balance["remaining_units"] as? NSNumber)?.doubleValue
+                        ?? (balance["available_units"] as? NSNumber)?.doubleValue ?? 0,
+                    expiresAt: Self.secondLevelDate(balance["expires_at"]),
+                    period: period
+                )
+            )
+        }.sorted { $0.priority > $1.priority }
+        let visibleBalances = balances.map(\.balance)
+
+        return ZAIQuotaSnapshot(
+            kind: .startPlan,
+            balances: Array(visibleBalances),
+            planName: activePlan?["name"] as? String,
+            planDescription: activePlan?["description"] as? String,
+            email: ZAISettings.loadAccount()?.email
+        )
+    }
+
+    /// 个人付费 Coding Plan：GET api/monitor/usage/quota/limit（Bearer OAuth token）。
+    private func fetchCodingPlanSnapshot(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
+        let (token, userInfo) = try ZAISettings.loadCredentials(domain: selection.domain)
+        let request = ZAIQuotaEndpoint.makeCodingPlanRequest(token: token, domain: selection.domain)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw ZAIQuotaError.requestFailed("HTTP \(status)")
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { throw ZAIQuotaError.malformedResponse }
+
+        // 业务失败时接口仍返回 HTTP 200，但 success=false，此时把服务端 msg 展示出来。
+        try Self.checkBusinessError(object)
+
+        guard let dataPayload = object["data"] as? [String: Any]
         else { throw ZAIQuotaError.malformedResponse }
 
         let rawLimits = (dataPayload["limits"] as? [[String: Any]]) ?? []
@@ -307,7 +564,36 @@ final class ZAIQuotaStore {
         let level = dataPayload["level"] as? String
         let email = userInfo?["email"] as? String
 
-        return ZAIQuotaSnapshot(limits: limits, level: level, email: email, fetchedAt: Date())
+        return ZAIQuotaSnapshot(
+            kind: .codingPlan,
+            limits: limits,
+            level: level,
+            email: email
+        )
+    }
+
+    /// 两套接口的业务错误风格：api.z.ai 成功码是 200，zcode.z.ai 是 0，失败时都带 msg。
+    private static func checkBusinessError(_ object: [String: Any]) throws {
+        if let success = object["success"] as? Bool, !success {
+            let message = (object["msg"] as? String) ?? "未知错误"
+            throw ZAIQuotaError.requestFailed(message)
+        }
+        if let code = (object["code"] as? NSNumber)?.intValue, code != 0 && code != 200 {
+            let message = (object["msg"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "未知错误(\(code))"
+            throw ZAIQuotaError.requestFailed(message)
+        }
+    }
+
+    /// billing/balance 的时间戳是秒级，超过 1e12 视为毫秒兜底。
+    private static func secondLevelDate(_ value: Any?) -> Date? {
+        guard let number = value as? NSNumber else { return nil }
+        let seconds = number.doubleValue > 1e12 ? number.doubleValue / 1000 : number.doubleValue
+        return Date(timeIntervalSince1970: seconds)
+    }
+
+    private static func inferPeriod(start: Double?, end: Double?) -> String {
+        guard let start, let end else { return "one_time" }
+        return (end - start) > 36 * 3600 ? "one_time" : "daily"
     }
 }
 
