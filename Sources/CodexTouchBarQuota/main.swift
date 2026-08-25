@@ -1477,6 +1477,11 @@ final class QuotaViewController: NSViewController {
         QuotaRowView(title: "小时", titleWidth: 80, detailWidth: 160, barMinWidth: 156),
         QuotaRowView(title: "周", titleWidth: 80, detailWidth: 160, barMinWidth: 156)
     ]
+    private let zaiResetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
+    private let zaiResetCreditsValueLabel = NSTextField(labelWithString: "--")
+    private let zaiResetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
+    private lazy var zaiResetCreditsRow = makeZAIResetCreditsRow()
+    private var currentZAIResetCreditCards: [ZAIResetCreditCard]?
     private lazy var zaiSection = makeZAISection()
     private var shouldShowZAISection = false
     private var contentStack: NSStackView?
@@ -1553,6 +1558,7 @@ final class QuotaViewController: NSViewController {
             zaiLevelTag.backgroundColor = .systemGray
             zaiLevelTag.toolTip = "API Key 模式，无余额数据"
             zaiRows.forEach { $0.isHidden = true }
+            zaiResetCreditsRow.isHidden = true
         case .startPlan:
             // tag 显示 name（如 "ZCode Start Plan"）；description（如 "GLM-5.3 周末活动"）可能过长，放 tooltip。
             let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
@@ -1569,6 +1575,7 @@ final class QuotaViewController: NSViewController {
                     row.isHidden = true
                 }
             }
+            zaiResetCreditsRow.isHidden = true
         case .codingPlan:
             setLabelText(zaiLevelTag, snapshot?.level ?? "")
             zaiLevelTag.backgroundColor = .systemBlue
@@ -1578,6 +1585,8 @@ final class QuotaViewController: NSViewController {
                 row.update(limit: limits.first { $0.unit == unit })
                 row.isHidden = false
             }
+            zaiResetCreditsRow.isHidden = false
+            updateZAIResetCredits(snapshot?.resetCreditCards)
         }
         zaiLevelTag.isHidden = zaiLevelTag.stringValue.isEmpty
 
@@ -1796,6 +1805,20 @@ final class QuotaViewController: NSViewController {
         zaiRefreshButton.target = self
         zaiRefreshButton.action = #selector(zaiRefreshTapped)
 
+        zaiResetCreditsTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        zaiResetCreditsTitleLabel.textColor = .labelColor
+        zaiResetCreditsValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        zaiResetCreditsValueLabel.textColor = .labelColor
+        zaiResetCreditsValueLabel.alignment = .left
+
+        zaiResetCreditsExpirationButton.bezelStyle = .rounded
+        zaiResetCreditsExpirationButton.controlSize = .small
+        zaiResetCreditsExpirationButton.font = .systemFont(ofSize: 11)
+        zaiResetCreditsExpirationButton.toolTip = "查看每张重置额度的过期时间"
+        zaiResetCreditsExpirationButton.target = self
+        zaiResetCreditsExpirationButton.action = #selector(showZAIResetCreditExpirationsTapped)
+        zaiResetCreditsExpirationButton.isHidden = true
+
         let titleLine = NSStackView(views: [zaiTitleLabel, zaiEmailLabel, zaiLevelTag, NSView()])
         titleLine.orientation = .horizontal
         titleLine.alignment = .lastBaseline
@@ -1811,7 +1834,7 @@ final class QuotaViewController: NSViewController {
         header.alignment = .centerY
         header.spacing = 12
 
-        let rows = NSStackView(views: zaiRows)
+        let rows = NSStackView(views: zaiRows + [zaiResetCreditsRow])
         rows.orientation = .vertical
         rows.alignment = .leading
         rows.spacing = 4
@@ -1868,6 +1891,85 @@ final class QuotaViewController: NSViewController {
 
     @objc private func showResetCreditExpirationsTapped() {
         showResetCreditExpirations(currentResetCreditCards ?? [])
+    }
+
+    // MARK: ZAI 重置额度（coding-plan）
+
+    private func makeZAIResetCreditsRow() -> NSStackView {
+        let row = NSStackView(views: [zaiResetCreditsTitleLabel, zaiResetCreditsValueLabel, zaiResetCreditsExpirationButton, NSView()])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(equalToConstant: 20),
+            zaiResetCreditsTitleLabel.widthAnchor.constraint(equalToConstant: 108),
+            zaiResetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 32),
+            zaiResetCreditsExpirationButton.widthAnchor.constraint(equalToConstant: 76)
+        ])
+
+        return row
+    }
+
+    private func updateZAIResetCredits(_ cards: [ZAIResetCreditCard]?) {
+        currentZAIResetCreditCards = cards
+        zaiResetCreditsValueLabel.stringValue = cards.map { String($0.count) } ?? "--"
+        zaiResetCreditsExpirationButton.isHidden = (cards?.count ?? 0) <= 0
+    }
+
+    @objc private func showZAIResetCreditExpirationsTapped() {
+        let alert = NSAlert()
+        alert.messageText = "重置额度过期时间"
+        let cards = currentZAIResetCreditCards ?? []
+        if cards.isEmpty {
+            alert.informativeText = "没有查到可展示的重置额度过期时间。"
+        } else {
+            alert.accessoryView = Self.makeZAIResetCreditExpirationList(cards)
+        }
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private static func makeZAIResetCreditExpirationList(_ cards: [ZAIResetCreditCard]) -> NSView {
+        let now = Date()
+        let warningInterval: TimeInterval = 7 * 24 * 60 * 60
+        let listWidth: CGFloat = 320
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        for (index, card) in cards.enumerated() {
+            let line = "\(index + 1). \(card.kind.title) · 过期 \(formatCompactDateTime(card.expiresAt))"
+            let expiresSoon = card.expiresAt.map { $0.timeIntervalSince(now) < warningInterval } ?? false
+            let label = NSTextField(labelWithString: line)
+            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+            label.textColor = expiresSoon ? .systemRed : .labelColor
+            label.alignment = .center
+            label.lineBreakMode = .byClipping
+            label.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(label)
+            label.widthAnchor.constraint(equalToConstant: listWidth).isActive = true
+        }
+
+        let listHeight = min(CGFloat(cards.count * 22), 180)
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: listWidth, height: listHeight))
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.backgroundColor = .clear
+        scrollView.contentView.drawsBackground = false
+        scrollView.hasVerticalScroller = cards.count > 8
+        scrollView.hasHorizontalScroller = false
+        scrollView.documentView = stack
+
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalToConstant: listWidth),
+            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: CGFloat(cards.count * 20))
+        ])
+
+        return scrollView
     }
 
     @objc private func refreshTapped() {

@@ -83,10 +83,29 @@ struct ZAIBalance: Equatable, Codable {
     }
 }
 
+/// coding-plan 的重置额度卡，来自 zcode.z.ai 的 coding-plan/reset/status。
+struct ZAIResetCreditCard: Equatable, Codable {
+    enum Kind: String, Codable {
+        case fiveHour
+        case week
+
+        var title: String {
+            switch self {
+            case .fiveHour: return "5小时额度"
+            case .week: return "周额度"
+            }
+        }
+    }
+
+    let kind: Kind
+    let expiresAt: Date?
+}
+
 struct ZAIQuotaSnapshot: Equatable, Codable {
     let kind: ZAIPlanKind?
     let limits: [ZAILimit]
     let balances: [ZAIBalance]
+    let resetCreditCards: [ZAIResetCreditCard]?
     let level: String?
     let planName: String?
     let planDescription: String?
@@ -97,6 +116,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
     init(kind: ZAIPlanKind? = nil,
          limits: [ZAILimit] = [],
          balances: [ZAIBalance] = [],
+         resetCreditCards: [ZAIResetCreditCard]? = nil,
          level: String? = nil,
          planName: String? = nil,
          planDescription: String? = nil,
@@ -106,6 +126,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         self.kind = kind
         self.limits = limits
         self.balances = balances
+        self.resetCreditCards = resetCreditCards
         self.level = level
         self.planName = planName
         self.planDescription = planDescription
@@ -120,6 +141,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         kind = try container.decodeIfPresent(ZAIPlanKind.self, forKey: .kind)
         limits = try container.decodeIfPresent([ZAILimit].self, forKey: .limits) ?? []
         balances = try container.decodeIfPresent([ZAIBalance].self, forKey: .balances) ?? []
+        resetCreditCards = try container.decodeIfPresent([ZAIResetCreditCard].self, forKey: .resetCreditCards)
         level = try container.decodeIfPresent(String.self, forKey: .level)
         planName = try container.decodeIfPresent(String.self, forKey: .planName)
         planDescription = try container.decodeIfPresent(String.self, forKey: .planDescription)
@@ -278,6 +300,11 @@ enum ZAISettings {
            jwt.split(separator: ".").count == 3 {
             return jwt
         }
+        return try loadZCodeJWTToken()
+    }
+
+    /// coding-plan 重置额度接口的凭证之一：credentials.json 的 zcodejwttoken。
+    static func loadZCodeJWTToken() throws -> String {
         guard let v2 = zcodeV2URL,
               let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
@@ -368,6 +395,19 @@ enum ZAIQuotaEndpoint {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        return request
+    }
+
+    /// coding-plan 重置额度状态。z.ai / bigmodel 两渠道共用 zcode.z.ai，
+    /// 靠 X-Bigmodel-Authorization 里的 OAuth token 区分账号体系。
+    static func makeCodingPlanResetStatusRequest(jwt: String, oauthToken: String) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://zcode.z.ai/api/v1/coding-plan/reset/status")!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization")
+        request.setValue(oauthToken, forHTTPHeaderField: "X-Bigmodel-Authorization")
+        request.setValue("PERSONAL", forHTTPHeaderField: "Bigmodel-Target-Type")
         request.timeoutInterval = 15
         return request
     }
@@ -564,12 +604,38 @@ final class ZAIQuotaStore {
         let level = dataPayload["level"] as? String
         let email = userInfo?["email"] as? String
 
+        // 重置额度是增量信息：单独容错，失败不影响主额度展示。
+        let resetCreditCards = try? await fetchResetCreditCards(domain: selection.domain, oauthToken: token)
+
         return ZAIQuotaSnapshot(
             kind: .codingPlan,
             limits: limits,
+            resetCreditCards: resetCreditCards,
             level: level,
             email: email
         )
+    }
+
+    /// coding-plan 重置额度：GET zcode.z.ai/api/v1/coding-plan/reset/status。
+    /// 响应 data.available_five_hour_resets / available_week_resets 各是 {expire_at} 数组。
+    private func fetchResetCreditCards(domain: String, oauthToken: String) async throws -> [ZAIResetCreditCard]? {
+        let jwt = try ZAISettings.loadZCodeJWTToken()
+        let request = ZAIQuotaEndpoint.makeCodingPlanResetStatusRequest(jwt: jwt, oauthToken: oauthToken)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              (try? Self.checkBusinessError(object)) != nil,
+              let dataPayload = object["data"] as? [String: Any]
+        else { return nil }
+
+        func cards(_ key: String, kind: ZAIResetCreditCard.Kind) -> [ZAIResetCreditCard] {
+            ((dataPayload[key] as? [[String: Any]]) ?? []).map {
+                ZAIResetCreditCard(kind: kind, expiresAt: Self.secondLevelDate($0["expire_at"]))
+            }
+        }
+        return cards("available_five_hour_resets", kind: .fiveHour)
+            + cards("available_week_resets", kind: .week)
     }
 
     /// 两套接口的业务错误风格：api.z.ai 成功码是 200，zcode.z.ai 是 0，失败时都带 msg。
