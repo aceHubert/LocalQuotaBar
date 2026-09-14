@@ -2,17 +2,23 @@
 import PackageDescription
 
 let package = Package(
-    name: "CodexTouchBarQuota",
+    name: "LocalQuotaBar",
     platforms: [
-        .macOS(.v12)
+        .macOS(.v13)
     ],
     products: [
-        .executable(name: "CodexTouchBarQuota", targets: ["CodexTouchBarQuota"])
+        .executable(name: "LocalQuotaBar", targets: ["LocalQuotaBar"])
+    ],
+    dependencies: [
+        // 真正的灵动岛 API：DynamicNotchKit（MIT 协议，作者 MrKai77）。
+        // .floating 风格自动处理非刘海屏，.notch 风格贴合刘海。
+        .package(url: "https://github.com/MrKai77/DynamicNotchKit", from: "1.0.0")
     ],
     targets: [
         .executableTarget(
-            name: "CodexTouchBarQuota",
-            path: "Sources/CodexTouchBarQuota",
+            name: "LocalQuotaBar",
+            dependencies: ["DynamicNotchKit"],
+            path: "Sources/LocalQuotaBar",
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
             ]

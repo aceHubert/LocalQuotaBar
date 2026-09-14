@@ -83,6 +83,23 @@ struct ZAIBalance: Equatable, Codable {
     }
 }
 
+/// start-plan 的权益项（plans[].entitlements[]）。
+/// 余额接口在权益生效前（effective_at 未到）不返回 balances，只返回这份数据，
+/// 用于「待生效」额度展示——套餐未到开始时间是一个正常状态，不是错误。
+struct ZAIPendingEntitlement: Equatable, Codable {
+    let title: String
+    let grantUnits: Double
+    let effectiveAt: Date?
+    let period: String
+    /// 过期时间：权益自身 expires_at 缺失时回退到套餐 ends_at。
+    /// 待生效行的进度条信息按过期时间展示，与余额行口径一致。
+    let expiresAt: Date?
+
+    var isDaily: Bool {
+        period.caseInsensitiveCompare("daily") == .orderedSame
+    }
+}
+
 /// coding-plan 的重置额度卡，来自 zcode.z.ai 的 coding-plan/reset/status。
 struct ZAIResetCreditCard: Equatable, Codable {
     enum Kind: String, Codable {
@@ -112,6 +129,12 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
     let apiKeySuffix: String?
     let email: String?
     let fetchedAt: Date
+    /// start-plan 套餐自身状态与时间（plans[].status / starts_at / ends_at）。
+    let planStatus: String?
+    let planStartAt: Date?
+    let planEndAt: Date?
+    /// start-plan 权益项（plans[].entitlements[]）；生效前 balances 为空、用它展示待生效额度。
+    let pendingEntitlements: [ZAIPendingEntitlement]
 
     init(kind: ZAIPlanKind? = nil,
          limits: [ZAILimit] = [],
@@ -122,7 +145,11 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
          planDescription: String? = nil,
          apiKeySuffix: String? = nil,
          email: String? = nil,
-         fetchedAt: Date = Date()) {
+         fetchedAt: Date = Date(),
+         planStatus: String? = nil,
+         planStartAt: Date? = nil,
+         planEndAt: Date? = nil,
+         pendingEntitlements: [ZAIPendingEntitlement] = []) {
         self.kind = kind
         self.limits = limits
         self.balances = balances
@@ -133,6 +160,10 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         self.apiKeySuffix = apiKeySuffix
         self.email = email
         self.fetchedAt = fetchedAt
+        self.planStatus = planStatus
+        self.planStartAt = planStartAt
+        self.planEndAt = planEndAt
+        self.pendingEntitlements = pendingEntitlements
     }
 
     /// 新增字段用 decodeIfPresent，保证 UserDefaults 里的旧缓存仍能解码。
@@ -148,6 +179,10 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         apiKeySuffix = try container.decodeIfPresent(String.self, forKey: .apiKeySuffix)
         email = try container.decodeIfPresent(String.self, forKey: .email)
         fetchedAt = try container.decode(Date.self, forKey: .fetchedAt)
+        planStatus = try container.decodeIfPresent(String.self, forKey: .planStatus)
+        planStartAt = try container.decodeIfPresent(Date.self, forKey: .planStartAt)
+        planEndAt = try container.decodeIfPresent(Date.self, forKey: .planEndAt)
+        pendingEntitlements = try container.decodeIfPresent([ZAIPendingEntitlement].self, forKey: .pendingEntitlements) ?? []
     }
 }
 
@@ -293,6 +328,18 @@ enum ZAISettings {
         return apiKey
     }
 
+    /// start-plan provider（builtin:<domain>-start-plan）的 baseURL 与 apiKey。
+    /// 不同 plan 的 provider 各自独立配置；余额端点与凭证都从它取，
+    /// 不再硬编码 zcode.z.ai。
+    static func startPlanProviderConfig(domain: String) -> (baseURL: URL?, apiKey: String?) {
+        guard let config = providerConfig("builtin:\(domain)-start-plan"),
+              let options = config["options"] as? [String: Any]
+        else { return (nil, nil) }
+        let baseURL = (options["baseURL"] as? String).flatMap { $0.isEmpty ? nil : URL(string: $0) }
+        let apiKey = (options["apiKey"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+        return (baseURL, apiKey)
+    }
+
     /// start-plan 计费查询凭证：优先 config.json 里体验套餐 provider 的明文 JWT，
     /// 回退解密 credentials.json 的 zcodejwttoken。
     static func loadStartPlanToken(domain: String) throws -> String {
@@ -389,9 +436,20 @@ enum ZAIQuotaEndpoint {
         return request
     }
 
-    /// start-plan（体验套餐）计费余额，凭证是套餐 JWT 而非 OAuth token。
-    static func makeStartPlanBalanceRequest(token: String) -> URLRequest {
-        var request = URLRequest(url: URL(string: "https://zcode.z.ai/api/v1/zcode-plan/billing/balance")!)
+    /// start-plan（体验套餐）计费余额。端点跟随该 provider 自身配置：
+    /// baseURL 取自 config.json 的 builtin:<domain>-start-plan（形如 …/api/v1/zcode-plan/anthropic），
+    /// 余额端点为同 origin 下的 /api/v1/zcode-plan/billing/balance，需带 app_version（与 zcode 官方一致）。
+    /// 凭证是套餐 JWT（provider 的 options.apiKey），而非 OAuth token。
+    static func makeStartPlanBalanceRequest(token: String, baseURL: URL) -> URLRequest {
+        var components = URLComponents()
+        components.scheme = baseURL.scheme
+        components.host = baseURL.host
+        components.port = baseURL.port
+        components.path = "/api/v1/zcode-plan/billing/balance"
+        components.queryItems = [URLQueryItem(name: "app_version", value: "3.10.1")]
+        let url = components.url
+            ?? URL(string: "https://zcode.z.ai/api/v1/zcode-plan/billing/balance?app_version=3.10.1")!
+        var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -418,6 +476,8 @@ enum ZAIQuotaEndpoint {
 @MainActor
 final class ZAIQuotaStore {
     static let refreshCooldown: TimeInterval = 5 * 60
+    /// 后台周期刷新间隔，默认与 Codex 一致，可在状态栏右键菜单调整。
+    private(set) var refreshInterval: TimeInterval
     private let session: URLSession
 
     private(set) var snapshot: ZAIQuotaSnapshot?
@@ -425,6 +485,7 @@ final class ZAIQuotaStore {
     private(set) var isRefreshing = false
     private(set) var lastError: String?
     private var lastRefreshedAt: Date?
+    private var timer: Timer?
 
     var onChange: ((ZAIQuotaSnapshot?, ZAIAccount?, Bool, String?) -> Void)?
 
@@ -435,15 +496,42 @@ final class ZAIQuotaStore {
         session = URLSession(configuration: configuration)
         snapshot = ZAIQuotaCache.load()
         account = ZAISettings.loadAccount()
+        refreshInterval = RefreshSettings.load()
     }
 
-    /// 展开面板时调用；受 5 分钟冷却保护，避免频繁请求。
-    func refreshIfNeeded() {
-        if isRefreshing { return }
-        if let last = lastRefreshedAt, Date().timeIntervalSince(last) < Self.refreshCooldown {
-            onChange?(snapshot, account, false, lastError)
-            return
+    /// 启动后台周期刷新：启动立即刷一次，之后按设置的间隔重复（与 Codex store 行为对齐）。
+    /// 显隐控制交给 UI 层（setZAISectionVisible / isZAIDomain），refresh 内部用
+    /// `guard !isRefreshing` 防止重入。
+    func start() {
+        timer?.invalidate()
+        refresh()
+        scheduleTimer()
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    /// 修改自动刷新间隔；已在运行时则按新间隔重建定时器，不额外触发一次网络刷新。
+    func setRefreshInterval(_ interval: TimeInterval) {
+        refreshInterval = interval
+        guard timer != nil else { return }
+        timer?.invalidate()
+        scheduleTimer()
+    }
+
+    private func scheduleTimer() {
+        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refresh()
+            }
         }
+    }
+
+    /// 已弃用：start() 与 timer 回调直接调 refresh()，行为与 Codex `refresh(force:)` 一致。
+    /// 保留以兼容可能存在的旧调用点（实际目前已无人调用）。
+    func refreshIfNeeded() {
         refresh()
     }
 
@@ -495,10 +583,24 @@ final class ZAIQuotaStore {
         )
     }
 
-    /// 体验套餐：GET zcode.z.ai/api/v1/zcode-plan/billing/balance（Bearer 套餐 JWT）。
+    /// 体验套餐余额。数据源顺序：
+    /// 1) zcode host 日志（host 每 ~秒拉一次 billing/balance 并把完整响应落盘，
+    ///    与 ZCode 界面一致；app 直连 zcode.z.ai 常被网关拦截，用日志兜底）。
+    /// 2) 直连 GET zcode.z.ai/api/v1/zcode-plan/billing/balance（provider 自身的 baseURL + JWT）。
     private func fetchStartPlanSnapshot(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
+        let now = Date()
+        if let payload = Self.latestStartPlanBalancePayload(domain: selection.domain) {
+            return try Self.parseStartPlanSnapshot(payload: payload, selection: selection, fetchedAt: now)
+        }
+        return try await fetchStartPlanSnapshotNetwork(selection: selection)
+    }
+
+    private func fetchStartPlanSnapshotNetwork(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
+        let providerConfig = ZAISettings.startPlanProviderConfig(domain: selection.domain)
         let token = try ZAISettings.loadStartPlanToken(domain: selection.domain)
-        let request = ZAIQuotaEndpoint.makeStartPlanBalanceRequest(token: token)
+        let baseURL = providerConfig.baseURL
+            ?? URL(string: "https://zcode.z.ai/api/v1/zcode-plan/anthropic")!
+        let request = ZAIQuotaEndpoint.makeStartPlanBalanceRequest(token: token, baseURL: baseURL)
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -507,14 +609,41 @@ final class ZAIQuotaStore {
         }
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { throw ZAIQuotaError.malformedResponse }
-        try Self.checkBusinessError(object)
+        return try Self.parseStartPlanSnapshot(payload: object, selection: selection)
+    }
 
-        guard let dataPayload = object["data"] as? [String: Any]
+    /// 解析 billing/balance 响应（payload：{code,msg,data:{plans,balances}}），网络与 host 日志共用。
+    private static func parseStartPlanSnapshot(payload: [String: Any],
+                                               selection: ZAIProviderSelection,
+                                               fetchedAt: Date = Date()) throws -> ZAIQuotaSnapshot {
+        try Self.checkBusinessError(payload)
+
+        guard let dataPayload = payload["data"] as? [String: Any]
         else { throw ZAIQuotaError.malformedResponse }
 
-        // plans[] 提供套餐名；entitlements[] 的 period 需按 entitlement_id 关联到 balances[]。
+        // plans[] 提供套餐名；entitlements[] 提供权益生效时间与额度。
         let plans = (dataPayload["plans"] as? [[String: Any]]) ?? []
         let activePlan = plans.first { ($0["status"] as? String) == "active" } ?? plans.first
+
+        // 套餐级信息：权益生效前（新规则：套餐未到开始时间）接口 balances 为空，
+        // 只返回 plans[].entitlements[]，这里保留用于「待生效」展示，不算错误。
+        let planStatus = activePlan?["status"] as? String
+        let planStartAt = activePlan.flatMap { Self.secondLevelDate($0["starts_at"]) }
+        let planEndAt = activePlan.flatMap { Self.secondLevelDate($0["ends_at"]) }
+        let pendingEntitlements: [ZAIPendingEntitlement] =
+            ((activePlan?["entitlements"] as? [[String: Any]]) ?? []).compactMap { item in
+                let title = (item["show_name"] as? String) ?? ""
+                guard !title.isEmpty else { return nil }
+                return ZAIPendingEntitlement(
+                    title: title,
+                    grantUnits: (item["grant_units"] as? NSNumber)?.doubleValue ?? 0,
+                    effectiveAt: Self.secondLevelDate(item["effective_at"]),
+                    period: (item["period"] as? String) ?? "one_time",
+                    expiresAt: Self.secondLevelDate(item["expires_at"]) ?? planEndAt
+                )
+            }
+            .filter { $0.effectiveAt.map { $0 > Date() } ?? true }
+
         var periodByEntitlement: [String: String] = [:]
         for plan in plans {
             for entitlement in (plan["entitlements"] as? [[String: Any]]) ?? [] {
@@ -552,8 +681,46 @@ final class ZAIQuotaStore {
             balances: Array(visibleBalances),
             planName: activePlan?["name"] as? String,
             planDescription: activePlan?["description"] as? String,
-            email: ZAISettings.loadAccount()?.email
+            email: ZAISettings.loadAccount()?.email,
+            fetchedAt: fetchedAt,
+            planStatus: planStatus,
+            planStartAt: planStartAt,
+            planEndAt: planEndAt,
+            pendingEntitlements: pendingEntitlements
         )
+    }
+
+    /// 从 ~/.zcode/v2/logs/<当天>.log 取最新一条 start-plan 的 billing/balance 响应 payload。
+    /// host 每 ~秒把完整响应写进 [usage-stats]/[coding-plan-availability] 行，
+    /// 我们只认 providerId == builtin:<domain>-start-plan 的条目。
+    private static func latestStartPlanBalancePayload(domain: String) -> [String: Any]? {
+        let logs = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zcode", isDirectory: true)
+            .appendingPathComponent("v2", isDirectory: true)
+            .appendingPathComponent("logs", isDirectory: true)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let url = logs.appendingPathComponent("\(formatter.string(from: Date())).log")
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+
+        let marker = "billing/balance 请求完成"
+        let wantProvider = "builtin:\(domain)-start-plan"
+        var searchRange = text.startIndex..<text.endIndex
+        var lastPayload: [String: Any]?
+        while let matched = text.range(of: marker, range: searchRange) {
+            let after = matched.upperBound
+            if let newline = text[after...].firstIndex(of: "\n") {
+                let line = String(text[after..<newline])
+                if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
+                   (object["providerId"] as? String)?.lowercased() == wantProvider,
+                   let payload = object["payload"] as? [String: Any] {
+                    lastPayload = payload
+                }
+            }
+            searchRange = after..<text.endIndex
+        }
+        return lastPayload
     }
 
     /// 个人付费 Coding Plan：GET api/monitor/usage/quota/limit（Bearer OAuth token）。
@@ -676,5 +843,65 @@ enum ZAIQuotaCache {
     static func save(_ snapshot: ZAIQuotaSnapshot) {
         guard let data = try? JSONEncoder().encode(snapshot) else { return }
         UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+// MARK: - ZAI 提醒桶映射
+
+extension ZAIQuotaSnapshot {
+    /// 提醒评估用的统一额度桶；apiKey 模式无余额数据、无桶。
+    var reminderBuckets: [ReminderBucket] {
+        switch kind {
+        case .codingPlan?:
+            return limits.map { limit in
+                ReminderBucket(
+                    source: .zai,
+                    id: "zai.limit.\(limit.unit.rawValue).\(limit.number)",
+                    title: Self.reminderTitle(for: limit),
+                    shortTitle: Self.reminderShortTitle(for: limit),
+                    remainingPercent: limit.remainingPercent,
+                    resetsAt: limit.nextResetTime
+                )
+            }
+        case .startPlan?:
+            return balances.map { balance in
+                ReminderBucket(
+                    source: .zai,
+                    id: "zai.balance.\(balance.title)",
+                    title: "ZAI \(balance.title)",
+                    shortTitle: balance.title,
+                    remainingPercent: balance.remainingFraction * 100,
+                    resetsAt: balance.expiresAt
+                )
+            } + pendingEntitlements.map { entitlement in
+                ReminderBucket(
+                    source: .zai,
+                    id: "zai.pending.\(entitlement.title)",
+                    title: "ZAI \(entitlement.title)",
+                    shortTitle: entitlement.title,
+                    remainingPercent: 100,
+                    resetsAt: entitlement.expiresAt
+                )
+            }
+        default:
+            return []
+        }
+    }
+
+    private static func reminderTitle(for limit: ZAILimit) -> String {
+        switch limit.unit {
+        case .hourly: return "ZAI \(limit.number)小时额度"
+        case .weekly: return "ZAI 周额度"
+        case .unknown: return "ZAI \(limit.title)"
+        }
+    }
+
+    /// 与 reminderTitle 对应的短名（不含 "ZAI " 前缀），供灵动岛每行展示用。
+    private static func reminderShortTitle(for limit: ZAILimit) -> String {
+        switch limit.unit {
+        case .hourly: return "\(limit.number)小时额度"
+        case .weekly: return "周额度"
+        case .unknown: return limit.title
+        }
     }
 }

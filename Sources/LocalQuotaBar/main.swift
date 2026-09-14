@@ -53,6 +53,8 @@ struct QuotaSnapshot: Equatable, Codable {
     let weekly: QuotaBucket?
     let resetCreditCount: Int?
     let resetCreditCards: [ResetCreditCard]?
+    /// 额度余额（credits 积分）；rateLimits 响应里的 credits.balance，$100 = 2500 积分。
+    let creditBalance: Double?
     let planType: String?
     let fetchedAt: Date
 
@@ -70,90 +72,6 @@ struct QuotaSnapshot: Equatable, Codable {
 struct ResetCreditCard: Equatable, Codable {
     let issuedAt: Date?
     let expiresAt: Date?
-}
-
-enum ReminderLevel: Int, Comparable {
-    case resetSoon = 1
-    case warning = 2
-    case critical = 3
-
-    static func < (lhs: ReminderLevel, rhs: ReminderLevel) -> Bool {
-        lhs.rawValue < rhs.rawValue
-    }
-
-    var emoji: String {
-        switch self {
-        case .critical: return "🚨"
-        case .warning: return "⚠️"
-        case .resetSoon: return "⏳"
-        }
-    }
-}
-
-struct ReminderPresentation: Equatable {
-    let level: ReminderLevel?
-    let affectedKinds: Set<QuotaKind>
-
-    static let inactive = ReminderPresentation(level: nil, affectedKinds: [])
-
-    var isActive: Bool {
-        level != nil && !affectedKinds.isEmpty
-    }
-
-    var emoji: String {
-        level?.emoji ?? ""
-    }
-}
-
-struct ReminderConfiguration {
-    var isEnabled: Bool
-    var warningRemainingPercent: Double
-    var criticalRemainingPercent: Double
-    var resetSoonMinutes: TimeInterval
-    var cooldown: TimeInterval
-
-    static let `default` = ReminderConfiguration(
-        isEnabled: true,
-        warningRemainingPercent: 20,
-        criticalRemainingPercent: 10,
-        resetSoonMinutes: 30,
-        cooldown: 10 * 60
-    )
-}
-
-enum ReminderSettings {
-    static let enabledKey = "local.codex.touchbar.quota.reminder.enabled"
-    static let warningPercentKey = "local.codex.touchbar.quota.reminder.warningPercent"
-    static let resetSoonMinutesKey = "local.codex.touchbar.quota.reminder.resetSoonMinutes"
-    static let cooldownMinutesKey = "local.codex.touchbar.quota.reminder.cooldownMinutes"
-
-    static func registerDefaults() {
-        let defaults = ReminderConfiguration.default
-        UserDefaults.standard.register(defaults: [
-            enabledKey: defaults.isEnabled,
-            warningPercentKey: defaults.warningRemainingPercent,
-            resetSoonMinutesKey: defaults.resetSoonMinutes,
-            cooldownMinutesKey: defaults.cooldown / 60
-        ])
-    }
-
-    static func load() -> ReminderConfiguration {
-        registerDefaults()
-        return ReminderConfiguration(
-            isEnabled: UserDefaults.standard.bool(forKey: enabledKey),
-            warningRemainingPercent: UserDefaults.standard.double(forKey: warningPercentKey),
-            criticalRemainingPercent: ReminderConfiguration.default.criticalRemainingPercent,
-            resetSoonMinutes: UserDefaults.standard.double(forKey: resetSoonMinutesKey),
-            cooldown: UserDefaults.standard.double(forKey: cooldownMinutesKey) * 60
-        )
-    }
-
-    static func save(_ configuration: ReminderConfiguration) {
-        UserDefaults.standard.set(configuration.isEnabled, forKey: enabledKey)
-        UserDefaults.standard.set(configuration.warningRemainingPercent, forKey: warningPercentKey)
-        UserDefaults.standard.set(configuration.resetSoonMinutes, forKey: resetSoonMinutesKey)
-        UserDefaults.standard.set(configuration.cooldown / 60, forKey: cooldownMinutesKey)
-    }
 }
 
 enum SnapshotCache {
@@ -682,6 +600,7 @@ final class CodexRateLimitClient {
         let resetCreditCount = (result["rateLimitResetCredits"] as? [String: Any])
             .flatMap { intValue($0["availableCount"]) }
         let resetCreditCards = parseResetCreditCards(from: result)
+        let creditBalance = creditBalance(from: result)
 
         return QuotaSnapshot(
             fiveHour: fiveHourWindow.map {
@@ -702,9 +621,25 @@ final class CodexRateLimitClient {
             },
             resetCreditCount: resetCreditCount,
             resetCreditCards: resetCreditCards,
+            creditBalance: creditBalance,
             planType: planType,
             fetchedAt: Date()
         )
+    }
+
+    /// 额度余额（credits 积分）。放在顶层 rateLimits；按 limitId 展开时结构相同，兜底取 codex。
+    private static func creditBalance(from result: [String: Any]) -> Double? {
+        let rateLimits = (result["rateLimits"] as? [String: Any])
+            ?? ((result["rateLimitsByLimitId"] as? [String: Any])?["codex"] as? [String: Any])
+        guard let credits = rateLimits?["credits"] as? [String: Any],
+              credits["hasCredits"] as? Bool == true,
+              credits["unlimited"] as? Bool == false
+        else { return nil }
+        // balance 实测是字符串（如 "1017.0539675000"），兼容数字形式。
+        if let text = credits["balance"] as? String {
+            return Double(text)
+        }
+        return (credits["balance"] as? NSNumber)?.doubleValue
     }
 
     private static func extractRateLimitWindows(from result: [String: Any]) -> [ParsedWindow] {
@@ -862,45 +797,53 @@ private final class JSONLineResponseCollector {
 @MainActor
 final class RateLimitStore {
     let client: CodexRateLimitClient
-    let refreshInterval: TimeInterval
-    private(set) var reminderConfiguration: ReminderConfiguration
+    private(set) var refreshInterval: TimeInterval
 
     private(set) var snapshot: QuotaSnapshot?
     private(set) var isRefreshing = false
-    private(set) var reminder: ReminderPresentation = .inactive
     private var hasReadAccountPlan = false
     private var isReadingAccountPlan = false
     private var accountID = "unknown"
     private var cachedPlanType: String?
     private var timer: Timer?
 
-    var onChange: ((QuotaSnapshot?, Bool, String?, ReminderPresentation) -> Void)?
+    var onChange: ((QuotaSnapshot?, Bool, String?) -> Void)?
 
     init(
         client: CodexRateLimitClient = CodexRateLimitClient(),
-        // 额度变化不快，5 分钟自动刷新一次足够；手动刷新有 60 秒防重保护。
-        refreshInterval: TimeInterval = 5 * 60,
-        reminderConfiguration: ReminderConfiguration = ReminderSettings.load()
+        // 额度变化不快，默认 5 分钟自动刷新一次，可在状态栏右键菜单调整；手动刷新有 60 秒防重保护。
+        refreshInterval: TimeInterval = RefreshSettings.load()
     ) {
         self.client = client
         self.refreshInterval = refreshInterval
-        self.reminderConfiguration = reminderConfiguration
         // Show the last known quota immediately after relaunch; refresh will replace it.
         self.snapshot = SnapshotCache.load()
     }
 
     func start() {
         refresh(force: true)
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.refresh(force: false)
-            }
-        }
+        scheduleTimer()
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
+    }
+
+    /// 修改自动刷新间隔；已在运行时则按新间隔重建定时器，不额外触发一次网络刷新。
+    func setRefreshInterval(_ interval: TimeInterval) {
+        refreshInterval = interval
+        guard timer != nil else { return }
+        timer?.invalidate()
+        scheduleTimer()
+    }
+
+    private func scheduleTimer() {
+        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.refresh(force: false)
+            }
+        }
     }
 
     func setAccountID(_ accountID: String?) {
@@ -917,7 +860,7 @@ final class RateLimitStore {
     func refresh(force: Bool) {
         guard !isRefreshing else { return }
         isRefreshing = true
-        onChange?(snapshot, true, nil, reminder)
+        onChange?(snapshot, true, nil)
         let cachedPlanType = self.cachedPlanType
 
         Task { @MainActor in
@@ -925,14 +868,13 @@ final class RateLimitStore {
                 let newSnapshot = try await client.readRateLimits(planType: cachedPlanType)
                 snapshot = newSnapshot
                 SnapshotCache.save(newSnapshot)
-                reminder = evaluateReminder(for: newSnapshot, now: Date())
                 isRefreshing = false
-                onChange?(newSnapshot, false, nil, reminder)
+                onChange?(newSnapshot, false, nil)
             } catch {
                 isRefreshing = false
                 // Keep the old snapshot. Only surface the error text.
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                onChange?(snapshot, false, message, reminder)
+                onChange?(snapshot, false, message)
             }
         }
     }
@@ -965,139 +907,41 @@ final class RateLimitStore {
             weekly: snapshot.weekly,
             resetCreditCount: snapshot.resetCreditCount,
             resetCreditCards: snapshot.resetCreditCards,
+            creditBalance: snapshot.creditBalance,
             planType: planType,
             fetchedAt: snapshot.fetchedAt
         )
         self.snapshot = updatedSnapshot
         SnapshotCache.save(updatedSnapshot)
-        onChange?(updatedSnapshot, isRefreshing, nil, reminder)
-    }
-
-
-    func muteCurrentReminder() {
-        guard reminder.isActive, let snapshot else { return }
-
-        for kind in reminder.affectedKinds {
-            guard let bucket = snapshot.bucket(for: kind), let resetsAt = bucket.resetsAt else { continue }
-            UserDefaults.standard.set(resetsAt.timeIntervalSince1970, forKey: mutedUntilKey(for: kind))
-        }
-
-        reminder = .inactive
-        onChange?(snapshot, false, nil, reminder)
-    }
-
-    var canRestoreReminders: Bool {
-        // 仅在用户点过“不再提醒”（静默本周期）后显示恢复入口，普通冷却不算。
-        let now = Date()
-        return [QuotaKind.fiveHour, QuotaKind.weekly].contains { kind in
-            isMuted(kind: kind, now: now)
-        }
-    }
-
-    func unmuteAll() {
-        for kind in [QuotaKind.fiveHour, QuotaKind.weekly] {
-            UserDefaults.standard.removeObject(forKey: mutedUntilKey(for: kind))
-            UserDefaults.standard.removeObject(forKey: lastAlertKey(for: kind))
-        }
-
-        if let snapshot {
-            reminder = evaluateReminder(for: snapshot, now: Date())
-        } else {
-            reminder = .inactive
-        }
-
-        onChange?(snapshot, isRefreshing, nil, reminder)
-    }
-
-    func updateReminderConfiguration(_ configuration: ReminderConfiguration) {
-        reminderConfiguration = configuration
-        ReminderSettings.save(configuration)
-
-        if let snapshot {
-            reminder = evaluateReminder(for: snapshot, now: Date(), recordAlert: false)
-        } else {
-            reminder = .inactive
-        }
-
-        onChange?(snapshot, isRefreshing, nil, reminder)
-    }
-
-    private func evaluateReminder(
-        for snapshot: QuotaSnapshot,
-        now: Date,
-        recordAlert: Bool = true
-    ) -> ReminderPresentation {
-        guard TouchBarCapability.hasTouchBar, reminderConfiguration.isEnabled else { return .inactive }
-
-        var bestLevel: ReminderLevel?
-        var affectedKinds = Set<QuotaKind>()
-
-        for kind in [QuotaKind.fiveHour, QuotaKind.weekly] {
-            guard let bucket = snapshot.bucket(for: kind) else { continue }
-            guard let level = triggerLevel(for: bucket, now: now) else { continue }
-            guard !isMuted(kind: kind, now: now) else { continue }
-            guard !isCoolingDown(kind: kind, now: now) else { continue }
-
-            bestLevel = max(bestLevel ?? level, level)
-            affectedKinds.insert(kind)
-        }
-
-        guard let bestLevel, !affectedKinds.isEmpty else { return .inactive }
-
-        if recordAlert {
-            for kind in affectedKinds {
-                UserDefaults.standard.set(now.timeIntervalSince1970, forKey: lastAlertKey(for: kind))
-            }
-        }
-
-        return ReminderPresentation(level: bestLevel, affectedKinds: affectedKinds)
-    }
-
-    private func triggerLevel(for bucket: QuotaBucket, now: Date) -> ReminderLevel? {
-        if bucket.remainingPercent <= reminderConfiguration.criticalRemainingPercent {
-            return .critical
-        }
-
-        if bucket.remainingPercent <= reminderConfiguration.warningRemainingPercent {
-            return .warning
-        }
-
-        if reminderConfiguration.resetSoonMinutes > 0, let resetsAt = bucket.resetsAt {
-            let minutesToReset = resetsAt.timeIntervalSince(now) / 60
-            if minutesToReset >= 0 && minutesToReset <= reminderConfiguration.resetSoonMinutes {
-                return .resetSoon
-            }
-        }
-
-        return nil
-    }
-
-    private func isMuted(kind: QuotaKind, now: Date) -> Bool {
-        let mutedUntil = UserDefaults.standard.double(forKey: mutedUntilKey(for: kind))
-        return mutedUntil > now.timeIntervalSince1970
-    }
-
-    private func isCoolingDown(kind: QuotaKind, now: Date) -> Bool {
-        let lastAlertAt = UserDefaults.standard.double(forKey: lastAlertKey(for: kind))
-        guard lastAlertAt > 0 else { return false }
-        return now.timeIntervalSince1970 - lastAlertAt < reminderConfiguration.cooldown
-    }
-
-    private func lastAlertKey(for kind: QuotaKind) -> String {
-        "local.codex.touchbar.quota.\(kind.rawValue).lastAlertAt"
-    }
-
-    private func mutedUntilKey(for kind: QuotaKind) -> String {
-        "local.codex.touchbar.quota.\(kind.rawValue).mutedUntilResetAt"
+        onChange?(updatedSnapshot, isRefreshing, nil)
     }
 }
 
-private extension QuotaSnapshot {
-    func bucket(for kind: QuotaKind) -> QuotaBucket? {
-        switch kind {
-        case .fiveHour: return fiveHour
-        case .weekly: return weekly
+extension QuotaSnapshot {
+    /// 提醒评估用的统一额度桶。
+    var reminderBuckets: [ReminderBucket] {
+        var buckets: [ReminderBucket] = []
+        if let fiveHour {
+            buckets.append(ReminderBucket(
+                source: .codex,
+                id: "codex.fiveHour",
+                title: "Codex \(fiveHour.title)",
+                shortTitle: fiveHour.title,
+                remainingPercent: fiveHour.remainingPercent,
+                resetsAt: fiveHour.resetsAt
+            ))
         }
+        if let weekly {
+            buckets.append(ReminderBucket(
+                source: .codex,
+                id: "codex.weekly",
+                title: "Codex \(weekly.title)",
+                shortTitle: weekly.title,
+                remainingPercent: weekly.remainingPercent,
+                resetsAt: weekly.resetsAt
+            ))
+        }
+        return buckets
     }
 }
 
@@ -1133,103 +977,11 @@ enum TouchBarCapability {
     }
 }
 
-// MARK: - System modal Touch Bar (private API, runtime-checked)
-
-@MainActor
-enum SystemModalTouchBar {
-    private static let presentSelectorNames = [
-        "presentSystemModalTouchBar:systemTrayItemIdentifier:",
-        "presentSystemModalFunctionBar:systemTrayItemIdentifier:"
-    ]
-    private static let dismissSelectorNames = [
-        "dismissSystemModalTouchBar:",
-        "dismissSystemModalFunctionBar:"
-    ]
-
-    static var isSupported: Bool {
-        firstClassMethod(named: presentSelectorNames) != nil
-            && firstClassMethod(named: dismissSelectorNames) != nil
-    }
-
-    static func present(_ touchBar: NSTouchBar) {
-        guard let (selector, method) = firstClassMethod(named: presentSelectorNames) else { return }
-        typealias PresentIMP = @convention(c) (AnyObject, Selector, NSTouchBar, AnyObject?) -> Void
-        let imp = unsafeBitCast(method_getImplementation(method), to: PresentIMP.self)
-        imp(NSTouchBar.self, selector, touchBar, nil)
-    }
-
-    static func dismiss(_ touchBar: NSTouchBar) {
-        guard let (selector, method) = firstClassMethod(named: dismissSelectorNames) else { return }
-        typealias DismissIMP = @convention(c) (AnyObject, Selector, NSTouchBar) -> Void
-        let imp = unsafeBitCast(method_getImplementation(method), to: DismissIMP.self)
-        imp(NSTouchBar.self, selector, touchBar)
-    }
-
-    private static func firstClassMethod(named selectorNames: [String]) -> (Selector, Method)? {
-        for name in selectorNames {
-            let selector = NSSelectorFromString(name)
-            if let method = class_getClassMethod(NSTouchBar.self, selector) {
-                return (selector, method)
-            }
-        }
-        return nil
-    }
-}
-
-@MainActor
-final class TouchBarAlertPresenter: NSObject, NSTouchBarDelegate {
-    static let displayDuration: TimeInterval = 12
-
-    var onMute: (() -> Void)?
-
-    private let quotaView = TouchBarQuotaView(frame: NSRect(x: 0, y: 0, width: 370, height: 30))
-    private lazy var touchBar: NSTouchBar = {
-        let bar = NSTouchBar()
-        bar.delegate = self
-        bar.defaultItemIdentifiers = [.quotaPanel]
-        return bar
-    }()
-    private var dismissTimer: Timer?
-    private(set) var isPresenting = false
-
-    override init() {
-        super.init()
-        quotaView.onMuteReminder = { [weak self] in
-            self?.onMute?()
-        }
-    }
-
-    func touchBar(_ touchBar: NSTouchBar, makeItemForIdentifier identifier: NSTouchBarItem.Identifier) -> NSTouchBarItem? {
-        guard identifier == .quotaPanel else { return nil }
-        let item = NSCustomTouchBarItem(identifier: identifier)
-        item.customizationLabel = "Codex 余额"
-        item.view = quotaView
-        return item
-    }
-
-    func present(snapshot: QuotaSnapshot, reminder: ReminderPresentation) {
-        quotaView.update(snapshot: snapshot, reminder: reminder)
-
-        if !isPresenting {
-            SystemModalTouchBar.present(touchBar)
-            isPresenting = true
-        }
-
-        dismissTimer?.invalidate()
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: Self.displayDuration, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.dismiss()
-            }
-        }
-    }
-
-    func dismiss() {
-        dismissTimer?.invalidate()
-        dismissTimer = nil
-        guard isPresenting else { return }
-        isPresenting = false
-        SystemModalTouchBar.dismiss(touchBar)
-    }
+/// 提醒子菜单里每个选项对应 ReminderConfiguration 的哪个字段，挂在 NSMenuItem.tag 上。
+private enum ReminderMenuField: Int {
+    case warningPercent = 0
+    case resetSoonMinutes = 1
+    case cooldownMinutes = 2
 }
 
 @MainActor
@@ -1240,7 +992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = RateLimitStore()
     private let zaiStore = ZAIQuotaStore()
     private let authManager = CodexAuthManager()
-    private let alertPresenter = TouchBarAlertPresenter()
+    private let reminderCenter = ReminderCenter()
     private var accountOptions: [CodexAuthAccount] = []
     private var selectedAccountId: String?
 
@@ -1272,30 +1024,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaViewController.onZAIRefresh = { [weak self] in
             self?.zaiStore.refresh()
         }
+        reminderCenter.start { [weak self] in
+            self?.presentPopoverFromStatusItem()
+        }
         quotaViewController.onMuteReminder = { [weak self] in
-            self?.store.muteCurrentReminder()
-            self?.alertPresenter.dismiss()
+            self?.reminderCenter.muteCurrent()
+            self?.refreshReminderUI()
         }
         quotaViewController.onUnmuteAll = { [weak self] in
-            self?.store.unmuteAll()
-        }
-        alertPresenter.onMute = { [weak self] in
-            self?.store.muteCurrentReminder()
-            self?.alertPresenter.dismiss()
+            self?.reminderCenter.unmuteAll()
+            self?.refreshReminderUI()
         }
         quotaViewController.onReminderConfigurationChange = { [weak self] configuration in
-            self?.store.updateReminderConfiguration(configuration)
+            self?.reminderCenter.updateConfiguration(configuration)
+            self?.refreshReminderUI()
         }
-        quotaViewController.applyReminderConfiguration(store.reminderConfiguration)
+        quotaViewController.applyReminderConfiguration(reminderCenter.configuration)
         initializeAccountSwitcher()
 
         zaiStore.onChange = { [weak self] snapshot, account, isRefreshing, error in
-            self?.quotaViewController.applyZAI(
+            guard let self else { return }
+            self.quotaViewController.applyZAI(
                 snapshot: snapshot,
                 account: account,
                 isRefreshing: isRefreshing,
                 error: error
             )
+            if !isRefreshing, error == nil, let snapshot {
+                // 渠道身份 = 套餐类型 + 账号邮箱；BigModel/ZAI 切换或换号后状态互不干扰。
+                let channel = "\(snapshot.kind?.rawValue ?? "unknown")|\(account?.email ?? "")"
+                self.reminderCenter.ingest(
+                    source: .zai,
+                    buckets: snapshot.reminderBuckets.map { $0.namespacedByChannel(channel) }
+                )
+            }
         }
         quotaViewController.applyZAI(
             snapshot: zaiStore.snapshot,
@@ -1304,26 +1066,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             error: zaiStore.lastError
         )
 
-        store.onChange = { [weak self] snapshot, isRefreshing, error, reminder in
+        store.onChange = { [weak self] snapshot, isRefreshing, error in
             guard let self else { return }
             self.statusItem.button?.title = snapshot?.primaryStatusTitle ?? "Codex --%"
+
+            var reminder = self.reminderCenter.presentation(for: .codex)
+            if !isRefreshing, error == nil, let snapshot {
+                // 渠道身份 = 当前 Codex 账号；换账号后静音/去重互不影响。
+                let channel = self.selectedAccountId ?? "default"
+                reminder = self.reminderCenter.ingest(
+                    source: .codex,
+                    buckets: snapshot.reminderBuckets.map { $0.namespacedByChannel(channel) },
+                    codexSnapshot: snapshot
+                )
+            }
+
             self.quotaViewController.apply(
                 snapshot: snapshot,
                 isRefreshing: isRefreshing,
                 error: error,
                 reminder: reminder
             )
-            self.quotaViewController.setUnmuteButtonVisible(self.store.canRestoreReminders)
-
-            if TouchBarCapability.hasTouchBar, reminder.isActive && !isRefreshing, let snapshot {
-                if SystemModalTouchBar.isSupported {
-                    self.alertPresenter.present(snapshot: snapshot, reminder: reminder)
-                } else {
-                    self.showPopoverForReminder()
-                }
-            }
+            self.quotaViewController.setUnmuteButtonVisible(self.reminderCenter.canRestore)
         }
         store.start()
+        zaiStore.start()
     }
 
     private func initializeAccountSwitcher() {
@@ -1349,8 +1116,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        alertPresenter.dismiss()
+        reminderCenter.retractAll()
         store.stop()
+        zaiStore.stop()
     }
 
     @objc private func handleStatusItemClick(_ sender: Any?) {
@@ -1379,12 +1147,135 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        menu.addItem(makeReminderMenuItem())
+        menu.addItem(makeRefreshIntervalMenuItem())
+
+        menu.addItem(NSMenuItem.separator())
+
         let quitItem = NSMenuItem(title: "退出", action: #selector(quitFromMenu), keyEquivalent: "")
         quitItem.target = self
         quitItem.isEnabled = true
         menu.addItem(quitItem)
 
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.minY - 2), in: button)
+    }
+
+    /// 提醒设置入口：有可用通道时给完整子菜单，否则置灰提示设备不支持。
+    private func makeReminderMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "提醒设置", action: nil, keyEquivalent: "")
+        if ReminderCapability.hasAnyChannel {
+            item.submenu = makeReminderSubmenu()
+            item.isEnabled = true
+        } else {
+            item.isEnabled = false
+            item.toolTip = "当前设备没有 Touch Bar，屏幕也没有刘海，无可用提醒通道"
+        }
+        return item
+    }
+
+    /// 刷新频率入口：Codex 与 ZAI 共用一个间隔，按固定档位勾选。
+    private func makeRefreshIntervalMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "刷新频率", action: nil, keyEquivalent: "")
+        item.submenu = makeRefreshIntervalSubmenu()
+        item.isEnabled = true
+        return item
+    }
+
+    private func makeRefreshIntervalSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        let currentMinutes = RefreshSettings.loadMinutes()
+        for minutes in RefreshSettings.availableMinutes {
+            let item = NSMenuItem(title: "\(minutes) 分钟", action: #selector(refreshIntervalSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = minutes
+            item.isEnabled = true
+            if minutes == currentMinutes {
+                item.state = .on
+            }
+            submenu.addItem(item)
+        }
+
+        return submenu
+    }
+
+    private func makeReminderSubmenu() -> NSMenu {
+        let configuration = reminderCenter.configuration
+
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        let warningItem = NSMenuItem(title: "额度低于", action: nil, keyEquivalent: "")
+        warningItem.submenu = makeReminderOptionSubmenu(
+            field: .warningPercent,
+            currentValue: Int(configuration.warningRemainingPercent),
+            options: [("50%", 50), ("40%", 40), ("30%", 30), ("20%", 20), ("10%", 10)]
+        )
+        submenu.addItem(warningItem)
+
+        let resetSoonItem = NSMenuItem(title: "重置还剩", action: nil, keyEquivalent: "")
+        resetSoonItem.submenu = makeReminderOptionSubmenu(
+            field: .resetSoonMinutes,
+            currentValue: Int(configuration.resetSoonMinutes),
+            options: [("50 分钟", 50), ("40 分钟", 40), ("30 分钟", 30), ("20 分钟", 20), ("10 分钟", 10), ("关闭", 0)]
+        )
+        submenu.addItem(resetSoonItem)
+
+        let cooldownItem = NSMenuItem(title: "提醒间隔", action: nil, keyEquivalent: "")
+        cooldownItem.submenu = makeReminderOptionSubmenu(
+            field: .cooldownMinutes,
+            currentValue: Int(configuration.cooldown / 60),
+            options: [("5 分钟", 5), ("10 分钟", 10), ("15 分钟", 15), ("30 分钟", 30), ("60 分钟", 60)]
+        )
+        submenu.addItem(cooldownItem)
+
+        submenu.addItem(NSMenuItem.separator())
+
+        let restoreItem = NSMenuItem(title: "恢复默认", action: #selector(reminderRestoreDefaultsTapped), keyEquivalent: "")
+        restoreItem.target = self
+        restoreItem.isEnabled = true
+        restoreItem.toolTip = "恢复为默认：开启、额度低于 20%、重置还剩 30 分钟、提醒间隔 10 分钟"
+        submenu.addItem(restoreItem)
+
+        let testItem = NSMenuItem(title: "测试", action: #selector(testReminderTapped), keyEquivalent: "")
+        testItem.target = self
+        testItem.isEnabled = true
+        testItem.toolTip = "手动触发一次提醒，验证投递链路"
+        submenu.addItem(testItem)
+
+        return submenu
+    }
+
+    private func makeReminderOptionSubmenu(
+        field: ReminderMenuField,
+        currentValue: Int,
+        options: [(title: String, value: Int)]
+    ) -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+
+        var nearestItem: NSMenuItem?
+        var nearestDistance = Int.max
+
+        for option in options {
+            let item = NSMenuItem(title: option.title, action: #selector(reminderOptionSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.tag = field.rawValue
+            item.representedObject = option.value
+            item.isEnabled = true
+            submenu.addItem(item)
+
+            // 持久化的可能是旧版选项列表里的值；没有精确匹配时高亮最接近的一项。
+            let distance = abs(option.value - currentValue)
+            if distance < nearestDistance {
+                nearestDistance = distance
+                nearestItem = item
+            }
+        }
+        nearestItem?.state = .on
+
+        return submenu
     }
 
     private func makeAccountSubmenu() -> NSMenu {
@@ -1423,25 +1314,87 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 手动测试提醒投递链；无可用通道（无 Touch Bar 且无刘海屏）时给出提示。
+    /// 正常情况下入口在禁用态，这里只是兜底。
+    @objc private func testReminderTapped() {
+        if reminderCenter.deliverTestAlert(codexSnapshot: store.snapshot) { return }
+
+        let alert = NSAlert()
+        alert.messageText = "无可用提醒通道"
+        alert.informativeText = "当前设备没有 Touch Bar，屏幕也没有刘海，无法弹出提醒。"
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    @objc private func reminderOptionSelected(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Int,
+              let field = ReminderMenuField(rawValue: sender.tag) else { return }
+
+        var configuration = reminderCenter.configuration
+        switch field {
+        case .warningPercent:
+            configuration.warningRemainingPercent = Double(value)
+        case .resetSoonMinutes:
+            configuration.resetSoonMinutes = TimeInterval(value) // 0 表示关闭"重置还剩"提醒
+        case .cooldownMinutes:
+            configuration.cooldown = TimeInterval(value * 60)
+        }
+        updateReminderConfigurationFromMenu(configuration)
+    }
+
+    @objc private func reminderRestoreDefaultsTapped() {
+        updateReminderConfigurationFromMenu(.default)
+    }
+
+    /// 菜单侧修改配置后与面板回调走同一条链：持久化+重评 → 同步面板只读展示 → 刷新提醒 UI。
+    private func updateReminderConfigurationFromMenu(_ configuration: ReminderConfiguration) {
+        reminderCenter.updateConfiguration(configuration)
+        quotaViewController.applyReminderConfiguration(configuration)
+        refreshReminderUI()
+    }
+
+    /// 修改刷新频率：持久化 → 两个 store 重建定时器 → 同步面板只读展示。
+    @objc private func refreshIntervalSelected(_ sender: NSMenuItem) {
+        guard let minutes = sender.representedObject as? Int else { return }
+        RefreshSettings.save(minutes: minutes)
+        let interval = TimeInterval(minutes) * 60
+        store.setRefreshInterval(interval)
+        zaiStore.setRefreshInterval(interval)
+        quotaViewController.applyRefreshInterval(minutes: minutes)
+    }
+
     @objc private func quitFromMenu() {
         NSApplication.shared.terminate(nil)
     }
 
-    private func showPopoverForReminder() {
+    /// 提醒通道（刘海屏弹窗等）点击后打开主面板。
+    private func presentPopoverFromStatusItem() {
         guard let button = statusItem.button else { return }
         showPopover(relativeTo: button)
+    }
+
+    /// 静音 / 改配置后立即刷新 UI 上的提醒表现（emoji、恢复提醒按钮），
+    /// 与旧链路里 store.onChange 的即时回调保持一致。
+    private func refreshReminderUI() {
+        quotaViewController.apply(
+            snapshot: store.snapshot,
+            isRefreshing: store.isRefreshing,
+            error: nil,
+            reminder: reminderCenter.presentation(for: .codex)
+        )
+        quotaViewController.setUnmuteButtonVisible(reminderCenter.canRestore)
     }
 
     private func showPopover(relativeTo button: NSStatusBarButton) {
         NSApp.activate(ignoringOtherApps: true)
         updateZAISectionVisibility()
+        // 从刘海卡片静音不会经过面板回调，打开面板时必须重取 canRestore，
+        // 否则"恢复提醒"按钮要等下一次额度轮询（store.onChange）才出现。
+        quotaViewController.setUnmuteButtonVisible(reminderCenter.canRestore)
         if !popover.isShown {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             // NSPopover 首次加载 view 后会重新取一次 preferredContentSize，这里再设一次避免底部被裁切。
             popover.contentSize = quotaViewController.preferredContentSize
-        }
-        if ZAISettings.isZAIDomain() {
-            zaiStore.refreshIfNeeded()
         }
         quotaViewController.focusTouchBarHost()
     }
@@ -1488,17 +1441,23 @@ final class QuotaViewController: NSViewController {
     private let resetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
     private let resetCreditsValueLabel = NSTextField(labelWithString: "--")
     private let resetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
+    /// 额度余额（credits 折算美元），右对齐放在重置次数行末尾。
+    private let creditBalanceTitleLabel = NSTextField(labelWithString: "额度余额：")
+    private let creditBalanceLabel = NSTextField(labelWithString: "")
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private var refreshCooldownTimer: Timer?
     private var zaiRefreshCooldownTimer: Timer?
     private var currentResetCreditCount = 0
     private var currentResetCreditCards: [ResetCreditCard]?
-    private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动 Touch Bar 提醒", target: nil, action: nil)
-    private let warningPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let resetSoonPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let cooldownPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动提醒", target: nil, action: nil)
+    // 阈值等设置改到状态栏右键菜单里编辑，面板上只读展示当前值。
+    private let warningValueLabel = NSTextField(labelWithString: "--")
+    private let resetSoonValueLabel = NSTextField(labelWithString: "--")
+    private let cooldownValueLabel = NSTextField(labelWithString: "--")
+    private let refreshIntervalValueLabel = NSTextField(labelWithString: "--")
     private let unmuteButton = NSButton(title: "恢复提醒", target: nil, action: nil)
-    private let restoreDefaultsButton = NSButton(title: "恢复默认", target: nil, action: nil)
+    /// 当前生效的提醒配置；右键菜单改动后会推送回来同步这里的副本。
+    private var reminderConfiguration = ReminderConfiguration.default
 
     override func loadView() {
         rootView.material = .popover
@@ -1511,7 +1470,7 @@ final class QuotaViewController: NSViewController {
             self?.onMuteReminder?()
         }
         view = rootView
-        // 无 Touch Bar 机型只显示额度，不显示提醒设置。
+        // 无可用提醒通道（无 Touch Bar 且无刘海屏）时只显示额度，不显示提醒设置。
         preferredContentSize = quotaContentSize
 
         configureSubviews()
@@ -1560,16 +1519,21 @@ final class QuotaViewController: NSViewController {
             zaiRows.forEach { $0.isHidden = true }
             zaiResetCreditsRow.isHidden = true
         case .startPlan:
-            // tag 显示 name（如 "ZCode Start Plan"）；description（如 "GLM-5.3 周末活动"）可能过长，放 tooltip。
+            // tag 显示 name（如 "ZCode Weekend Build"）；description（如 "GLM-5.3 周末活动"）可能过长，放 tooltip。
             let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
             setLabelText(zaiLevelTag, planName)
             zaiLevelTag.backgroundColor = .systemGreen
             zaiLevelTag.toolTip = snapshot?.planDescription.flatMap { $0.isEmpty ? nil : $0 }
                 ?? snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 }
-            let balances = (snapshot?.balances ?? []).prefix(zaiRows.count)
+            // 权益生效前 balances 为空、只返回 entitlements，改从 pendingEntitlements 展示「待生效」额度。
+            let balances = Array((snapshot?.balances ?? []).prefix(zaiRows.count))
+            let entitlements = snapshot?.pendingEntitlements ?? []
             for (index, row) in zaiRows.enumerated() {
                 if index < balances.count {
                     row.update(balance: balances[index])
+                    row.isHidden = false
+                } else if balances.isEmpty, index < entitlements.count {
+                    row.update(pending: entitlements[index])
                     row.isHidden = false
                 } else {
                     row.isHidden = true
@@ -1596,12 +1560,34 @@ final class QuotaViewController: NSViewController {
             setLabelText(zaiStatusLabel, snapshot.map { "刷新中（上次更新 \(Self.formatFetchedAt($0.fetchedAt))）…" } ?? "刷新中…")
         } else if let error {
             setLabelText(zaiStatusLabel, snapshot.map { "刷新失败，显示 \(Self.formatFetchedAt($0.fetchedAt)) 数据 · \(error)" } ?? "刷新失败：\(error)")
+        } else if let snapshot, let pendingText = Self.startPlanPendingText(snapshot) {
+            setLabelText(zaiStatusLabel, pendingText)
         } else if let snapshot {
             setLabelText(zaiStatusLabel, "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))")
         } else {
             setLabelText(zaiStatusLabel, "暂无数据")
         }
         updatePreferredContentSize()
+    }
+
+    /// start-plan 套餐待生效 / 已结束时的状态文案。
+    /// 套餐未到开始时间（新规则）是正常状态，不当作刷新失败展示。
+    private static func startPlanPendingText(_ snapshot: ZAIQuotaSnapshot) -> String? {
+        guard snapshot.kind == .startPlan else { return nil }
+        let now = Date()
+        if let start = snapshot.planStartAt, start > now {
+            return "套餐待生效 · \(formatCompactDateTime(start)) 开始"
+        }
+        if let end = snapshot.planEndAt, end < now {
+            return "套餐已于 \(formatCompactDateTime(end)) 结束"
+        }
+        if let effectiveAt = snapshot.pendingEntitlements
+            .compactMap(\.effectiveAt)
+            .filter({ $0 > now })
+            .min() {
+            return "套餐待生效 · \(formatCompactDateTime(effectiveAt)) 生效"
+        }
+        return nil
     }
 
     func showAccountSwitchStatus(_ message: String) {
@@ -1640,7 +1626,7 @@ final class QuotaViewController: NSViewController {
         if let snapshot {
             fiveHourRow.update(bucket: snapshot.fiveHour)
             weeklyRow.update(bucket: snapshot.weekly)
-            updateResetCredits(snapshot.resetCreditCount, cards: snapshot.resetCreditCards)
+            updateResetCredits(snapshot.resetCreditCount, cards: snapshot.resetCreditCards, creditBalance: snapshot.creditBalance)
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
         accountPlanTag.stringValue = snapshot?.planType ?? ""
@@ -1704,7 +1690,7 @@ final class QuotaViewController: NSViewController {
         refreshButton.target = self
         refreshButton.action = #selector(refreshTapped)
 
-        if TouchBarCapability.hasTouchBar {
+        if ReminderCapability.hasAnyChannel {
             configureReminderControls()
         }
 
@@ -1734,11 +1720,22 @@ final class QuotaViewController: NSViewController {
         rows.alignment = .leading
         rows.spacing = 4
 
-        var contentViews: [NSView] = [header, rows]
-        if TouchBarCapability.hasTouchBar {
-            contentViews.append(makeSettingsView())
+        // 提醒设置同时管 Codex 与 ZAI 两个数据源，放在面板最底部。
+        var contentViews: [NSView] = [header, rows, zaiSection]
+        if ReminderCapability.hasAnyChannel {
+            let reminderDivider = NSBox()
+            reminderDivider.boxType = .separator
+            let reminderStack = makeSettingsView()
+            let reminderSection = NSStackView(views: [reminderDivider, reminderStack])
+            reminderSection.orientation = .vertical
+            reminderSection.alignment = .leading
+            reminderSection.spacing = 6
+            NSLayoutConstraint.activate([
+                reminderDivider.widthAnchor.constraint(equalToConstant: 424),
+                reminderStack.widthAnchor.constraint(equalToConstant: 424)
+            ])
+            contentViews.append(reminderSection)
         }
-        contentViews.append(zaiSection)
 
         let content = NSStackView(views: contentViews)
         content.orientation = .vertical
@@ -1766,7 +1763,7 @@ final class QuotaViewController: NSViewController {
     }
 
     private var quotaContentSize: NSSize {
-        let fallbackHeight: CGFloat = TouchBarCapability.hasTouchBar ? 248 : 158
+        let fallbackHeight: CGFloat = ReminderCapability.hasAnyChannel ? 248 : 158
         let contentHeight = contentStack.map { ceil($0.fittingSize.height) + 24 } ?? fallbackHeight
         return NSSize(width: 460, height: contentHeight)
     }
@@ -1862,7 +1859,22 @@ final class QuotaViewController: NSViewController {
     }
 
     private func makeResetCreditsRow() -> NSStackView {
-        let row = NSStackView(views: [resetCreditsTitleLabel, resetCreditsValueLabel, resetCreditsExpirationButton, NSView()])
+        creditBalanceTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        creditBalanceTitleLabel.textColor = .labelColor
+
+        creditBalanceLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        creditBalanceLabel.textColor = .labelColor
+        creditBalanceLabel.alignment = .right
+
+        // 末尾的 NSView 是弹性空隙，把余额标签推到行最右侧。
+        let row = NSStackView(views: [
+            resetCreditsTitleLabel,
+            resetCreditsValueLabel,
+            resetCreditsExpirationButton,
+            NSView(),
+            creditBalanceTitleLabel,
+            creditBalanceLabel
+        ])
         row.orientation = .horizontal
         row.alignment = .centerY
         row.spacing = 10
@@ -1878,11 +1890,26 @@ final class QuotaViewController: NSViewController {
         return row
     }
 
-    private func updateResetCredits(_ count: Int?, cards: [ResetCreditCard]?) {
+    private func updateResetCredits(_ count: Int?, cards: [ResetCreditCard]?, creditBalance: Double?) {
         currentResetCreditCount = count ?? 0
         currentResetCreditCards = cards
         resetCreditsValueLabel.stringValue = count.map(String.init) ?? "--"
         updateResetCreditsExpirationButton()
+        updateCreditBalanceLabel(creditBalance)
+    }
+
+    /// $100 = 2500 积分，余额积分除以 25 折算美元。
+    private func updateCreditBalanceLabel(_ balance: Double?) {
+        guard let balance else {
+            creditBalanceTitleLabel.isHidden = true
+            creditBalanceLabel.stringValue = ""
+            creditBalanceLabel.toolTip = nil
+            return
+        }
+        creditBalanceTitleLabel.isHidden = false
+        creditBalanceTitleLabel.toolTip = "额度余额 \(Int(balance.rounded())) 积分（$100 = 2500 积分）"
+        creditBalanceLabel.stringValue = String(format: "$%.2f", balance / 25)
+        creditBalanceLabel.toolTip = "额度余额 \(Int(balance.rounded())) 积分（$100 = 2500 积分）"
     }
 
     private func updateResetCreditsExpirationButton() {
@@ -2010,11 +2037,6 @@ final class QuotaViewController: NSViewController {
         onUnmuteAll?()
     }
 
-    @objc private func restoreDefaultsTapped() {
-        applyReminderConfiguration(.default)
-        onReminderConfigurationChange?(currentReminderConfiguration())
-    }
-
     private static func formatFetchedAt(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
@@ -2081,10 +2103,17 @@ final class QuotaViewController: NSViewController {
     }
 
     func applyReminderConfiguration(_ configuration: ReminderConfiguration) {
+        reminderConfiguration = configuration
         reminderEnabledButton.state = configuration.isEnabled ? .on : .off
-        selectPopupItem(warningPopup, representedValue: Int(configuration.warningRemainingPercent))
-        selectPopupItem(resetSoonPopup, representedValue: Int(configuration.resetSoonMinutes))
-        selectPopupItem(cooldownPopup, representedValue: Int(configuration.cooldown / 60))
+        warningValueLabel.stringValue = "\(Int(configuration.warningRemainingPercent))%"
+        resetSoonValueLabel.stringValue = configuration.resetSoonMinutes > 0
+            ? "\(Int(configuration.resetSoonMinutes)) 分钟"
+            : "关闭"
+        cooldownValueLabel.stringValue = "\(Int(configuration.cooldown / 60)) 分钟"
+    }
+
+    func applyRefreshInterval(minutes: Int) {
+        refreshIntervalValueLabel.stringValue = "\(minutes) 分钟"
     }
 
     private func configureReminderControls() {
@@ -2100,62 +2129,35 @@ final class QuotaViewController: NSViewController {
         unmuteButton.action = #selector(unmuteAllTapped)
         unmuteButton.isHidden = true
 
-        restoreDefaultsButton.bezelStyle = .rounded
-        restoreDefaultsButton.controlSize = .small
-        restoreDefaultsButton.font = .systemFont(ofSize: 11)
-        restoreDefaultsButton.toolTip = "恢复提醒设置为默认值：开启、额度低于 20%、重置还剩 30 分钟、提醒间隔 10 分钟"
-        restoreDefaultsButton.target = self
-        restoreDefaultsButton.action = #selector(restoreDefaultsTapped)
-
-        configurePopup(
-            warningPopup,
-            items: [
-                ("50%", 50), ("40%", 40), ("30%", 30), ("20%", 20), ("10%", 10)
-            ]
-        )
-        configurePopup(
-            resetSoonPopup,
-            items: [
-                ("50 分钟", 50), ("40 分钟", 40), ("30 分钟", 30), ("20 分钟", 20), ("10 分钟", 10), ("关闭", 0)
-            ]
-        )
-        configurePopup(
-            cooldownPopup,
-            items: [
-                ("5 分钟", 5), ("10 分钟", 10), ("15 分钟", 15), ("30 分钟", 30), ("60 分钟", 60)
-            ]
-        )
+        for label in [warningValueLabel, resetSoonValueLabel, cooldownValueLabel, refreshIntervalValueLabel] {
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .labelColor
+        }
 
         applyReminderConfiguration(ReminderSettings.load())
-    }
-
-    private func configurePopup(_ popup: NSPopUpButton, items: [(String, Int)]) {
-        popup.removeAllItems()
-        popup.font = .systemFont(ofSize: 11)
-        popup.target = self
-        popup.action = #selector(reminderControlChanged)
-
-        for item in items {
-            popup.addItem(withTitle: item.0)
-            popup.lastItem?.representedObject = item.1
-        }
+        applyRefreshInterval(minutes: RefreshSettings.loadMinutes())
     }
 
     private func makeSettingsView() -> NSView {
-        let title = NSTextField(labelWithString: "提醒设置")
+        let title = NSTextField(labelWithString: "设置")
         title.font = .systemFont(ofSize: 12, weight: .semibold)
         title.textColor = .secondaryLabelColor
 
-        let lowRow = makeSettingRow(label: "额度低于", control: warningPopup)
-        let resetRow = makeSettingRow(label: "重置还剩", control: resetSoonPopup)
-        let cooldownRow = makeSettingRow(label: "提醒间隔", control: cooldownPopup)
+        let editHint = NSTextField(labelWithString: "在状态栏右键菜单中修改")
+        editHint.font = .systemFont(ofSize: 10)
+        editHint.textColor = .tertiaryLabelColor
 
-        let titleLine = NSStackView(views: [title, NSView()])
+        let lowRow = makeSettingRow(label: "额度低于", control: warningValueLabel)
+        let resetRow = makeSettingRow(label: "重置还剩", control: resetSoonValueLabel)
+        let cooldownRow = makeSettingRow(label: "提醒间隔", control: cooldownValueLabel)
+        let refreshRow = makeSettingRow(label: "刷新频率", control: refreshIntervalValueLabel)
+
+        let titleLine = NSStackView(views: [title, editHint, NSView()])
         titleLine.orientation = .horizontal
         titleLine.alignment = .centerY
         titleLine.spacing = 8
 
-        let firstLine = NSStackView(views: [reminderEnabledButton, NSView(), unmuteButton, restoreDefaultsButton])
+        let firstLine = NSStackView(views: [reminderEnabledButton, NSView(), unmuteButton])
         firstLine.orientation = .horizontal
         firstLine.alignment = .centerY
         firstLine.spacing = 8
@@ -2165,7 +2167,7 @@ final class QuotaViewController: NSViewController {
         secondLine.alignment = .centerY
         secondLine.spacing = 10
 
-        let thirdLine = NSStackView(views: [cooldownRow, NSView()])
+        let thirdLine = NSStackView(views: [cooldownRow, NSView(), refreshRow])
         thirdLine.orientation = .horizontal
         thirdLine.alignment = .centerY
         thirdLine.spacing = 10
@@ -2205,40 +2207,10 @@ final class QuotaViewController: NSViewController {
     }
 
     private func currentReminderConfiguration() -> ReminderConfiguration {
-        ReminderConfiguration(
-            isEnabled: reminderEnabledButton.state == .on,
-            warningRemainingPercent: Double(selectedIntValue(warningPopup)),
-            criticalRemainingPercent: ReminderConfiguration.default.criticalRemainingPercent,
-            resetSoonMinutes: TimeInterval(selectedIntValue(resetSoonPopup)),
-            cooldown: TimeInterval(selectedIntValue(cooldownPopup) * 60)
-        )
-    }
-
-    private func selectPopupItem(_ popup: NSPopUpButton, representedValue: Int) {
-        var nearestItem: NSMenuItem?
-        var nearestDistance = Int.max
-
-        for item in popup.itemArray {
-            guard let value = item.representedObject as? Int else { continue }
-            if value == representedValue {
-                popup.select(item)
-                return
-            }
-            let distance = abs(value - representedValue)
-            if distance < nearestDistance {
-                nearestDistance = distance
-                nearestItem = item
-            }
-        }
-
-        // Stored value may come from an older option list; fall back to the closest one.
-        if let nearestItem {
-            popup.select(nearestItem)
-        }
-    }
-
-    private func selectedIntValue(_ popup: NSPopUpButton) -> Int {
-        popup.selectedItem?.representedObject as? Int ?? 0
+        // 阈值以菜单/持久化同步过来的副本为准，面板只改 isEnabled。
+        var configuration = reminderConfiguration
+        configuration.isEnabled = reminderEnabledButton.state == .on
+        return configuration
     }
 }
 
@@ -2274,7 +2246,7 @@ final class QuotaRowView: NSView {
     private let detailWidth: CGFloat
     private let barMinWidth: CGFloat
 
-    init(title: String, titleWidth: CGFloat = 52, detailWidth: CGFloat = 112, barMinWidth: CGFloat = 220) {
+    init(title: String, titleWidth: CGFloat = 52, detailWidth: CGFloat = 132, barMinWidth: CGFloat = 200) {
         self.placeholderTitle = title
         self.titleLabel = NSTextField(labelWithString: title)
         self.detailLabel = NSTextField(labelWithString: "--% · --")
@@ -2298,6 +2270,7 @@ final class QuotaRowView: NSView {
 
     func update(bucket: QuotaBucket?) {
         guard let bucket else {
+            barView.isPending = false
             setRowTitle(placeholderTitle)
             barView.percent = 0
             detailLabel.stringValue = "--% · --"
@@ -2305,6 +2278,7 @@ final class QuotaRowView: NSView {
             return
         }
 
+        barView.isPending = false
         setRowTitle(bucket.title)
         barView.percent = bucket.remainingPercent
         detailLabel.stringValue = "\(bucket.roundedRemainingPercent)% · \(formatReset(bucket.resetsAt))"
@@ -2312,6 +2286,7 @@ final class QuotaRowView: NSView {
 
     func update(limit: ZAILimit?) {
         guard let limit else {
+            barView.isPending = false
             setRowTitle(placeholderTitle)
             barView.percent = 0
             detailLabel.stringValue = "--% · --"
@@ -2319,6 +2294,7 @@ final class QuotaRowView: NSView {
             return
         }
 
+        barView.isPending = false
         setRowTitle(limit.title)
         barView.percent = limit.remainingPercent
         detailLabel.stringValue = "\(limit.roundedRemainingPercent)% · \(formatReset(limit.nextResetTime))"
@@ -2327,6 +2303,7 @@ final class QuotaRowView: NSView {
     /// 体验套餐余额行：电量条按剩余/总量，detail 显示绝对 token 数与到期时间。
     func update(balance: ZAIBalance?) {
         guard let balance else {
+            barView.isPending = false
             setRowTitle(placeholderTitle)
             barView.percent = 0
             detailLabel.stringValue = "-- · --"
@@ -2334,6 +2311,7 @@ final class QuotaRowView: NSView {
             return
         }
 
+        barView.isPending = false
         setRowTitle(balance.title)
         barView.percent = balance.remainingFraction * 100
         detailLabel.stringValue = "\(Self.formatTokenCount(balance.remainingUnits))/\(Self.formatTokenCount(balance.totalUnits)) · \(formatReset(balance.expiresAt))"
@@ -2341,6 +2319,28 @@ final class QuotaRowView: NSView {
         let periodText = balance.isDaily ? "每日额度" : "一次性额度"
         let verb = balance.isDaily ? "重置" : "到期"
         detailLabel.toolTip = "\(balance.title) · \(periodText)，\(formatReset(balance.expiresAt)) \(verb)（已用 \(used)）"
+    }
+
+    /// 待生效权益行：权益生效前余额接口只返回 entitlements（balances 为空）。
+    /// 进度条整条置灰（额度尚未启用），detail 按过期时间展示，与余额行口径一致。
+    func update(pending entitlement: ZAIPendingEntitlement?) {
+        guard let entitlement else {
+            barView.isPending = false
+            setRowTitle(placeholderTitle)
+            barView.percent = 0
+            detailLabel.stringValue = "-- · --"
+            detailLabel.toolTip = nil
+            return
+        }
+
+        barView.isPending = true
+        barView.percent = 100
+        setRowTitle(entitlement.title)
+        let grant = Self.formatTokenCount(entitlement.grantUnits)
+        let expiry = formatReset(entitlement.expiresAt)
+        let effective = formatReset(entitlement.effectiveAt)
+        detailLabel.stringValue = "\(grant) · \(expiry) 到期"
+        detailLabel.toolTip = "\(entitlement.title) · 待生效，\(effective) 起可用，\(expiry) 到期"
     }
 
     /// token 数格式化：100000000 → "100.0M"。
@@ -2550,6 +2550,11 @@ final class SegmentedBatteryBarView: NSView {
         }
     }
 
+    /// 待生效（额度尚未启用）时整条用灰色，不按百分比上色。
+    var isPending: Bool = false {
+        didSet { needsDisplay = true }
+    }
+
     private let segmentCount: Int
 
     init(segmentCount: Int) {
@@ -2578,7 +2583,7 @@ final class SegmentedBatteryBarView: NSView {
         let filledSegments = Int((percent / 100 * Double(segmentCount)).rounded(.up))
 
         let backgroundColor = NSColor.separatorColor.withAlphaComponent(0.35)
-        let fillColor = color(for: percent)
+        let fillColor = isPending ? NSColor.systemGray : color(for: percent)
 
         for index in 0..<segmentCount {
             let x = bounds.minX + CGFloat(index) * (segmentWidth + gap)
@@ -2605,7 +2610,7 @@ final class SegmentedBatteryBarView: NSView {
     }
 }
 
-private func formatReset(_ date: Date?) -> String {
+func formatReset(_ date: Date?) -> String {
     guard let date else { return "--" }
 
     let calendar = Calendar.current
@@ -2626,7 +2631,7 @@ private func formatReset(_ date: Date?) -> String {
     return formatter.string(from: date)
 }
 
-private func formatCompactReset(_ date: Date?) -> String {
+func formatCompactReset(_ date: Date?) -> String {
     guard let date else { return "--" }
 
     let calendar = Calendar.current
@@ -2650,7 +2655,7 @@ private func formatCompactReset(_ date: Date?) -> String {
 // MARK: - Entry point
 
 @main
-final class CodexTouchBarQuotaApp {
+final class LocalQuotaBarApp {
     static func main() {
         let app = NSApplication.shared
         let delegate = AppDelegate()

@@ -1,4 +1,4 @@
-APP_NAME := CodexTouchBarQuota
+APP_NAME := LocalQuotaBar
 BUNDLE := .build/release/$(APP_NAME).app
 BIN := .build/release/$(APP_NAME)
 ICON := Resources/AppIcon.icns
