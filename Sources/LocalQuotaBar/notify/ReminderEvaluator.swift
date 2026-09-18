@@ -72,13 +72,20 @@ final class ReminderEvaluator {
             guard let level = triggerLevel(for: bucket, now: now) else { continue }
             let state = states[bucket.id] ?? ReminderStateStore.BucketState()
             if state.mutedUntil > nowInterval { continue }
-            // 额度没动（一直没用或已为 0）时数字与上次相同，不重复打扰；
-            // 数字变化、点"恢复提醒"或重置后才会重新放行。
-            if let lastPercent = state.lastAlertedRemainingPercent,
-               lastPercent == bucket.remainingPercent {
-                continue
+            let isResetCard = bucket.kind == .resetCard
+            if !isResetCard {
+                // 额度没动（一直没用或已为 0）时数字与上次相同，不重复打扰；
+                // 数字变化、点"恢复提醒"或重置后才会重新放行。
+                // 重置卡桶的剩余百分比恒为 100，跳过该去重，按固定间隔重复提醒。
+                if let lastPercent = state.lastAlertedRemainingPercent,
+                   lastPercent == bucket.remainingPercent {
+                    continue
+                }
             }
-            if state.lastAlertAt > 0, nowInterval - state.lastAlertAt < configuration.cooldown { continue }
+            let repeatInterval = isResetCard
+                ? ReminderConfiguration.resetCardRepeatInterval
+                : configuration.cooldown
+            if state.lastAlertAt > 0, nowInterval - state.lastAlertAt < repeatInterval { continue }
             hits.append(ReminderHit(bucket: bucket, level: level))
         }
 
@@ -137,6 +144,16 @@ final class ReminderEvaluator {
     }
 
     private func triggerLevel(for bucket: ReminderBucket, now: Date) -> ReminderLevel? {
+        // 重置卡只看到期时间：进入固定窗口就提醒，不受"重置还剩"等设置影响。
+        if bucket.kind == .resetCard {
+            guard let expiresAt = bucket.resetsAt else { return nil }
+            let timeToExpiry = expiresAt.timeIntervalSince(now)
+            guard timeToExpiry > 0, timeToExpiry <= ReminderConfiguration.resetCardExpiryWindow else {
+                return nil
+            }
+            return .resetSoon
+        }
+
         if bucket.remainingPercent <= configuration.criticalRemainingPercent {
             return .critical
         }

@@ -1,73 +1,78 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">LocalQuotaBar 新版应用图标</title>
+  <desc id="desc">炭黑圆角底座，三条额度胶囊依次为绿色 100%、橙色 50%、红色 30%，未填充部分显示暗色底槽。</desc>
   <defs>
-    <linearGradient id="bg" x1="152" y1="128" x2="872" y2="896" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#101820"/>
-      <stop offset="0.48" stop-color="#18222d"/>
-      <stop offset="1" stop-color="#0a0f16"/>
+    <linearGradient id="base" x1="0" y1="0" x2="0.7" y2="1">
+      <stop stop-color="#29292e"/><stop offset=".48" stop-color="#1a1a1c"/><stop offset="1" stop-color="#141416"/>
     </linearGradient>
-    <linearGradient id="panel" x1="196" y1="246" x2="828" y2="778" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#253447"/>
-      <stop offset="1" stop-color="#101821"/>
+    <linearGradient id="rim" x1="0" y1="0" x2=".5" y2="1">
+      <stop stop-color="#ffffff" stop-opacity=".19"/><stop offset=".45" stop-color="#ffffff" stop-opacity=".04"/><stop offset="1" stop-color="#ffffff" stop-opacity=".09"/>
     </linearGradient>
-    <linearGradient id="green" x1="248" y1="390" x2="776" y2="390" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#63f6a7"/>
-      <stop offset="1" stop-color="#18d9d2"/>
+    <linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#46e095"/><stop offset=".48" stop-color="#32d583"/><stop offset="1" stop-color="#27bd6f"/>
     </linearGradient>
-    <linearGradient id="blue" x1="248" y1="552" x2="776" y2="552" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#7cb7ff"/>
-      <stop offset="1" stop-color="#8b7cff"/>
+    <linearGradient id="orange" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#ffb340"/><stop offset=".48" stop-color="#ff9f0a"/><stop offset="1" stop-color="#f08c00"/>
     </linearGradient>
-    <filter id="softShadow" x="-20%" y="-20%" width="140%" height="140%">
-      <feDropShadow dx="0" dy="32" stdDeviation="36" flood-color="#000000" flood-opacity="0.42"/>
+    <linearGradient id="red" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#ff6b5e"/><stop offset=".48" stop-color="#ff453a"/><stop offset="1" stop-color="#e03327"/>
+    </linearGradient>
+    <linearGradient id="track" x1="0" y1="0" x2="0" y2="1">
+      <stop stop-color="#28282c"/><stop offset="1" stop-color="#343438"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="155%">
+      <feDropShadow dx="0" dy="18" stdDeviation="15" flood-color="#000000" flood-opacity=".24"/>
     </filter>
-    <filter id="glow" x="-40%" y="-60%" width="180%" height="220%">
-      <feGaussianBlur stdDeviation="13" result="blur"/>
-      <feMerge>
-        <feMergeNode in="blur"/>
-        <feMergeNode in="SourceGraphic"/>
-      </feMerge>
+    <filter id="pill-shadow" x="-15%" y="-35%" width="130%" height="180%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity=".24"/>
+    </filter>
+    <clipPath id="icon-clip">
+      <path d="M302 64H722C890 64 960 134 960 302V722C960 890 890 960 722 960H302C134 960 64 890 64 722V302C64 134 134 64 302 64Z"/>
+    </clipPath>
+    <radialGradient id="glass-top" gradientUnits="userSpaceOnUse" cx="156" cy="140" r="385">
+      <stop stop-color="#e9f7ff" stop-opacity=".22"/><stop offset=".4" stop-color="#b9d8e7" stop-opacity=".08"/><stop offset="1" stop-color="#b9d8e7" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glass-bottom" gradientUnits="userSpaceOnUse" cx="896" cy="900" r="335">
+      <stop stop-color="#c5e9ff" stop-opacity=".18"/><stop offset=".45" stop-color="#8cbdd7" stop-opacity=".06"/><stop offset="1" stop-color="#8cbdd7" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="edge-top" gradientUnits="userSpaceOnUse" cx="146" cy="146" r="390">
+      <stop stop-color="#f4fcff" stop-opacity=".78"/><stop offset=".4" stop-color="#c5edff" stop-opacity=".36"/><stop offset=".72" stop-color="#d5edff" stop-opacity=".09"/><stop offset=".9" stop-color="#d5edff" stop-opacity=".015"/><stop offset="1" stop-color="#d5edff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="edge-bottom" gradientUnits="userSpaceOnUse" cx="878" cy="878" r="390">
+      <stop stop-color="#e5f8ff" stop-opacity=".65"/><stop offset=".4" stop-color="#a8dfff" stop-opacity=".3"/><stop offset=".72" stop-color="#c5eaff" stop-opacity=".075"/><stop offset=".9" stop-color="#c5eaff" stop-opacity=".012"/><stop offset="1" stop-color="#c5eaff" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glass-soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="5"/>
     </filter>
   </defs>
-
-  <rect x="64" y="64" width="896" height="896" rx="210" fill="url(#bg)"/>
-  <path d="M196 260c0-56 45-102 101-102h430c56 0 101 46 101 102v504c0 56-45 102-101 102H297c-56 0-101-46-101-102V260z" fill="url(#panel)" filter="url(#softShadow)"/>
-  <path d="M300 158h424c57 0 104 47 104 104v25H196v-25c0-57 47-104 104-104z" fill="#34445a" opacity="0.72"/>
-  <circle cx="282" cy="224" r="18" fill="#ff5f57"/>
-  <circle cx="344" cy="224" r="18" fill="#ffbd2e"/>
-  <circle cx="406" cy="224" r="18" fill="#28c840"/>
-
-  <rect x="248" y="344" width="528" height="92" rx="28" fill="#091016" stroke="#3d4b5c" stroke-width="8"/>
-  <g filter="url(#glow)">
-    <rect x="276" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="326" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="376" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="426" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="476" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="526" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="576" y="372" width="35" height="36" rx="9" fill="url(#green)"/>
-    <rect x="626" y="372" width="35" height="36" rx="9" fill="#26313f"/>
-    <rect x="676" y="372" width="35" height="36" rx="9" fill="#26313f"/>
+  <!-- 透明边距保留 macOS 图标的呼吸空间。 -->
+  <path d="M302 64H722C890 64 960 134 960 302V722C960 890 890 960 722 960H302C134 960 64 890 64 722V302C64 134 134 64 302 64Z" fill="url(#base)" filter="url(#shadow)"/>
+  <path d="M302 66H722C889 66 958 135 958 302V722C958 889 889 958 722 958H302C135 958 66 889 66 722V302C66 135 135 66 302 66Z" fill="none" stroke="url(#rim)" stroke-width="3"/>
+  <!-- 两角高光延伸至边缘中段，并在路径结束前渐隐至透明，避免硬截断。 -->
+  <g clip-path="url(#icon-clip)">
+    <path d="M64 64H960V960H64Z" fill="url(#glass-top)"/>
+    <path d="M64 64H960V960H64Z" fill="url(#glass-bottom)"/>
+    <path d="M78 552V302C78 146 146 78 302 78H552" fill="none" stroke="url(#edge-top)" stroke-width="19" filter="url(#glass-soft)"/>
+    <path d="M76 552V302C76 144 144 76 302 76H552" fill="none" stroke="url(#edge-top)" stroke-width="3.5"/>
+    <path d="M90 552V302C90 153 153 90 302 90H552" fill="none" stroke="url(#edge-top)" stroke-width="1.5" opacity=".28"/>
+    <path d="M472 946H722C878 946 946 878 946 722V472" fill="none" stroke="url(#edge-bottom)" stroke-width="18" filter="url(#glass-soft)"/>
+    <path d="M472 948H722C880 948 948 880 948 722V472" fill="none" stroke="url(#edge-bottom)" stroke-width="3"/>
+    <path d="M472 934H722C871 934 934 871 934 722V472" fill="none" stroke="url(#edge-bottom)" stroke-width="1.5" opacity=".3"/>
   </g>
-  <text x="248" y="322" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="54" font-weight="800" fill="#e8f2ff">5H</text>
-
-  <rect x="248" y="506" width="528" height="92" rx="28" fill="#091016" stroke="#3d4b5c" stroke-width="8"/>
-  <g filter="url(#glow)">
-    <rect x="276" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="326" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="376" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="426" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="476" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="526" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="576" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="626" y="534" width="35" height="36" rx="9" fill="url(#blue)"/>
-    <rect x="676" y="534" width="35" height="36" rx="9" fill="#26313f"/>
+  <!-- 三条等宽轨道以 100%、50%、30% 填充，直观表现不同额度余量。 -->
+  <g filter="url(#pill-shadow)">
+    <rect x="216" y="296" width="592" height="112" rx="56" fill="url(#green)"/>
+    <text x="512" y="374" text-anchor="middle" fill="#ffffff" font-family="Helvetica Neue, sans-serif" font-size="64" font-weight="700" letter-spacing="-1">100%</text>
+    <path d="M274 302H750" fill="none" stroke="#b4ffd5" stroke-opacity=".42" stroke-width="3" stroke-linecap="round"/>
   </g>
-  <text x="248" y="484" font-family="-apple-system, BlinkMacSystemFont, 'SF Pro Display', sans-serif" font-size="54" font-weight="800" fill="#e8f2ff">W</text>
-
-  <path d="M512 670c62 0 112 50 112 112h-48c0-35-29-64-64-64s-64 29-64 64h-48c0-62 50-112 112-112z" fill="#e8f2ff" opacity="0.95"/>
-  <circle cx="512" cy="782" r="28" fill="#19dbc2"/>
-  <path d="M382 726c30-70 88-106 130-106s100 36 130 106" fill="none" stroke="#4b5d74" stroke-width="28" stroke-linecap="round"/>
-  <path d="M382 726c30-70 88-106 130-106 36 0 84 27 116 82" fill="none" stroke="#19dbc2" stroke-width="28" stroke-linecap="round" filter="url(#glow)"/>
-
-  <path d="M238 706c-19 0-34-15-34-34V307c0-19 15-34 34-34h548c19 0 34 15 34 34" fill="none" stroke="#ffffff" stroke-opacity="0.11" stroke-width="6" stroke-linecap="round"/>
+  <g filter="url(#pill-shadow)">
+    <rect x="216" y="456" width="592" height="112" rx="56" fill="url(#track)" stroke="#ffffff" stroke-opacity=".045" stroke-width="2"/>
+    <rect x="216" y="456" width="296" height="112" rx="56" fill="url(#orange)"/>
+    <path d="M274 462H454" fill="none" stroke="#ffe1a3" stroke-opacity=".42" stroke-width="3" stroke-linecap="round"/>
+  </g>
+  <g filter="url(#pill-shadow)">
+    <rect x="216" y="616" width="592" height="112" rx="56" fill="url(#track)" stroke="#ffffff" stroke-opacity=".045" stroke-width="2"/>
+    <rect x="216" y="616" width="177.6" height="112" rx="56" fill="url(#red)"/>
+    <path d="M274 622H335.6" fill="none" stroke="#ffbfb6" stroke-opacity=".42" stroke-width="3" stroke-linecap="round"/>
+  </g>
 </svg>

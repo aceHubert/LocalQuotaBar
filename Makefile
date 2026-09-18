@@ -9,7 +9,7 @@ build:
 	swift build -c release
 
 icon:
-	swift Tools/render-icon.swift "$(CURDIR)/Resources/AppIcon-1024.png"
+	swift Tools/render-svg-icon.swift Resources/AppIcon.svg "$(CURDIR)/Resources/AppIcon-1024.png"
 	rm -rf Resources/AppIcon.iconset
 	mkdir -p Resources/AppIcon.iconset
 	sips -z 16 16 Resources/AppIcon-1024.png --out Resources/AppIcon.iconset/icon_16x16.png

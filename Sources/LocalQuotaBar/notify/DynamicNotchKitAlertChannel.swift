@@ -218,6 +218,10 @@ struct NotchAlertContent: View {
 
     private func triggerText(for hit: ReminderHit) -> String {
         let name = hit.bucket.shortTitle
+        // 重置卡桶的 resetsAt 是卡的到期时刻，不是额度重置。
+        if hit.bucket.kind == .resetCard {
+            return "\(name)快过期了"
+        }
         // ZAI 的短标题自带"额度"，Codex 的"5小时/周限额"需要补量词才通顺。
         let noun = name.contains("额度") || name.contains("限额") ? "" : "额度"
         switch hit.level {

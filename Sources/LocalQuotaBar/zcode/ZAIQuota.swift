@@ -18,6 +18,29 @@ struct ZAIProviderSelection: Equatable {
     let domain: String
     let kind: ZAIPlanKind
     let selectedKey: String?
+    /// ZCode 3.12.3+ 写入 `providerFamilyConnectionSelections[domain].kind` 的原始值
+    /// （start-plan / individual-coding-plan / team-coding-plan）。legacy 路径下为 nil。
+    /// 团队版判定依赖它：新格式不再写 selectedKey，team 只能从这里认出来。
+    let connectionKind: String?
+
+    init(domain: String, kind: ZAIPlanKind, selectedKey: String?, connectionKind: String? = nil) {
+        self.domain = domain
+        self.kind = kind
+        self.selectedKey = selectedKey
+        self.connectionKind = connectionKind
+    }
+}
+
+extension ZAIPlanKind {
+    /// ZCode 3.12.3+ 的连接类型归一化；未知值返回 nil，交给 legacy 路径兜底。
+    /// api-key 模式不写连接选择，仍由 modelProviderFamilySelectedKeys 表达。
+    init?(connectionKind: String) {
+        switch connectionKind {
+        case "start-plan": self = .startPlan
+        case "individual-coding-plan", "team-coding-plan": self = .codingPlan
+        default: return nil
+        }
+    }
 }
 
 struct ZAILimit: Equatable, Codable {
@@ -224,12 +247,28 @@ enum ZAISettings {
     static func resolveProviderSelection() -> ZAIProviderSelection? {
         guard let url = settingURLs.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
               let data = try? Data(contentsOf: url),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let domain = object["providerFamilyDomain"] as? String,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        return resolveProviderSelection(object: object)
+    }
+
+    /// 纯解析入口，供单测直接注入 setting.json 的字典内容。
+    /// ZCode 3.12.3 起切换套餐只写 `providerFamilyConnectionSelections[domain].kind`，
+    /// `modelProviderFamilySelectedKeys` 已冻结在旧值上；连接选择存在时必须以它为准，
+    /// 否则会跟着冻结的旧套餐走（例如切到 start-plan 后仍查 coding-plan 额度）。
+    static func resolveProviderSelection(object: [String: Any]) -> ZAIProviderSelection? {
+        guard let domain = object["providerFamilyDomain"] as? String,
               domain == "zai" || domain == "bigmodel"
         else { return nil }
 
         let selectedKey = (object["modelProviderFamilySelectedKeys"] as? [String: String])?[domain]
+
+        if let connectionKind = connectionSelectionKind(object: object, domain: domain),
+           let kind = ZAIPlanKind(connectionKind: connectionKind) {
+            return ZAIProviderSelection(domain: domain, kind: kind,
+                                        selectedKey: selectedKey, connectionKind: connectionKind)
+        }
+
         let kind: ZAIPlanKind
         if let key = selectedKey?.lowercased() {
             if key.contains("start-plan") {
@@ -245,6 +284,16 @@ enum ZAISettings {
             kind = fallbackKind(object: object, domain: domain)
         }
         return ZAIProviderSelection(domain: domain, kind: kind, selectedKey: selectedKey)
+    }
+
+    /// `providerFamilyConnectionSelections[domain].kind`；条目缺失或形状非法时返回 nil，
+    /// 由 legacy 路径接管（api-key 模式、未重启的惰性迁移窗口、team 连接未解析）。
+    private static func connectionSelectionKind(object: [String: Any], domain: String) -> String? {
+        guard let selections = object["providerFamilyConnectionSelections"] as? [String: Any],
+              let entry = selections[domain] as? [String: Any]
+        else { return nil }
+        guard let kind = entry["kind"] as? String, !kind.isEmpty else { return nil }
+        return kind
     }
 
     private static func fallbackKind(object: [String: Any], domain: String) -> ZAIPlanKind {
@@ -270,7 +319,7 @@ enum ZAISettings {
 
     /// 从 credentials.json 解密出 OAuth access token 与用户信息。
     /// bigmodel 渠道优先找 oauth:bigmodel:*，回退 oauth:zai:*（两渠道共用 zai OAuth 的历史布局）。
-    static func loadCredentials(domain: String = "zai") throws -> (accessToken: String, userInfo: [String: Any]?) {
+    static func loadCredentials(domain: String = "zai", allowZaiFallback: Bool = true) throws -> (accessToken: String, userInfo: [String: Any]?) {
         guard let v2 = zcodeV2URL else { throw ZAIQuotaError.credentialsMissing }
         let credsURL = v2.appendingPathComponent("credentials.json")
         guard let data = try? Data(contentsOf: credsURL),
@@ -280,12 +329,12 @@ enum ZAISettings {
         let cipher = ZAICredentialCipher()
 
         let encryptedToken = object["oauth:\(domain):access_token"]
-            ?? object["oauth:zai:access_token"] ?? ""
+            ?? (allowZaiFallback ? object["oauth:zai:access_token"] : nil) ?? ""
         guard !encryptedToken.isEmpty else { throw ZAIQuotaError.credentialsMissing }
         let token = try cipher.decrypt(encryptedToken)
 
         var userInfo: [String: Any]?
-        let encryptedUser = object["oauth:\(domain):user_info"] ?? object["oauth:zai:user_info"]
+        let encryptedUser = object["oauth:\(domain):user_info"] ?? (allowZaiFallback ? object["oauth:zai:user_info"] : nil)
         if let encryptedUser, !encryptedUser.isEmpty {
             if let plain = try? cipher.decrypt(encryptedUser),
                let jsonData = plain.data(using: .utf8),
@@ -358,6 +407,19 @@ enum ZAISettings {
               let encrypted = object["zcodejwttoken"], !encrypted.isEmpty
         else { throw ZAIQuotaError.credentialsMissing }
         return try ZAICredentialCipher().decrypt(encrypted)
+    }
+
+    /// 设备标识（对齐 zcode.cjs 的 readExistingDeviceMid）：
+    /// 读 ~/.zcode/v2/telemetry-state.json 的 deviceMid，只读不生成。
+    /// zcode.z.ai 网关对缺该头的 billing/balance 返回 400 "parameter error"。
+    static func loadDeviceMid() -> String? {
+        guard let v2 = zcodeV2URL,
+              let data = try? Data(contentsOf: v2.appendingPathComponent("telemetry-state.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let mid = object["deviceMid"] as? String
+        else { return nil }
+        let trimmed = mid.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     /// selectedKey（"api-key:builtin:zai"）里去掉首个模式前缀后的 provider id。
@@ -440,7 +502,9 @@ enum ZAIQuotaEndpoint {
     /// baseURL 取自 config.json 的 builtin:<domain>-start-plan（形如 …/api/v1/zcode-plan/anthropic），
     /// 余额端点为同 origin 下的 /api/v1/zcode-plan/billing/balance，需带 app_version（与 zcode 官方一致）。
     /// 凭证是套餐 JWT（provider 的 options.apiKey），而非 OAuth token。
-    static func makeStartPlanBalanceRequest(token: String, baseURL: URL) -> URLRequest {
+    /// deviceMid 是网关强制的设备标识（缺失时 400 "parameter error"），
+    /// 来自 telemetry-state.json，官方 host 的其余来源头（UA/平台等）经二分验证均非必需。
+    static func makeStartPlanBalanceRequest(token: String, baseURL: URL, deviceMid: String?) -> URLRequest {
         var components = URLComponents()
         components.scheme = baseURL.scheme
         components.host = baseURL.host
@@ -453,6 +517,9 @@ enum ZAIQuotaEndpoint {
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let deviceMid, !deviceMid.isEmpty {
+            request.setValue(deviceMid, forHTTPHeaderField: "X-Device-Mid")
+        }
         request.timeoutInterval = 15
         return request
     }
@@ -484,7 +551,9 @@ final class ZAIQuotaStore {
     private(set) var account: ZAIAccount?
     private(set) var isRefreshing = false
     private(set) var lastError: String?
-    private var lastRefreshedAt: Date?
+    private(set) var lastRefreshStartedAt: Date?
+    private(set) var lastResetScopeID: String?
+    private var needsRefreshAfterCurrent = false
     private var timer: Timer?
 
     var onChange: ((ZAIQuotaSnapshot?, ZAIAccount?, Bool, String?) -> Void)?
@@ -535,10 +604,20 @@ final class ZAIQuotaStore {
         refresh()
     }
 
+    /// 重置成功后必须开始一次新查询；已有查询尚未结束时排队执行。
+    func refreshAfterReset() {
+        if isRefreshing {
+            needsRefreshAfterCurrent = true
+        } else {
+            refresh()
+        }
+    }
+
     func refresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
-        lastRefreshedAt = Date()
+        lastRefreshStartedAt = Date()
+        lastResetScopeID = nil
         account = ZAISettings.loadAccount()
         onChange?(snapshot, account, true, lastError)
 
@@ -554,6 +633,10 @@ final class ZAIQuotaStore {
             }
             isRefreshing = false
             onChange?(snapshot, account, false, lastError)
+            if needsRefreshAfterCurrent {
+                needsRefreshAfterCurrent = false
+                refresh()
+            }
         }
     }
 
@@ -600,7 +683,9 @@ final class ZAIQuotaStore {
         let token = try ZAISettings.loadStartPlanToken(domain: selection.domain)
         let baseURL = providerConfig.baseURL
             ?? URL(string: "https://zcode.z.ai/api/v1/zcode-plan/anthropic")!
-        let request = ZAIQuotaEndpoint.makeStartPlanBalanceRequest(token: token, baseURL: baseURL)
+        let request = ZAIQuotaEndpoint.makeStartPlanBalanceRequest(
+            token: token, baseURL: baseURL, deviceMid: ZAISettings.loadDeviceMid()
+        )
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -690,9 +775,16 @@ final class ZAIQuotaStore {
         )
     }
 
+    /// start-plan 日志条目的 providerId 匹配：ZCode ≤3.11 写 `builtin:<domain>-start-plan`，
+    /// 3.12.3 起 host 改写 `account:<domain>-start-plan`（zcode.cjs 的 provider 正则两种都认）。
+    nonisolated static func isStartPlanLogProviderID(_ providerID: String, domain: String) -> Bool {
+        let lowered = providerID.lowercased()
+        return lowered == "builtin:\(domain)-start-plan" || lowered == "account:\(domain)-start-plan"
+    }
+
     /// 从 ~/.zcode/v2/logs/<当天>.log 取最新一条 start-plan 的 billing/balance 响应 payload。
     /// host 每 ~秒把完整响应写进 [usage-stats]/[coding-plan-availability] 行，
-    /// 我们只认 providerId == builtin:<domain>-start-plan 的条目。
+    /// 只认 providerId 为 start-plan 的条目（前缀见 isStartPlanLogProviderID）。
     private static func latestStartPlanBalancePayload(domain: String) -> [String: Any]? {
         let logs = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".zcode", isDirectory: true)
@@ -705,7 +797,6 @@ final class ZAIQuotaStore {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
 
         let marker = "billing/balance 请求完成"
-        let wantProvider = "builtin:\(domain)-start-plan"
         var searchRange = text.startIndex..<text.endIndex
         var lastPayload: [String: Any]?
         while let matched = text.range(of: marker, range: searchRange) {
@@ -713,7 +804,8 @@ final class ZAIQuotaStore {
             if let newline = text[after...].firstIndex(of: "\n") {
                 let line = String(text[after..<newline])
                 if let object = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                   (object["providerId"] as? String)?.lowercased() == wantProvider,
+                   let providerID = object["providerId"] as? String,
+                   isStartPlanLogProviderID(providerID, domain: domain),
                    let payload = object["payload"] as? [String: Any] {
                     lastPayload = payload
                 }
@@ -726,6 +818,13 @@ final class ZAIQuotaStore {
     /// 个人付费 Coding Plan：GET api/monitor/usage/quota/limit（Bearer OAuth token）。
     private func fetchCodingPlanSnapshot(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
         let (token, userInfo) = try ZAISettings.loadCredentials(domain: selection.domain)
+        // 身份标识和两个查询都使用同一组已捕获凭证，不能在 await 后重读切换中的账号。
+        let resetJWT = try? ZAISettings.loadZCodeJWTToken()
+        if let resetJWT {
+            lastResetScopeID = try? ZAIResetContextResolver.makeContext(
+                selection: selection, jwt: resetJWT, oauthToken: token, userInfo: userInfo
+            ).scopeID
+        }
         let request = ZAIQuotaEndpoint.makeCodingPlanRequest(token: token, domain: selection.domain)
 
         let (data, response) = try await session.data(for: request)
@@ -772,7 +871,12 @@ final class ZAIQuotaStore {
         let email = userInfo?["email"] as? String
 
         // 重置额度是增量信息：单独容错，失败不影响主额度展示。
-        let resetCreditCards = try? await fetchResetCreditCards(domain: selection.domain, oauthToken: token)
+        let resetCreditCards: [ZAIResetCreditCard]?
+        if let resetJWT {
+            resetCreditCards = try? await fetchResetCreditCards(jwt: resetJWT, oauthToken: token)
+        } else {
+            resetCreditCards = nil
+        }
 
         return ZAIQuotaSnapshot(
             kind: .codingPlan,
@@ -785,8 +889,7 @@ final class ZAIQuotaStore {
 
     /// coding-plan 重置额度：GET zcode.z.ai/api/v1/coding-plan/reset/status。
     /// 响应 data.available_five_hour_resets / available_week_resets 各是 {expire_at} 数组。
-    private func fetchResetCreditCards(domain: String, oauthToken: String) async throws -> [ZAIResetCreditCard]? {
-        let jwt = try ZAISettings.loadZCodeJWTToken()
+    private func fetchResetCreditCards(jwt: String, oauthToken: String) async throws -> [ZAIResetCreditCard]? {
         let request = ZAIQuotaEndpoint.makeCodingPlanResetStatusRequest(jwt: jwt, oauthToken: oauthToken)
 
         let (data, response) = try await session.data(for: request)
@@ -862,7 +965,7 @@ extension ZAIQuotaSnapshot {
                     remainingPercent: limit.remainingPercent,
                     resetsAt: limit.nextResetTime
                 )
-            }
+            } + Self.resetCardReminderBuckets(cards: resetCreditCards, now: Date())
         case .startPlan?:
             return balances.map { balance in
                 ReminderBucket(
@@ -902,6 +1005,39 @@ extension ZAIQuotaSnapshot {
         case .hourly: return "\(limit.number)小时额度"
         case .weekly: return "周额度"
         case .unknown: return limit.title
+        }
+    }
+
+    /// 未过期的重置卡按种类各合成一个提醒桶，resetsAt 取该种类最早到期。
+    private static func resetCardReminderBuckets(cards: [ZAIResetCreditCard]?, now: Date) -> [ReminderBucket] {
+        let alertable = (cards ?? []).filter { $0.expiresAt.map { $0 > now } ?? false }
+        return [ZAIResetCreditCard.Kind.fiveHour, .week].compactMap { kind in
+            let group = alertable.filter { $0.kind == kind }
+            guard let earliest = group.compactMap(\.expiresAt).min() else { return nil }
+            return ReminderBucket(
+                source: .zai,
+                id: "zai.resetCard.\(kind.rawValue)",
+                title: "ZAI \(Self.resetCardTitle(for: kind))",
+                shortTitle: Self.resetCardShortTitle(for: kind),
+                remainingPercent: 100,
+                resetsAt: earliest,
+                kind: .resetCard,
+                cardCount: group.count
+            )
+        }
+    }
+
+    private static func resetCardTitle(for kind: ZAIResetCreditCard.Kind) -> String {
+        switch kind {
+        case .fiveHour: return "5小时重置卡"
+        case .week: return "周额度重置卡"
+        }
+    }
+
+    private static func resetCardShortTitle(for kind: ZAIResetCreditCard.Kind) -> String {
+        switch kind {
+        case .fiveHour: return "5H重置卡"
+        case .week: return "周重置卡"
         }
     }
 }

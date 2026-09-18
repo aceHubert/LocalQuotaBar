@@ -27,6 +27,12 @@ struct ReminderBucket: Equatable {
         case zai
     }
 
+    /// 额度桶按剩余百分比触发；重置卡桶只按到期时间触发，两者共用评估管线。
+    enum Kind: Equatable {
+        case quota
+        case resetCard
+    }
+
     let source: Source
     /// 稳定 id，同时是静音/冷却状态的 key：codex.fiveHour / zai.limit.hourly / zai.balance.<标题>
     let id: String
@@ -36,7 +42,11 @@ struct ReminderBucket: Equatable {
     /// 灵动岛每行展示用 shortTitle，避免每行重复 provider 名。
     let shortTitle: String
     let remainingPercent: Double
+    /// 额度桶是重置时刻；重置卡桶是最早一张卡的到期时刻。
     let resetsAt: Date?
+    var kind: Kind = .quota
+    /// 重置卡桶的可用卡数量，仅 kind == .resetCard 时有意义。
+    var cardCount: Int? = nil
 
     var roundedRemainingPercent: Int {
         Int(remainingPercent.rounded())
@@ -54,7 +64,9 @@ struct ReminderBucket: Equatable {
             title: title,
             shortTitle: shortTitle,
             remainingPercent: remainingPercent,
-            resetsAt: resetsAt
+            resetsAt: resetsAt,
+            kind: kind,
+            cardCount: cardCount
         )
     }
 }
@@ -84,7 +96,7 @@ struct ReminderPresentation: Equatable {
     }
 }
 
-struct ReminderConfiguration {
+struct ReminderConfiguration: Equatable {
     var isEnabled: Bool
     var warningRemainingPercent: Double
     var criticalRemainingPercent: Double
@@ -98,6 +110,25 @@ struct ReminderConfiguration {
         resetSoonMinutes: 30,
         cooldown: 10 * 60
     )
+
+    /// 重置卡到期提醒的固定规则，不随设置变化：到期前 30 分钟开始，每 5 分钟重复一次。
+    static let resetCardExpiryWindow: TimeInterval = 30 * 60
+    static let resetCardRepeatInterval: TimeInterval = 5 * 60
+
+    /// 到期倒计时文案："20分钟后" / "3小时后" / "2天后"。
+    static func resetCardExpiryPhrase(until expiresAt: Date, now: Date) -> String {
+        let seconds = max(0, expiresAt.timeIntervalSince(now))
+        if seconds < 3600 {
+            let minutes = max(1, Int((seconds / 60).rounded()))
+            return "\(minutes)分钟后"
+        }
+        if seconds < 24 * 3600 {
+            let hours = Int(seconds / 3600)
+            return "\(hours)小时后"
+        }
+        let days = Int((seconds / 86400).rounded(.up))
+        return "\(days)天后"
+    }
 }
 
 enum ReminderSettings {

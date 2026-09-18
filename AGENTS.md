@@ -4,9 +4,11 @@
 
 LocalQuotaBar 是基于 Swift Package Manager 的 macOS 菜单栏应用，使用 AppKit，支持 macOS 13 及以上版本。
 
-- `Sources/LocalQuotaBar/`：应用源码。`main.swift` 包含入口、Codex 数据读取与界面；`ZAIQuota.swift` 负责 Z.AI / BigModel 额度。
-- `ReminderModels.swift`、`ReminderEvaluator.swift`、`ReminderCenter.swift` 与通道文件分别负责模型、评估、编排和投递；新增提醒行为保持这些职责分离。
-- `Resources/`：图标资源；`Tools/render-icon.swift`：图标生成脚本。
+- `Sources/LocalQuotaBar/`：应用源码，按领域分子目录；同一 target 递归编译，子目录仅作组织用途。根目录 `main.swift` 包含入口、Codex 数据读取与界面，`RefreshSettings.swift` 是共用刷新设置。
+- `codex/`：Codex 用量读取与重置卡片操作；`zcode/`：Z.AI / BigModel 额度、重置服务与用量数据库。
+- `notify/`：`ReminderModels.swift`、`ReminderEvaluator.swift`、`ReminderCenter.swift` 与通道文件分别负责模型、评估、编排和投递；新增提醒行为保持这些职责分离。
+- `ui/`：面板与设置页视图（额度面板、Provider 区块、主题、用量图表）。
+- `Resources/`：图标资源，`AppIcon.svg` 为图标源文件；`Tools/render-svg-icon.swift`：透明 PNG 渲染脚本。
 - `Package.swift`：目标与依赖；`Info.plist`：应用元数据；`Makefile`：构建和打包入口。
 
 ## 构建与本地开发

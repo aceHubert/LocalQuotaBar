@@ -137,6 +137,12 @@ final class ReminderCenter {
     /// 测试展示用的级别：按真实百分比套用阈值，未触发阈值的桶以 ⚠️ 展示。
     private func testLevel(for bucket: ReminderBucket) -> ReminderLevel {
         let config = evaluator.configuration
+        if bucket.kind == .resetCard {
+            guard let expiresAt = bucket.resetsAt else { return .warning }
+            return expiresAt.timeIntervalSince(Date()) <= ReminderConfiguration.resetCardExpiryWindow
+                ? .resetSoon
+                : .warning
+        }
         if bucket.remainingPercent <= config.criticalRemainingPercent {
             return .critical
         }
@@ -184,7 +190,10 @@ final class ReminderCenter {
         )
     }
 
-    private static func describe(hit: ReminderHit, now: Date) -> String {
+    static func describe(hit: ReminderHit, now: Date) -> String {
+        if hit.bucket.kind == .resetCard {
+            return describeResetCard(hit: hit, now: now)
+        }
         switch hit.level {
         case .critical, .warning:
             return "\(hit.bucket.title) 仅剩 \(hit.bucket.roundedRemainingPercent)%"
@@ -193,5 +202,15 @@ final class ReminderCenter {
             let minutes = Int(max(0, resetsAt.timeIntervalSince(now) / 60).rounded())
             return "\(hit.bucket.title) \(minutes)分钟后重置"
         }
+    }
+
+    /// 重置卡到期推送："你有一张重置卡将于 20分钟后过期"；多张时提示数量。
+    private static func describeResetCard(hit: ReminderHit, now: Date) -> String {
+        guard let expiresAt = hit.bucket.resetsAt else { return hit.bucket.title }
+        let phrase = ReminderConfiguration.resetCardExpiryPhrase(until: expiresAt, now: now)
+        let count = hit.bucket.cardCount ?? 1
+        return count <= 1
+            ? "你有一张重置卡将于\(phrase)过期"
+            : "你有\(count)张重置卡将于\(phrase)过期"
     }
 }

@@ -70,6 +70,8 @@ struct QuotaSnapshot: Equatable, Codable {
 }
 
 struct ResetCreditCard: Equatable, Codable {
+    var id: String? = nil
+    var status: String? = nil
     let issuedAt: Date?
     let expiresAt: Date?
 }
@@ -397,6 +399,10 @@ enum CodexRateLimitError: LocalizedError {
 
 // MARK: - ChatGPT app-server RPC client
 
+enum CodexResetOutcome: String {
+    case reset, alreadyRedeemed, noCredit, nothingToReset
+}
+
 final class CodexRateLimitClient {
     let appServerExecutablePath: String
     let requestTimeout: TimeInterval
@@ -437,16 +443,49 @@ final class CodexRateLimitClient {
         }.value
     }
 
+    func consumeRateLimitResetCredit(creditID: String, idempotencyKey: String) async throws -> CodexResetOutcome {
+        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
+            let params = try Self.resetCreditParams(creditID: creditID, idempotencyKey: idempotencyKey)
+            let results = try Self.readAppServerResultsBlocking(
+                appServerExecutablePath: appServerExecutablePath,
+                requestTimeout: requestTimeout,
+                shouldReadAccount: false,
+                shouldReadRateLimits: false,
+                resetCreditParams: params
+            )
+            return try Self.parseResetOutcome(results.resetCredit ?? [:])
+        }.value
+    }
+
+    /// 纯参数构造便于离线检查；卡 ID 和本次操作的幂等键必须分别传递。
+    static func resetCreditParams(creditID: String, idempotencyKey: String) throws -> [String: String] {
+        guard !creditID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !idempotencyKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw CodexRateLimitError.malformedResponse
+        }
+        return ["creditId": creditID, "idempotencyKey": idempotencyKey]
+    }
+
+    static func parseResetOutcome(_ result: [String: Any]) throws -> CodexResetOutcome {
+        guard let value = result["outcome"] as? String,
+              let outcome = CodexResetOutcome(rawValue: value) else {
+            throw CodexRateLimitError.malformedResponse
+        }
+        return outcome
+    }
+
     private struct AppServerResults {
         let rateLimits: [String: Any]?
         let account: [String: Any]?
+        let resetCredit: [String: Any]?
     }
 
     private static func readAppServerResultsBlocking(
         appServerExecutablePath: String,
         requestTimeout: TimeInterval,
         shouldReadAccount: Bool,
-        shouldReadRateLimits: Bool
+        shouldReadRateLimits: Bool,
+        resetCreditParams: [String: String]? = nil
     ) throws -> AppServerResults {
         guard FileManager.default.isExecutableFile(atPath: appServerExecutablePath) else {
             throw CodexRateLimitError.appServerNotFound(appServerExecutablePath)
@@ -466,11 +505,14 @@ final class CodexRateLimitClient {
         var targetIDs = Set<Int>()
         if shouldReadAccount { targetIDs.insert(2) }
         if shouldReadRateLimits { targetIDs.insert(3) }
+        if resetCreditParams != nil { targetIDs.insert(4) }
+        let initializationCollector = JSONLineResponseCollector(targetIDs: [1])
         let collector = JSONLineResponseCollector(targetIDs: targetIDs)
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if !data.isEmpty {
                 collector.append(data)
+                initializationCollector.append(data)
             }
         }
 
@@ -478,6 +520,8 @@ final class CodexRateLimitClient {
         stderrPipe.fileHandleForReading.readabilityHandler = { handle in
             _ = handle.availableData
         }
+
+        defer { cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe) }
 
         do {
             try process.run()
@@ -517,6 +561,23 @@ final class CodexRateLimitClient {
             ])
         }
 
+        if let resetCreditParams {
+            // 有副作用的方法必须等初始化成功后再发送，不因超时自行重试。
+            try writeJSONLines([messages[0]], to: stdinPipe.fileHandleForWriting)
+            guard initializationCollector.wait(timeout: requestTimeout) else {
+                throw CodexRateLimitError.timeout
+            }
+            guard let initialized = initializationCollector.response(for: 1) else {
+                throw CodexRateLimitError.malformedResponse
+            }
+            _ = try result(from: initialized)
+            messages = [messages[1], [
+                "id": 4,
+                "method": "account/rateLimitResetCredit/consume",
+                "params": resetCreditParams
+            ]]
+        }
+
         do {
             try writeJSONLines(messages, to: stdinPipe.fileHandleForWriting)
         } catch {
@@ -546,7 +607,8 @@ final class CodexRateLimitClient {
 
         return AppServerResults(
             rateLimits: try collector.response(for: 3).map(result(from:)),
-            account: try collector.response(for: 2).map(result(from:))
+            account: try collector.response(for: 2).map(result(from:)),
+            resetCredit: try collector.response(for: 4).map(result(from:))
         )
     }
 
@@ -727,17 +789,19 @@ final class CodexRateLimitClient {
         return Date(timeIntervalSince1970: seconds)
     }
 
-    private static func parseResetCreditCards(from result: [String: Any]) -> [ResetCreditCard]? {
+    static func parseResetCreditCards(from result: [String: Any]) -> [ResetCreditCard]? {
         guard let summary = result["rateLimitResetCredits"] as? [String: Any],
               let credits = summary["credits"] as? [[String: Any]]
         else {
             return nil
         }
 
-        return credits.compactMap { credit in
-            guard let grantedAt = dateValue(credit["grantedAt"]) else { return nil }
+        return credits.map { credit in
+            let id = (credit["id"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             return ResetCreditCard(
-                issuedAt: grantedAt,
+                id: id?.isEmpty == false ? id : nil,
+                status: credit["status"] as? String,
+                issuedAt: dateValue(credit["grantedAt"]),
                 expiresAt: dateValue(credit["expiresAt"])
             )
         }
@@ -800,6 +864,8 @@ final class RateLimitStore {
     private(set) var refreshInterval: TimeInterval
 
     private(set) var snapshot: QuotaSnapshot?
+    private(set) var snapshotAccountID: String?
+    private var refreshAfterCurrent = false
     private(set) var isRefreshing = false
     private var hasReadAccountPlan = false
     private var isReadingAccountPlan = false
@@ -847,7 +913,12 @@ final class RateLimitStore {
     }
 
     func setAccountID(_ accountID: String?) {
-        self.accountID = accountID ?? "unknown"
+        let nextAccountID = accountID ?? "unknown"
+        if self.accountID != nextAccountID {
+            snapshotAccountID = nil
+            if isRefreshing { refreshAfterCurrent = true }
+        }
+        self.accountID = nextAccountID
         hasReadAccountPlan = AccountPlanCache.contains(self.accountID)
         cachedPlanType = AccountPlanCache.planType(for: self.accountID)
         if hasReadAccountPlan {
@@ -857,25 +928,51 @@ final class RateLimitStore {
         }
     }
 
+    /// 若旧刷新仍在进行，必须在它结束后再拉取一次重置后的最新额度。
+    func refreshAfterReset() {
+        if isRefreshing {
+            refreshAfterCurrent = true
+        } else {
+            refresh(force: true)
+        }
+    }
+
     func refresh(force: Bool) {
         guard !isRefreshing else { return }
         isRefreshing = true
         onChange?(snapshot, true, nil)
+        // 套餐若还没读到成功过（如启动时 app-server 未就绪），借每次刷新重试，
+        // 避免陈旧的缓存 planType（如降级前的 plus）一直显示到下次重启。
+        readAccountPlan()
         let cachedPlanType = self.cachedPlanType
+        let requestedAccountID = accountID
 
         Task { @MainActor in
             do {
                 let newSnapshot = try await client.readRateLimits(planType: cachedPlanType)
+                guard requestedAccountID == accountID else {
+                    finishRefresh(error: nil)
+                    return
+                }
                 snapshot = newSnapshot
+                snapshotAccountID = requestedAccountID
                 SnapshotCache.save(newSnapshot)
-                isRefreshing = false
-                onChange?(newSnapshot, false, nil)
+                finishRefresh(error: nil)
             } catch {
-                isRefreshing = false
-                // Keep the old snapshot. Only surface the error text.
+                // 保留已有快照；旧账号请求的错误不污染当前账号。
                 let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                onChange?(snapshot, false, message)
+                finishRefresh(error: requestedAccountID == accountID ? message : nil)
             }
+        }
+    }
+
+    private func finishRefresh(error: String?) {
+        isRefreshing = false
+        if refreshAfterCurrent {
+            refreshAfterCurrent = false
+            refresh(force: true)
+        } else {
+            onChange?(snapshot, false, error)
         }
     }
 
@@ -941,7 +1038,29 @@ extension QuotaSnapshot {
                 resetsAt: weekly.resetsAt
             ))
         }
+        buckets.append(contentsOf: resetCardReminderBuckets(now: Date()))
         return buckets
+    }
+
+    /// 可用重置卡（状态可用且未过期）合成一个提醒桶，resetsAt 取最早到期。
+    private func resetCardReminderBuckets(now: Date) -> [ReminderBucket] {
+        let alertable = (resetCreditCards ?? []).filter { card in
+            (card.status == nil || card.status == "available")
+                && (card.expiresAt.map { $0 > now } ?? false)
+        }
+        guard let earliest = alertable.compactMap(\.expiresAt).min() else { return [] }
+        return [
+            ReminderBucket(
+                source: .codex,
+                id: "codex.resetCard",
+                title: "Codex 重置卡",
+                shortTitle: "重置卡",
+                remainingPercent: 100,
+                resetsAt: earliest,
+                kind: .resetCard,
+                cardCount: alertable.count
+            )
+        ]
     }
 }
 
@@ -990,9 +1109,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let popover = NSPopover()
     private let quotaViewController = QuotaViewController()
     private let store = RateLimitStore()
+    private lazy var codexResetService = CodexResetService { [client = store.client] creditID, key in
+        try await client.consumeRateLimitResetCredit(creditID: creditID, idempotencyKey: key)
+    }
+    /// 两个供应商共用点击锁；进入异步任务前同步上锁，避免快速连点。
+    private var resetRequestInFlight = false
     private let zaiStore = ZAIQuotaStore()
+    private let zaiResetService = ZAIResetService()
+    private var presentedResetScopeID: String?
     private let authManager = CodexAuthManager()
     private let reminderCenter = ReminderCenter()
+    /// Codex 官方日用量（account/usage/read），独立只读客户端、30 分钟节流拉取。
+    private lazy var codexUsageStore = CodexUsageStore(client: CodexUsageClient())
+    /// Z.AI 本机日用量（zcode SQLite 聚合），额度刷新后重查。
+    private let zaiUsageStore = ZAIUsageStore()
     private var accountOptions: [CodexAuthAccount] = []
     private var selectedAccountId: String?
 
@@ -1010,19 +1140,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         popover.behavior = .transient
-        popover.animates = true
+        // 展开明细直接调整尺寸，避免 NSPopover 动画重绘造成内容闪烁。
+        popover.animates = false
         popover.contentViewController = quotaViewController
         quotaViewController.onPreferredContentSizeChange = { [weak self] in
             guard let self else { return }
-            self.popover.contentSize = self.quotaViewController.preferredContentSize
+            let size = self.quotaViewController.preferredContentSize
+            if self.popover.contentSize != size {
+                self.popover.contentSize = size
+            }
         }
         updateZAISectionVisibility()
 
         quotaViewController.onRefresh = { [weak self] in
             self?.store.refresh(force: true)
+            // 手动刷新同时强制拉一次官方日用量（绕过 30 分钟节流）
+            self?.codexUsageStore.refreshIfNeeded(force: true)
         }
         quotaViewController.onZAIRefresh = { [weak self] in
-            self?.zaiStore.refresh()
+            guard let self else { return }
+            if ZAISettings.resolveProviderSelection()?.kind != .apiKey {
+                zaiStore.refresh()
+            }
+            zaiUsageStore.refresh()
+        }
+        quotaViewController.onResetCodexCredit = { [weak self] creditID in
+            self?.useCodexResetCredit(creditID)
+        }
+        codexResetService.onChange = { [weak self] in self?.updateCodexResetActions() }
+        quotaViewController.onUseZAIResetCard = { [weak self] kind in
+            self?.useZAIResetCard(kind)
+        }
+        zaiResetService.onChange = { [weak self] in self?.updateZAIResetActions() }
+        quotaViewController.onRefreshIntervalChange = { [weak self] minutes in
+            guard let self else { return }
+            // 与右键菜单 refreshIntervalSelected 同一条链：持久化 → 双 store 重建定时器 → 同步面板展示
+            RefreshSettings.save(minutes: minutes)
+            let interval = TimeInterval(minutes) * 60
+            store.setRefreshInterval(interval)
+            zaiStore.setRefreshInterval(interval)
+            quotaViewController.applyRefreshInterval(minutes: minutes)
         }
         reminderCenter.start { [weak self] in
             self?.presentPopoverFromStatusItem()
@@ -1050,6 +1207,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 isRefreshing: isRefreshing,
                 error: error
             )
+            if !isRefreshing, error == nil, snapshot?.resetCreditCards != nil,
+               let scope = self.zaiStore.lastResetScopeID,
+               let startedAt = self.zaiStore.lastRefreshStartedAt {
+                self.zaiResetService.acknowledgeFreshSnapshot(scopeID: scope, refreshStartedAt: startedAt)
+            }
+            self.updateZAIResetActions()
             if !isRefreshing, error == nil, let snapshot {
                 // 渠道身份 = 套餐类型 + 账号邮箱；BigModel/ZAI 切换或换号后状态互不干扰。
                 let channel = "\(snapshot.kind?.rawValue ?? "unknown")|\(account?.email ?? "")"
@@ -1058,6 +1221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     buckets: snapshot.reminderBuckets.map { $0.namespacedByChannel(channel) }
                 )
             }
+            // 本机 SQLite 快查：日用量独立于余额模式，API Key 模式也正常读取。
+            self.zaiUsageStore.refresh()
         }
         quotaViewController.applyZAI(
             snapshot: zaiStore.snapshot,
@@ -1079,6 +1244,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     buckets: snapshot.reminderBuckets.map { $0.namespacedByChannel(channel) },
                     codexSnapshot: snapshot
                 )
+                // 官方日用量节流拉取（默认 30 分钟一次，失败静默）
+                self.codexUsageStore.refreshIfNeeded(force: false)
             }
 
             self.quotaViewController.apply(
@@ -1088,12 +1255,147 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 reminder: reminder
             )
             self.quotaViewController.setUnmuteButtonVisible(self.reminderCenter.canRestore)
+            self.updateCodexResetActions()
         }
         store.start()
         zaiStore.start()
+
+        // 日用量图表：先回放缓存，再接变更回调并启动官方用量拉取
+        quotaViewController.applyCodexUsage(codexUsageStore.snapshot?.last30Days)
+        codexUsageStore.onChange = { [weak self] snapshot in
+            self?.quotaViewController.applyCodexUsage(snapshot?.last30Days)
+        }
+        codexUsageStore.start()
+        zaiUsageStore.onChange = { [weak self] days in
+            self?.quotaViewController.applyZAIUsage(days)
+        }
+        zaiUsageStore.refresh()
+    }
+
+    private func codexResetAction(for card: ResetCreditCard) -> ResetCardsRow.ResetAction {
+        guard let accountID = selectedAccountId, let creditID = card.id else {
+            return .init(title: "重置", isEnabled: false, toolTip: "请先刷新当前账号的重置卡")
+        }
+        let canUse = !resetRequestInFlight && !codexResetService.isSubmitting
+            && !store.isRefreshing && store.snapshotAccountID == accountID
+        switch codexResetService.state(accountID: accountID, creditID: creditID) {
+        case .submitting:
+            return .init(title: "重置中", isEnabled: false)
+        case .succeeded:
+            return .init(title: "已重置", isEnabled: false)
+        case .failed(let message):
+            // 未确认请求即使卡已过期或状态改变，也使用原键重试以确认结果。
+            return .init(title: "重试", isEnabled: canUse, toolTip: message)
+        case .idle:
+            let available = (card.status == nil || card.status == "available")
+                && (card.expiresAt.map { $0 > Date() } ?? true)
+            return .init(title: "重置", isEnabled: canUse && available,
+                         toolTip: available ? "使用这张重置卡" : "这张重置卡当前不可用")
+        }
+    }
+
+    private func updateCodexResetActions() {
+        var actions: [String: ResetCardsRow.ResetAction] = [:]
+        for (index, card) in (store.snapshot?.resetCreditCards ?? []).enumerated() {
+            actions[card.id ?? "codex-missing-id-\(index)"] = codexResetAction(for: card)
+        }
+        quotaViewController.applyCodexResetActions(actions)
+    }
+
+    private func updateAllResetActions() {
+        updateCodexResetActions()
+        updateZAIResetActions()
+    }
+
+    /// 重置卡按钮点击后的二次确认弹框；取消则不发送任何请求。
+    /// "取消"放第一个成为默认按钮，回车即取消，避免误触直接消耗重置卡。
+    private func confirmResetCardUse(informativeText: String) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "确认使用重置卡？"
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "确认重置")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private func useCodexResetCredit(_ creditID: String) {
+        guard let accountID = selectedAccountId,
+              let card = store.snapshot?.resetCreditCards?.first(where: { $0.id == creditID }),
+              codexResetAction(for: card).isEnabled else { return }
+        guard confirmResetCardUse(informativeText: "将消耗一张重置卡，立即重置当前 Codex 额度窗口。") else { return }
+        resetRequestInFlight = true
+        updateAllResetActions()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.resetRequestInFlight = false
+                self.updateAllResetActions()
+            }
+            if await self.codexResetService.use(accountID: accountID, creditID: creditID) {
+                self.store.refreshAfterReset()
+            }
+        }
+    }
+
+    private func updateZAIResetActions() {
+        do {
+            let context = try ZAIResetContextResolver.resolve()
+            presentedResetScopeID = context.scopeID
+            let states = Dictionary(uniqueKeysWithValues: [ZAIResetCreditCard.Kind.fiveHour, .week].map {
+                ($0, zaiResetService.state(scopeID: context.scopeID, kind: $0))
+            })
+            let canUse = zaiStore.lastResetScopeID == context.scopeID
+                && zaiStore.snapshot?.kind == .codingPlan && zaiStore.snapshot?.resetCreditCards != nil
+                && !zaiStore.isRefreshing && zaiStore.lastError == nil && !resetRequestInFlight
+            quotaViewController.applyZAIResetState(states, canUseCards: canUse,
+                                                canRetry: !zaiStore.isRefreshing && !resetRequestInFlight,
+                                                unavailableReason: canUse ? nil : "请先刷新当前账号的额度和重置卡")
+        } catch {
+            presentedResetScopeID = nil
+            quotaViewController.applyZAIResetState([:], canUseCards: false, canRetry: false,
+                                                unavailableReason: error.localizedDescription)
+        }
+    }
+
+    private func useZAIResetCard(_ kind: ZAIResetCreditCard.Kind) {
+        guard !resetRequestInFlight, !zaiStore.isRefreshing,
+              let context = try? ZAIResetContextResolver.resolve(),
+              context.scopeID == presentedResetScopeID else {
+            updateZAIResetActions()
+            return
+        }
+        let state = zaiResetService.state(scopeID: context.scopeID, kind: kind)
+        switch state {
+        case .submitting, .succeeded: return
+        case .failed: break // 未确认请求即使列表变化，仍可使用原 key 重试。
+        case .idle:
+            guard zaiStore.lastResetScopeID == context.scopeID, zaiStore.lastError == nil,
+                  zaiStore.snapshot?.kind == .codingPlan,
+                  zaiStore.snapshot?.resetCreditCards?.contains(where: {
+                      $0.kind == kind && ($0.expiresAt.map { $0 > Date() } ?? false)
+                  }) == true else {
+                updateZAIResetActions()
+                return
+            }
+        }
+        guard confirmResetCardUse(informativeText: "将消耗一张重置卡，立即重置 ZAI \(kind.title)。") else { return }
+        resetRequestInFlight = true
+        updateAllResetActions()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.resetRequestInFlight = false
+                self.updateAllResetActions()
+            }
+            if await self.zaiResetService.use(context: context, kind: kind) {
+                self.zaiStore.refreshAfterReset()
+            }
+        }
     }
 
     private func initializeAccountSwitcher() {
+        defer { updateCodexResetActions() }
         do {
             let result = try authManager.loadAccounts()
             accountOptions = result.accounts
@@ -1294,7 +1596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = account.fileName
             item.state = account.accountId == selectedAccountId ? .on : .off
-            item.isEnabled = true
+            item.isEnabled = !resetRequestInFlight
             submenu.addItem(item)
         }
 
@@ -1302,7 +1604,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func accountMenuItemSelected(_ sender: NSMenuItem) {
-        guard let fileName = sender.representedObject as? String else { return }
+        guard !resetRequestInFlight, let fileName = sender.representedObject as? String else { return }
         do {
             try authManager.switchAccount(to: fileName)
             initializeAccountSwitcher()
@@ -1376,6 +1678,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 静音 / 改配置后立即刷新 UI 上的提醒表现（emoji、恢复提醒按钮），
     /// 与旧链路里 store.onChange 的即时回调保持一致。
     private func refreshReminderUI() {
+        quotaViewController.applyReminderConfiguration(reminderCenter.configuration)
         quotaViewController.apply(
             snapshot: store.snapshot,
             isRefreshing: store.isRefreshing,
@@ -1396,6 +1699,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // NSPopover 首次加载 view 后会重新取一次 preferredContentSize，这里再设一次避免底部被裁切。
             popover.contentSize = quotaViewController.preferredContentSize
         }
+        updateAllResetActions()
         quotaViewController.focusTouchBarHost()
     }
 
@@ -1405,59 +1709,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+// MARK: - 额度弹窗视图控制器（quota-popup-redesign-9319 原型落地版）
+// 宽 322 固定深色弹窗：顶部栏 + Codex/ZAI provider 区块 + 图例页脚；齿轮进入设置页。
+
+@MainActor
 final class QuotaViewController: NSViewController {
     var onRefresh: (() -> Void)?
     var onZAIRefresh: (() -> Void)?
+    var onUseZAIResetCard: ((ZAIResetCreditCard.Kind) -> Void)?
+    var onResetCodexCredit: ((String) -> Void)?
     var onPreferredContentSizeChange: (() -> Void)?
     var onMuteReminder: (() -> Void)?
     var onUnmuteAll: (() -> Void)?
     var onReminderConfigurationChange: ((ReminderConfiguration) -> Void)?
+    var onRefreshIntervalChange: ((Int) -> Void)?
 
     private let rootView = TouchBarHostingVisualEffectView()
-    private let titleLabel = NSTextField(labelWithString: "Codex 余额")
-    private let accountLabel = NSTextField(labelWithString: "")
-    private let accountPlanTag = NSTextField(labelWithString: "")
-    private let statusLabel = NSTextField(labelWithString: "等待刷新")
-    private let fiveHourRow = QuotaRowView(title: "5小时")
-    private let weeklyRow = QuotaRowView(title: "周限额")
-    private let zaiTitleLabel = NSTextField(labelWithString: "Z.AI 余额")
-    private let zaiEmailLabel = NSTextField(labelWithString: "")
-    private let zaiLevelTag = NSTextField(labelWithString: "")
-    private let zaiStatusLabel = NSTextField(labelWithString: "等待刷新")
-    private let zaiRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
-    private let zaiRows = [
-        // 标题列加宽以容纳模型名（如 GLM-5-Turbo），放不下时截断并靠 tooltip 显示全名。
-        QuotaRowView(title: "小时", titleWidth: 80, detailWidth: 160, barMinWidth: 156),
-        QuotaRowView(title: "周", titleWidth: 80, detailWidth: 160, barMinWidth: 156)
-    ]
-    private let zaiResetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
-    private let zaiResetCreditsValueLabel = NSTextField(labelWithString: "--")
-    private let zaiResetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
-    private lazy var zaiResetCreditsRow = makeZAIResetCreditsRow()
-    private var currentZAIResetCreditCards: [ZAIResetCreditCard]?
-    private lazy var zaiSection = makeZAISection()
+    /// 实色背景层：盖住半透明材质，保证面板颜色与原型 #1A1A1C 一致
+    private let solidBackground = NSView()
+
+    /// 额度页 / 设置页两页切换，共用同一个 popover。
+    private let quotaPage = NSStackView()
+    private let settingsPageView = SettingsPageView()
+    /// 设置页的定宽容器（makeBlock 产物），切页时按它控制显隐
+    private var settingsBlock: NSView = NSView()
+    private let pageContainer = NSStackView()
+
+    // 顶部栏
+    private let updatedLabel = NSTextField(labelWithString: "")
+    private var updatedLabelTimer: Timer?
+    private let refreshAllButton = PanelIconButton(symbolName: "arrow.clockwise", toolTipText: "全部刷新", side: 22)
+    private let settingsButton = PanelIconButton(symbolName: "gearshape", toolTipText: "设置", side: 22)
+
+    // provider 区块与页脚
+    private let codexSection = CodexPanelSection()
+    private let zaiSection = ZAIPanelSection()
+    private var zaiBlock: NSView?
+    private let footer = PanelFooterView()
     private var shouldShowZAISection = false
-    private var contentStack: NSStackView?
-    private let resetCreditsTitleLabel = NSTextField(labelWithString: "可用重置次数：")
-    private let resetCreditsValueLabel = NSTextField(labelWithString: "--")
-    private let resetCreditsExpirationButton = NSButton(title: "过期时间", target: nil, action: nil)
-    /// 额度余额（credits 折算美元），右对齐放在重置次数行末尾。
-    private let creditBalanceTitleLabel = NSTextField(labelWithString: "额度余额：")
-    private let creditBalanceLabel = NSTextField(labelWithString: "")
-    private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
-    private var refreshCooldownTimer: Timer?
-    private var zaiRefreshCooldownTimer: Timer?
-    private var currentResetCreditCount = 0
-    private var currentResetCreditCards: [ResetCreditCard]?
-    private let reminderEnabledButton = NSButton(checkboxWithTitle: "主动提醒", target: nil, action: nil)
-    // 阈值等设置改到状态栏右键菜单里编辑，面板上只读展示当前值。
-    private let warningValueLabel = NSTextField(labelWithString: "--")
-    private let resetSoonValueLabel = NSTextField(labelWithString: "--")
-    private let cooldownValueLabel = NSTextField(labelWithString: "--")
-    private let refreshIntervalValueLabel = NSTextField(labelWithString: "--")
-    private let unmuteButton = NSButton(title: "恢复提醒", target: nil, action: nil)
-    /// 当前生效的提醒配置；右键菜单改动后会推送回来同步这里的副本。
+
+    /// 最近一次 Codex 状态；账号标签等外部更新后重放（与旧版行为一致）。
+    private var lastCodexSnapshot: QuotaSnapshot?
+    private var lastCodexIsRefreshing = false
+    private var lastCodexError: String?
+    private var accountLabelText: String?
+
+    /// 顶部更新时间：任一渠道最近一次成功刷新的时刻。快照只在成功时生成，
+    /// 刷新中的重放会带旧 fetchedAt，取 max 防止乱序回放把时间回退。
+    private var lastRefreshedAt: Date?
+
+    /// 当前生效的提醒配置；面板/设置页改动后走 onReminderConfigurationChange 与右键菜单共用一条链。
     private var reminderConfiguration = ReminderConfiguration.default
+    private var refreshIntervalMinutes = RefreshSettings.loadMinutes()
+    private var canRestoreMuted = false
 
     override func loadView() {
         rootView.material = .popover
@@ -1466,19 +1770,44 @@ final class QuotaViewController: NSViewController {
         rootView.wantsLayer = true
         rootView.layer?.cornerRadius = 14
         rootView.layer?.masksToBounds = true
+        // 原型为固定深色弹窗，文本/状态色见 PanelTheme
+        rootView.appearance = PanelTheme.appearance
         rootView.touchBarQuotaView.onMuteReminder = { [weak self] in
             self?.onMuteReminder?()
         }
         view = rootView
-        // 无可用提醒通道（无 Touch Bar 且无刘海屏）时只显示额度，不显示提醒设置。
-        preferredContentSize = quotaContentSize
+
+        // 实色底：NSVisualEffectView 的材质是半透明的，会把背后内容透进来，
+        // 整体颜色像加了透明度。垫一层原型同色 #1A1A1C 实色背景后再放内容。
+        solidBackground.wantsLayer = true
+        solidBackground.layer?.backgroundColor = PanelTheme.panelBackground.cgColor
+        solidBackground.translatesAutoresizingMaskIntoConstraints = false
+        rootView.addSubview(solidBackground, positioned: .below, relativeTo: nil)
 
         configureSubviews()
+        updatePreferredContentSize()
     }
 
     override func viewDidAppear() {
         super.viewDidAppear()
+        // popover 每次重新打开都回到额度页
+        setShowsSettings(false)
         focusTouchBarHost()
+        updateLastUpdatedLabel()
+        updatedLabelTimer?.invalidate()
+        // 只在面板打开时更新相对时间文案，不触发数据刷新。
+        let timer = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updateLastUpdatedLabel() }
+        }
+        timer.tolerance = 1
+        updatedLabelTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    override func viewWillDisappear() {
+        super.viewWillDisappear()
+        updatedLabelTimer?.invalidate()
+        updatedLabelTimer = nil
     }
 
     func focusTouchBarHost() {
@@ -1486,135 +1815,46 @@ final class QuotaViewController: NSViewController {
         rootView.touchBar = rootView.makeTouchBar()
     }
 
+    // MARK: - 对外状态入口（apply/applyZAI 签名与旧版一致）
+
     func setUnmuteButtonVisible(_ visible: Bool) {
-        unmuteButton.isHidden = !visible
+        canRestoreMuted = visible
+        syncControlStates()
     }
 
     func setZAISectionVisible(_ visible: Bool) {
         shouldShowZAISection = visible
         if isViewLoaded {
-            zaiSection.isHidden = !visible
+            zaiBlock?.isHidden = !visible
         }
+        updateRefreshAllButton()
         updatePreferredContentSize()
     }
 
     func applyZAI(snapshot: ZAIQuotaSnapshot?, account: ZAIAccount?, isRefreshing: Bool, error: String?) {
-        guard shouldShowZAISection else { return }
-
-        // setting.json 是当前事实；快照可能还是切换账号/套餐前的旧缓存，
-        // 刷新失败展示旧数据时 tag 也要跟本地配置走。
         let selection = ZAISettings.resolveProviderSelection()
-        let kind = selection?.kind ?? snapshot?.kind ?? .codingPlan
-
-        setLabelText(zaiTitleLabel, selection?.domain == "bigmodel" ? "BigModel 余额" : "Z.AI 余额")
-        setLabelText(zaiEmailLabel, account?.email ?? snapshot?.email ?? "")
-        zaiEmailLabel.isHidden = zaiEmailLabel.stringValue.isEmpty
-
-        switch kind {
-        case .apiKey:
-            let suffix = snapshot?.apiKeySuffix.map { " ····\($0)" } ?? ""
-            setLabelText(zaiLevelTag, "API Key\(suffix)")
-            zaiLevelTag.backgroundColor = .systemGray
-            zaiLevelTag.toolTip = "API Key 模式，无余额数据"
-            zaiRows.forEach { $0.isHidden = true }
-            zaiResetCreditsRow.isHidden = true
-        case .startPlan:
-            // tag 显示 name（如 "ZCode Weekend Build"）；description（如 "GLM-5.3 周末活动"）可能过长，放 tooltip。
-            let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
-            setLabelText(zaiLevelTag, planName)
-            zaiLevelTag.backgroundColor = .systemGreen
-            zaiLevelTag.toolTip = snapshot?.planDescription.flatMap { $0.isEmpty ? nil : $0 }
-                ?? snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 }
-            // 权益生效前 balances 为空、只返回 entitlements，改从 pendingEntitlements 展示「待生效」额度。
-            let balances = Array((snapshot?.balances ?? []).prefix(zaiRows.count))
-            let entitlements = snapshot?.pendingEntitlements ?? []
-            for (index, row) in zaiRows.enumerated() {
-                if index < balances.count {
-                    row.update(balance: balances[index])
-                    row.isHidden = false
-                } else if balances.isEmpty, index < entitlements.count {
-                    row.update(pending: entitlements[index])
-                    row.isHidden = false
-                } else {
-                    row.isHidden = true
-                }
-            }
-            zaiResetCreditsRow.isHidden = true
-        case .codingPlan:
-            setLabelText(zaiLevelTag, snapshot?.level ?? "")
-            zaiLevelTag.backgroundColor = .systemBlue
-            let limits = snapshot?.limits ?? []
-            let zaiUnits: [ZAILimit.WindowUnit] = [.hourly, .weekly]
-            for (unit, row) in zip(zaiUnits, zaiRows) {
-                row.update(limit: limits.first { $0.unit == unit })
-                row.isHidden = false
-            }
-            zaiResetCreditsRow.isHidden = false
-            updateZAIResetCredits(snapshot?.resetCreditCards)
-        }
-        zaiLevelTag.isHidden = zaiLevelTag.stringValue.isEmpty
-
-        if kind == .apiKey {
-            setLabelText(zaiStatusLabel, "API Key 模式，无余额数据")
-        } else if isRefreshing {
-            setLabelText(zaiStatusLabel, snapshot.map { "刷新中（上次更新 \(Self.formatFetchedAt($0.fetchedAt))）…" } ?? "刷新中…")
-        } else if let error {
-            setLabelText(zaiStatusLabel, snapshot.map { "刷新失败，显示 \(Self.formatFetchedAt($0.fetchedAt)) 数据 · \(error)" } ?? "刷新失败：\(error)")
-        } else if let snapshot, let pendingText = Self.startPlanPendingText(snapshot) {
-            setLabelText(zaiStatusLabel, pendingText)
-        } else if let snapshot {
-            setLabelText(zaiStatusLabel, "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))")
-        } else {
-            setLabelText(zaiStatusLabel, "暂无数据")
-        }
+        let title = selection?.domain == "bigmodel" ? "BigModel" : "Z.AI"
+        zaiSection.apply(snapshot: snapshot, account: account, isRefreshing: isRefreshing, error: error, titleOverride: title)
+        recordRefreshedAt(snapshot?.fetchedAt)
+        updateLastUpdatedLabel()
         updatePreferredContentSize()
     }
 
-    /// start-plan 套餐待生效 / 已结束时的状态文案。
-    /// 套餐未到开始时间（新规则）是正常状态，不当作刷新失败展示。
-    private static func startPlanPendingText(_ snapshot: ZAIQuotaSnapshot) -> String? {
-        guard snapshot.kind == .startPlan else { return nil }
-        let now = Date()
-        if let start = snapshot.planStartAt, start > now {
-            return "套餐待生效 · \(formatCompactDateTime(start)) 开始"
-        }
-        if let end = snapshot.planEndAt, end < now {
-            return "套餐已于 \(formatCompactDateTime(end)) 结束"
-        }
-        if let effectiveAt = snapshot.pendingEntitlements
-            .compactMap(\.effectiveAt)
-            .filter({ $0 > now })
-            .min() {
-            return "套餐待生效 · \(formatCompactDateTime(effectiveAt)) 生效"
-        }
-        return nil
+    func applyZAIResetState(_ states: [ZAIResetCreditCard.Kind: ZAIResetState],
+                            canUseCards: Bool, canRetry: Bool, unavailableReason: String?) {
+        zaiSection.applyResetState(states, canUseCards: canUseCards, canRetry: canRetry,
+                                   unavailableReason: unavailableReason)
+        updatePreferredContentSize()
     }
 
     func showAccountSwitchStatus(_ message: String) {
-        setLabelText(statusLabel, message)
+        codexSection.showTransientStatus(message)
+        replayCodexState()
     }
 
     func setAccountLabel(_ text: String?) {
-        setLabelText(accountLabel, text ?? "")
-        accountLabel.isHidden = text == nil
-    }
-
-    /// 设置文本并同步 toolTip：文本被截断时，鼠标悬停可查看完整内容（类似 Web 的 title）。
-    private func setLabelText(_ label: NSTextField, _ text: String) {
-        label.stringValue = text
-        label.toolTip = text
-    }
-
-    private func showResetCreditExpirations(_ cards: [ResetCreditCard]) {
-        let alert = NSAlert()
-        alert.messageText = "重置卡过期时间"
-        if cards.isEmpty {
-            alert.informativeText = "没有查到可展示的重置卡过期时间。"
-        } else {
-            alert.accessoryView = Self.makeResetCreditExpirationList(cards)
-        }
-        alert.addButton(withTitle: "好")
-        alert.runModal()
+        accountLabelText = text
+        replayCodexState()
     }
 
     func apply(
@@ -1623,596 +1863,290 @@ final class QuotaViewController: NSViewController {
         error: String?,
         reminder: ReminderPresentation
     ) {
+        lastCodexSnapshot = snapshot
+        lastCodexIsRefreshing = isRefreshing
+        lastCodexError = error
+        recordRefreshedAt(snapshot?.fetchedAt)
+
+        codexSection.apply(snapshot: snapshot, isRefreshing: isRefreshing, error: error, accountLabel: accountLabelText)
+        updateLastUpdatedLabel()
         if let snapshot {
-            fiveHourRow.update(bucket: snapshot.fiveHour)
-            weeklyRow.update(bucket: snapshot.weekly)
-            updateResetCredits(snapshot.resetCreditCount, cards: snapshot.resetCreditCards, creditBalance: snapshot.creditBalance)
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
-        accountPlanTag.stringValue = snapshot?.planType ?? ""
-        accountPlanTag.isHidden = accountPlanTag.stringValue.isEmpty
-
-        if isRefreshing {
-            if let snapshot {
-                setLabelText(statusLabel, "刷新中（上次更新 \(Self.formatFetchedAt(snapshot.fetchedAt))）…")
-            } else {
-                setLabelText(statusLabel, "正在读取 ChatGPT app-server…")
-            }
-        } else if let error {
-            if let snapshot {
-                setLabelText(statusLabel, "刷新失败，显示 \(Self.formatFetchedAt(snapshot.fetchedAt)) 数据 · \(error)")
-            } else {
-                setLabelText(statusLabel, "刷新失败：\(error)")
-            }
-        } else if let snapshot {
-            setLabelText(statusLabel, "更新：\(Self.formatFetchedAt(snapshot.fetchedAt))")
-        } else {
-            setLabelText(statusLabel, "暂无数据")
-        }
     }
 
-    private func configureSubviews() {
-        titleLabel.font = .systemFont(ofSize: 17, weight: .semibold)
-        accountLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        accountLabel.textColor = .secondaryLabelColor
-        accountLabel.lineBreakMode = .byTruncatingMiddle
-        accountLabel.isHidden = accountLabel.stringValue.isEmpty
-
-        accountPlanTag.font = .systemFont(ofSize: 10, weight: .semibold)
-        accountPlanTag.textColor = .white
-        accountPlanTag.alignment = .center
-        accountPlanTag.drawsBackground = true
-        accountPlanTag.backgroundColor = .systemBlue
-        accountPlanTag.wantsLayer = true
-        accountPlanTag.layer?.cornerRadius = 4
-        accountPlanTag.layer?.masksToBounds = true
-        accountPlanTag.isHidden = true
-
-        statusLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        statusLabel.textColor = .secondaryLabelColor
-        statusLabel.lineBreakMode = .byTruncatingTail
-
-        resetCreditsTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        resetCreditsTitleLabel.textColor = .labelColor
-        resetCreditsValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        resetCreditsValueLabel.textColor = .labelColor
-        resetCreditsValueLabel.alignment = .left
-
-        resetCreditsExpirationButton.bezelStyle = .rounded
-        resetCreditsExpirationButton.controlSize = .small
-        resetCreditsExpirationButton.font = .systemFont(ofSize: 11)
-        resetCreditsExpirationButton.target = self
-        resetCreditsExpirationButton.action = #selector(showResetCreditExpirationsTapped)
-        updateResetCreditsExpirationButton()
-
-        refreshButton.bezelStyle = .rounded
-        refreshButton.toolTip = "手动刷新（60 秒内只能刷新一次）"
-        refreshButton.target = self
-        refreshButton.action = #selector(refreshTapped)
-
-        if ReminderCapability.hasAnyChannel {
-            configureReminderControls()
-        }
-
-        let titleLine = NSStackView(views: [titleLabel, accountLabel, accountPlanTag])
-        titleLine.orientation = .horizontal
-        titleLine.alignment = .lastBaseline
-        titleLine.spacing = 8
-
-        let headerLeftStack = NSStackView(views: [titleLine, statusLabel])
-        headerLeftStack.orientation = .vertical
-        headerLeftStack.alignment = .leading
-        headerLeftStack.spacing = 2
-
-        let headerRightStack = NSStackView(views: [refreshButton])
-        headerRightStack.orientation = .horizontal
-        headerRightStack.alignment = .centerY
-        headerRightStack.spacing = 8
-
-        let header = NSStackView(views: [headerLeftStack, NSView(), headerRightStack])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 12
-
-        let resetCreditsRow = makeResetCreditsRow()
-        let rows = NSStackView(views: [fiveHourRow, weeklyRow, resetCreditsRow])
-        rows.orientation = .vertical
-        rows.alignment = .leading
-        rows.spacing = 4
-
-        // 提醒设置同时管 Codex 与 ZAI 两个数据源，放在面板最底部。
-        var contentViews: [NSView] = [header, rows, zaiSection]
-        if ReminderCapability.hasAnyChannel {
-            let reminderDivider = NSBox()
-            reminderDivider.boxType = .separator
-            let reminderStack = makeSettingsView()
-            let reminderSection = NSStackView(views: [reminderDivider, reminderStack])
-            reminderSection.orientation = .vertical
-            reminderSection.alignment = .leading
-            reminderSection.spacing = 6
-            NSLayoutConstraint.activate([
-                reminderDivider.widthAnchor.constraint(equalToConstant: 424),
-                reminderStack.widthAnchor.constraint(equalToConstant: 424)
-            ])
-            contentViews.append(reminderSection)
-        }
-
-        let content = NSStackView(views: contentViews)
-        content.orientation = .vertical
-        content.alignment = .leading
-        content.spacing = 10
-        content.translatesAutoresizingMaskIntoConstraints = false
-        contentStack = content
-
-        rootView.addSubview(content)
-
-        NSLayoutConstraint.activate([
-            content.leadingAnchor.constraint(equalTo: rootView.leadingAnchor, constant: 18),
-            content.trailingAnchor.constraint(equalTo: rootView.trailingAnchor, constant: -18),
-            content.topAnchor.constraint(equalTo: rootView.topAnchor, constant: 12),
-            content.bottomAnchor.constraint(lessThanOrEqualTo: rootView.bottomAnchor, constant: -12),
-            content.widthAnchor.constraint(equalToConstant: 424),
-            rows.widthAnchor.constraint(equalTo: content.widthAnchor),
-            zaiSection.widthAnchor.constraint(equalTo: content.widthAnchor),
-            resetCreditsRow.widthAnchor.constraint(equalTo: rows.widthAnchor),
-            titleLine.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
-            accountLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 180),
-            accountPlanTag.widthAnchor.constraint(greaterThanOrEqualToConstant: 28)
-        ])
-        updatePreferredContentSize()
+    /// 任一渠道成功返回快照后推进顶部时间；旧快照重放不会回退。
+    private func recordRefreshedAt(_ fetchedAt: Date?) {
+        guard let fetchedAt else { return }
+        lastRefreshedAt = max(lastRefreshedAt ?? .distantPast, fetchedAt)
     }
 
-    private var quotaContentSize: NSSize {
-        let fallbackHeight: CGFloat = ReminderCapability.hasAnyChannel ? 248 : 158
-        let contentHeight = contentStack.map { ceil($0.fittingSize.height) + 24 } ?? fallbackHeight
-        return NSSize(width: 460, height: contentHeight)
-    }
+    /// 顶部更新时间文案（测试读取用）。
+    var lastUpdatedDisplayText: String { updatedLabel.stringValue }
 
-    private func updatePreferredContentSize() {
-        guard isViewLoaded else {
-            preferredContentSize = quotaContentSize
+    private func updateLastUpdatedLabel() {
+        guard let lastRefreshedAt else {
+            updatedLabel.stringValue = ""
+            updatedLabel.toolTip = nil
             return
         }
-        rootView.layoutSubtreeIfNeeded()
-        preferredContentSize = quotaContentSize
-        onPreferredContentSizeChange?()
-    }
-
-    private func makeZAISection() -> NSView {
-        zaiTitleLabel.font = .systemFont(ofSize: 15, weight: .semibold)
-        zaiEmailLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        zaiEmailLabel.textColor = .secondaryLabelColor
-        zaiEmailLabel.lineBreakMode = .byTruncatingMiddle
-
-        zaiLevelTag.font = .systemFont(ofSize: 10, weight: .semibold)
-        zaiLevelTag.textColor = .white
-        zaiLevelTag.alignment = .center
-        zaiLevelTag.drawsBackground = true
-        zaiLevelTag.backgroundColor = .systemBlue
-        zaiLevelTag.wantsLayer = true
-        zaiLevelTag.layer?.cornerRadius = 4
-        zaiLevelTag.layer?.masksToBounds = true
-
-        zaiStatusLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        zaiStatusLabel.textColor = .secondaryLabelColor
-        zaiStatusLabel.lineBreakMode = .byTruncatingTail
-
-        zaiRefreshButton.bezelStyle = .rounded
-        zaiRefreshButton.toolTip = "手动刷新（60 秒内只能刷新一次）"
-        zaiRefreshButton.target = self
-        zaiRefreshButton.action = #selector(zaiRefreshTapped)
-
-        zaiResetCreditsTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        zaiResetCreditsTitleLabel.textColor = .labelColor
-        zaiResetCreditsValueLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        zaiResetCreditsValueLabel.textColor = .labelColor
-        zaiResetCreditsValueLabel.alignment = .left
-
-        zaiResetCreditsExpirationButton.bezelStyle = .rounded
-        zaiResetCreditsExpirationButton.controlSize = .small
-        zaiResetCreditsExpirationButton.font = .systemFont(ofSize: 11)
-        zaiResetCreditsExpirationButton.toolTip = "查看每张重置额度的过期时间"
-        zaiResetCreditsExpirationButton.target = self
-        zaiResetCreditsExpirationButton.action = #selector(showZAIResetCreditExpirationsTapped)
-        zaiResetCreditsExpirationButton.isHidden = true
-
-        let titleLine = NSStackView(views: [zaiTitleLabel, zaiEmailLabel, zaiLevelTag, NSView()])
-        titleLine.orientation = .horizontal
-        titleLine.alignment = .lastBaseline
-        titleLine.spacing = 8
-
-        let headerLeft = NSStackView(views: [titleLine, zaiStatusLabel])
-        headerLeft.orientation = .vertical
-        headerLeft.alignment = .leading
-        headerLeft.spacing = 2
-
-        let header = NSStackView(views: [headerLeft, NSView(), zaiRefreshButton])
-        header.orientation = .horizontal
-        header.alignment = .centerY
-        header.spacing = 12
-
-        let rows = NSStackView(views: zaiRows + [zaiResetCreditsRow])
-        rows.orientation = .vertical
-        rows.alignment = .leading
-        rows.spacing = 4
-
-        let divider = NSBox()
-        divider.boxType = .separator
-
-        let section = NSStackView(views: [divider, header, rows])
-        section.orientation = .vertical
-        section.alignment = .leading
-        section.spacing = 6
-        section.isHidden = !shouldShowZAISection
-
-        NSLayoutConstraint.activate([
-            divider.widthAnchor.constraint(equalToConstant: 424),
-            header.widthAnchor.constraint(equalToConstant: 424),
-            titleLine.widthAnchor.constraint(lessThanOrEqualToConstant: 330),
-            zaiEmailLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 210),
-            zaiLevelTag.widthAnchor.constraint(greaterThanOrEqualToConstant: 28),
-            zaiRefreshButton.widthAnchor.constraint(equalToConstant: 64),
-            rows.widthAnchor.constraint(equalToConstant: 424)
-        ])
-
-        return section
-    }
-
-    private func makeResetCreditsRow() -> NSStackView {
-        creditBalanceTitleLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        creditBalanceTitleLabel.textColor = .labelColor
-
-        creditBalanceLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        creditBalanceLabel.textColor = .labelColor
-        creditBalanceLabel.alignment = .right
-
-        // 末尾的 NSView 是弹性空隙，把余额标签推到行最右侧。
-        let row = NSStackView(views: [
-            resetCreditsTitleLabel,
-            resetCreditsValueLabel,
-            resetCreditsExpirationButton,
-            NSView(),
-            creditBalanceTitleLabel,
-            creditBalanceLabel
-        ])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 20),
-            resetCreditsTitleLabel.widthAnchor.constraint(equalToConstant: 108),
-            resetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 32),
-            resetCreditsExpirationButton.widthAnchor.constraint(equalToConstant: 76)
-        ])
-
-        return row
-    }
-
-    private func updateResetCredits(_ count: Int?, cards: [ResetCreditCard]?, creditBalance: Double?) {
-        currentResetCreditCount = count ?? 0
-        currentResetCreditCards = cards
-        resetCreditsValueLabel.stringValue = count.map(String.init) ?? "--"
-        updateResetCreditsExpirationButton()
-        updateCreditBalanceLabel(creditBalance)
-    }
-
-    /// $100 = 2500 积分，余额积分除以 25 折算美元。
-    private func updateCreditBalanceLabel(_ balance: Double?) {
-        guard let balance else {
-            creditBalanceTitleLabel.isHidden = true
-            creditBalanceLabel.stringValue = ""
-            creditBalanceLabel.toolTip = nil
-            return
-        }
-        creditBalanceTitleLabel.isHidden = false
-        creditBalanceTitleLabel.toolTip = "额度余额 \(Int(balance.rounded())) 积分（$100 = 2500 积分）"
-        creditBalanceLabel.stringValue = String(format: "$%.2f", balance / 25)
-        creditBalanceLabel.toolTip = "额度余额 \(Int(balance.rounded())) 积分（$100 = 2500 积分）"
-    }
-
-    private func updateResetCreditsExpirationButton() {
-        resetCreditsExpirationButton.isHidden = currentResetCreditCount <= 0
-    }
-
-    @objc private func showResetCreditExpirationsTapped() {
-        showResetCreditExpirations(currentResetCreditCards ?? [])
-    }
-
-    // MARK: ZAI 重置额度（coding-plan）
-
-    private func makeZAIResetCreditsRow() -> NSStackView {
-        let row = NSStackView(views: [zaiResetCreditsTitleLabel, zaiResetCreditsValueLabel, zaiResetCreditsExpirationButton, NSView()])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        row.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 20),
-            zaiResetCreditsTitleLabel.widthAnchor.constraint(equalToConstant: 108),
-            zaiResetCreditsValueLabel.widthAnchor.constraint(equalToConstant: 32),
-            zaiResetCreditsExpirationButton.widthAnchor.constraint(equalToConstant: 76)
-        ])
-
-        return row
-    }
-
-    private func updateZAIResetCredits(_ cards: [ZAIResetCreditCard]?) {
-        currentZAIResetCreditCards = cards
-        zaiResetCreditsValueLabel.stringValue = cards.map { String($0.count) } ?? "--"
-        zaiResetCreditsExpirationButton.isHidden = (cards?.count ?? 0) <= 0
-    }
-
-    @objc private func showZAIResetCreditExpirationsTapped() {
-        let alert = NSAlert()
-        alert.messageText = "重置额度过期时间"
-        let cards = currentZAIResetCreditCards ?? []
-        if cards.isEmpty {
-            alert.informativeText = "没有查到可展示的重置额度过期时间。"
-        } else {
-            alert.accessoryView = Self.makeZAIResetCreditExpirationList(cards)
-        }
-        alert.addButton(withTitle: "好")
-        alert.runModal()
-    }
-
-    private static func makeZAIResetCreditExpirationList(_ cards: [ZAIResetCreditCard]) -> NSView {
-        let now = Date()
-        let warningInterval: TimeInterval = 7 * 24 * 60 * 60
-        let listWidth: CGFloat = 320
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        for (index, card) in cards.enumerated() {
-            let line = "\(index + 1). \(card.kind.title) · 过期 \(formatCompactDateTime(card.expiresAt))"
-            let expiresSoon = card.expiresAt.map { $0.timeIntervalSince(now) < warningInterval } ?? false
-            let label = NSTextField(labelWithString: line)
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            label.textColor = expiresSoon ? .systemRed : .labelColor
-            label.alignment = .center
-            label.lineBreakMode = .byClipping
-            label.translatesAutoresizingMaskIntoConstraints = false
-            stack.addArrangedSubview(label)
-            label.widthAnchor.constraint(equalToConstant: listWidth).isActive = true
-        }
-
-        let listHeight = min(CGFloat(cards.count * 22), 180)
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: listWidth, height: listHeight))
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        scrollView.backgroundColor = .clear
-        scrollView.contentView.drawsBackground = false
-        scrollView.hasVerticalScroller = cards.count > 8
-        scrollView.hasHorizontalScroller = false
-        scrollView.documentView = stack
-
-        NSLayoutConstraint.activate([
-            stack.widthAnchor.constraint(equalToConstant: listWidth),
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: CGFloat(cards.count * 20))
-        ])
-
-        return scrollView
-    }
-
-    @objc private func refreshTapped() {
-        guard refreshButton.isEnabled else { return }
-        // 手动刷新 60 秒防重：点击后禁用按钮一分钟。
-        refreshButton.isEnabled = false
-        refreshCooldownTimer?.invalidate()
-        refreshCooldownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.refreshButton.isEnabled = true
-            }
-        }
-        onRefresh?()
-    }
-
-    @objc private func zaiRefreshTapped() {
-        guard zaiRefreshButton.isEnabled else { return }
-        // 与 Codex 刷新一致：手动请求也在 60 秒内防重。
-        zaiRefreshButton.isEnabled = false
-        zaiRefreshCooldownTimer?.invalidate()
-        zaiRefreshCooldownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
-            Task { @MainActor in
-                self?.zaiRefreshButton.isEnabled = true
-            }
-        }
-        onZAIRefresh?()
-    }
-
-    @objc fileprivate func muteReminderTapped() {
-        onMuteReminder?()
-    }
-
-    @objc private func reminderControlChanged() {
-        onReminderConfigurationChange?(currentReminderConfiguration())
-    }
-
-    @objc private func unmuteAllTapped() {
-        onUnmuteAll?()
-    }
-
-    private static func formatFetchedAt(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.dateFormat = Calendar.current.isDateInToday(date) ? "HH:mm:ss" : "MM-dd HH:mm"
-        return formatter.string(from: date)
-    }
-
-    private static func formatDateTime(_ date: Date?) -> String {
-        formatDate(date, dateFormat: "yyyy-MM-dd HH:mm:ss")
-    }
-
-    private static func formatCompactDateTime(_ date: Date?) -> String {
-        formatDate(date, dateFormat: "MM-dd HH:mm:ss")
-    }
-
-    private static func formatDate(_ date: Date?, dateFormat: String) -> String {
-        guard let date else { return "--" }
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "zh_CN")
-        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
-        formatter.dateFormat = dateFormat
-        return formatter.string(from: date)
-    }
-
-    private static func makeResetCreditExpirationList(_ cards: [ResetCreditCard]) -> NSView {
-        let now = Date()
-        let warningInterval: TimeInterval = 7 * 24 * 60 * 60
-        let listWidth: CGFloat = 320
-        let stack = NSStackView()
-        stack.orientation = .vertical
-        stack.alignment = .centerX
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        for (index, card) in cards.enumerated() {
-            let line = "\(index + 1). 发放 \(formatCompactDateTime(card.issuedAt))  过期 \(formatCompactDateTime(card.expiresAt))"
-            let expiresSoon = card.expiresAt.map { $0.timeIntervalSince(now) < warningInterval } ?? false
-            let label = NSTextField(labelWithString: line)
-            label.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-            label.textColor = expiresSoon ? .systemRed : .labelColor
-            label.alignment = .center
-            label.lineBreakMode = .byClipping
-            label.translatesAutoresizingMaskIntoConstraints = false
-            stack.addArrangedSubview(label)
-            label.widthAnchor.constraint(equalToConstant: listWidth).isActive = true
-        }
-
-        let listHeight = min(CGFloat(cards.count * 22), 180)
-        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: listWidth, height: listHeight))
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = false
-        scrollView.backgroundColor = .clear
-        scrollView.contentView.drawsBackground = false
-        scrollView.hasVerticalScroller = cards.count > 8
-        scrollView.hasHorizontalScroller = false
-        scrollView.documentView = stack
-
-        NSLayoutConstraint.activate([
-            stack.widthAnchor.constraint(equalToConstant: listWidth),
-            stack.heightAnchor.constraint(greaterThanOrEqualToConstant: CGFloat(cards.count * 20))
-        ])
-
-        return scrollView
+        updatedLabel.stringValue = PanelTheme.relativeTime(from: lastRefreshedAt)
+        updatedLabel.toolTip = "上次成功刷新：\(PanelTheme.formatFetchedAt(lastRefreshedAt))"
     }
 
     func applyReminderConfiguration(_ configuration: ReminderConfiguration) {
         reminderConfiguration = configuration
-        reminderEnabledButton.state = configuration.isEnabled ? .on : .off
-        warningValueLabel.stringValue = "\(Int(configuration.warningRemainingPercent))%"
-        resetSoonValueLabel.stringValue = configuration.resetSoonMinutes > 0
-            ? "\(Int(configuration.resetSoonMinutes)) 分钟"
-            : "关闭"
-        cooldownValueLabel.stringValue = "\(Int(configuration.cooldown / 60)) 分钟"
+        syncControlStates()
     }
 
     func applyRefreshInterval(minutes: Int) {
-        refreshIntervalValueLabel.stringValue = "\(minutes) 分钟"
+        refreshIntervalMinutes = minutes
+        syncControlStates()
     }
 
-    private func configureReminderControls() {
-        reminderEnabledButton.target = self
-        reminderEnabledButton.action = #selector(reminderControlChanged)
-        reminderEnabledButton.font = .systemFont(ofSize: 12, weight: .medium)
+    func applyCodexResetActions(_ actions: [String: ResetCardsRow.ResetAction]) {
+        codexSection.applyResetActions(actions)
+    }
 
-        unmuteButton.bezelStyle = .rounded
-        unmuteButton.controlSize = .small
-        unmuteButton.font = .systemFont(ofSize: 11)
-        unmuteButton.toolTip = "撤销“不再提醒”并清除冷却，本周期内重新允许提醒"
-        unmuteButton.target = self
-        unmuteButton.action = #selector(unmuteAllTapped)
-        unmuteButton.isHidden = true
+    func applyCodexUsage(_ days: [DayUsage]?) {
+        codexSection.applyUsage(days: days)
+        updatePreferredContentSize()
+    }
 
-        for label in [warningValueLabel, resetSoonValueLabel, cooldownValueLabel, refreshIntervalValueLabel] {
-            label.font = .systemFont(ofSize: 11)
-            label.textColor = .labelColor
+    func applyZAIUsage(_ days: [DayUsage]?) {
+        zaiSection.applyUsage(days: days)
+    }
+
+    // MARK: - 布局
+
+    private func configureSubviews() {
+        buildTopBar()
+        buildSections()
+        buildFooter()
+        buildSettingsPage()
+
+        pageContainer.orientation = .horizontal
+        pageContainer.alignment = .top
+        pageContainer.spacing = 0
+        pageContainer.translatesAutoresizingMaskIntoConstraints = false
+        pageContainer.addView(quotaPage, in: .leading)
+        // 设置页走 makeBlock：与额度页同款 12pt 内边距，避免 stack 自动贴边约束吃掉边距
+        let settingsBlock = makeBlock(settingsPageView, top: 10, bottom: 10)
+        pageContainer.addView(settingsBlock, in: .leading)
+        settingsBlock.isHidden = true
+        self.settingsBlock = settingsBlock
+
+        rootView.addSubview(pageContainer)
+        NSLayoutConstraint.activate([
+            solidBackground.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            solidBackground.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
+            solidBackground.topAnchor.constraint(equalTo: rootView.topAnchor),
+            solidBackground.bottomAnchor.constraint(equalTo: rootView.bottomAnchor),
+            pageContainer.leadingAnchor.constraint(equalTo: rootView.leadingAnchor),
+            pageContainer.trailingAnchor.constraint(equalTo: rootView.trailingAnchor),
+            pageContainer.topAnchor.constraint(equalTo: rootView.topAnchor),
+            pageContainer.bottomAnchor.constraint(lessThanOrEqualTo: rootView.bottomAnchor),
+            quotaPage.widthAnchor.constraint(equalTo: pageContainer.widthAnchor),
+            settingsBlock.widthAnchor.constraint(equalTo: pageContainer.widthAnchor)
+        ])
+    }
+
+    private func buildTopBar() {
+        let titleLabel = NSTextField(labelWithString: "LocalQuotaBar")
+        titleLabel.font = .systemFont(ofSize: 13, weight: .bold)
+        titleLabel.textColor = PanelTheme.primaryText
+
+        updatedLabel.font = .systemFont(ofSize: 10, weight: .regular)
+        updatedLabel.textColor = PanelTheme.tertiaryText
+
+        refreshAllButton.identifier = NSUserInterfaceItemIdentifier("global-refresh")
+        refreshAllButton.onTap = { [weak self] in
+            guard let self, self.canRefreshAll else { return }
+            self.codexSection.requestRefresh()
+            if self.shouldShowZAISection {
+                self.zaiSection.requestRefresh()
+            }
+        }
+        settingsButton.onTap = { [weak self] in
+            self?.setShowsSettings(true)
         }
 
-        applyReminderConfiguration(ReminderSettings.load())
-        applyRefreshInterval(minutes: RefreshSettings.loadMinutes())
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let topBar = NSStackView(views: [titleLabel, spacer, updatedLabel, refreshAllButton, settingsButton])
+        topBar.orientation = .horizontal
+        topBar.alignment = .centerY
+        topBar.spacing = 8
+
+        quotaPage.orientation = .vertical
+        quotaPage.alignment = .leading
+        quotaPage.spacing = 0
+        quotaPage.translatesAutoresizingMaskIntoConstraints = false
+
+        let block = makeBlock(topBar, top: 10, bottom: 8)
+        quotaPage.addArrangedSubview(block)
+        quotaPage.addArrangedSubview(makeHairline())
     }
 
-    private func makeSettingsView() -> NSView {
-        let title = NSTextField(labelWithString: "设置")
-        title.font = .systemFont(ofSize: 12, weight: .semibold)
-        title.textColor = .secondaryLabelColor
+    private func buildSections() {
+        codexSection.onRefresh = { [weak self] in self?.onRefresh?() }
+        codexSection.onResetCredit = { [weak self] id in self?.onResetCodexCredit?(id) }
+        codexSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshAllButton() }
+        codexSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
+        quotaPage.addArrangedSubview(makeBlock(codexSection, top: 8, bottom: 10))
 
-        let editHint = NSTextField(labelWithString: "在状态栏右键菜单中修改")
-        editHint.font = .systemFont(ofSize: 10)
-        editHint.textColor = .tertiaryLabelColor
+        zaiSection.onRefresh = { [weak self] in self?.onZAIRefresh?() }
+        zaiSection.onUseResetCard = { [weak self] kind in self?.onUseZAIResetCard?(kind) }
+        zaiSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshAllButton() }
+        zaiSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
 
-        let lowRow = makeSettingRow(label: "额度低于", control: warningValueLabel)
-        let resetRow = makeSettingRow(label: "重置还剩", control: resetSoonValueLabel)
-        let cooldownRow = makeSettingRow(label: "提醒间隔", control: cooldownValueLabel)
-        let refreshRow = makeSettingRow(label: "刷新频率", control: refreshIntervalValueLabel)
-
-        let titleLine = NSStackView(views: [title, editHint, NSView()])
-        titleLine.orientation = .horizontal
-        titleLine.alignment = .centerY
-        titleLine.spacing = 8
-
-        let firstLine = NSStackView(views: [reminderEnabledButton, NSView(), unmuteButton])
-        firstLine.orientation = .horizontal
-        firstLine.alignment = .centerY
-        firstLine.spacing = 8
-
-        let secondLine = NSStackView(views: [lowRow, NSView(), resetRow])
-        secondLine.orientation = .horizontal
-        secondLine.alignment = .centerY
-        secondLine.spacing = 10
-
-        let thirdLine = NSStackView(views: [cooldownRow, NSView(), refreshRow])
-        thirdLine.orientation = .horizontal
-        thirdLine.alignment = .centerY
-        thirdLine.spacing = 10
-
-        let stack = NSStackView(views: [titleLine, firstLine, secondLine, thirdLine])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 4
-        stack.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            titleLine.widthAnchor.constraint(equalToConstant: 424),
-            firstLine.widthAnchor.constraint(equalToConstant: 424),
-            secondLine.widthAnchor.constraint(equalToConstant: 424),
-            thirdLine.widthAnchor.constraint(equalToConstant: 424)
-        ])
-
-        return stack
+        let zaiDivider = makeHairline()
+        let zaiBlock = makeBlock(zaiSection, top: 8, bottom: 10)
+        self.zaiBlock = zaiBlock
+        quotaPage.addArrangedSubview(zaiDivider)
+        quotaPage.addArrangedSubview(zaiBlock)
+        zaiDivider.isHidden = !shouldShowZAISection
+        zaiBlock.isHidden = !shouldShowZAISection
+        updateRefreshAllButton()
     }
 
-    private func makeSettingRow(label: String, control: NSView) -> NSStackView {
-        let labelView = NSTextField(labelWithString: label)
-        labelView.font = .systemFont(ofSize: 11)
-        labelView.textColor = .secondaryLabelColor
-        labelView.alignment = .right
-
-        let stack = NSStackView(views: [labelView, control])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 6
-
-        NSLayoutConstraint.activate([
-            control.widthAnchor.constraint(equalToConstant: 86)
-        ])
-
-        return stack
+    private var canRefreshAll: Bool {
+        codexSection.canRequestRefresh && (!shouldShowZAISection || zaiSection.canRequestRefresh)
     }
 
-    private func currentReminderConfiguration() -> ReminderConfiguration {
-        // 阈值以菜单/持久化同步过来的副本为准，面板只改 isEnabled。
+    private func updateRefreshAllButton() {
+        refreshAllButton.isEnabled = canRefreshAll
+        refreshAllButton.alphaValue = canRefreshAll ? 1 : 0.35
+        refreshAllButton.toolTip = canRefreshAll ? "全部刷新" : "有项目正在刷新或冷却，请稍后重试"
+    }
+
+    private func buildFooter() {
+        footer.onToggleReminder = { [weak self] enabled in
+            self?.pushReminderConfiguration { configuration in
+                configuration.isEnabled = enabled
+            }
+        }
+        footer.onRestoreReminders = { [weak self] in
+            self?.onUnmuteAll?()
+        }
+
+        quotaPage.addArrangedSubview(makeHairline())
+        quotaPage.addArrangedSubview(makeBlock(footer, top: 8, bottom: 10))
+    }
+
+    private func buildSettingsPage() {
+        settingsPageView.onBack = { [weak self] in
+            self?.setShowsSettings(false)
+        }
+        settingsPageView.onReminderEnabledChange = { [weak self] enabled in
+            self?.pushReminderConfiguration { $0.isEnabled = enabled }
+        }
+        settingsPageView.onWarningPercentChange = { [weak self] value in
+            self?.pushReminderConfiguration { $0.warningRemainingPercent = Double(value) }
+        }
+        settingsPageView.onResetSoonChange = { [weak self] value in
+            // 0 表示关闭"重置还剩"提醒
+            self?.pushReminderConfiguration { $0.resetSoonMinutes = TimeInterval(value) }
+        }
+        settingsPageView.onCooldownChange = { [weak self] value in
+            self?.pushReminderConfiguration { $0.cooldown = TimeInterval(value * 60) }
+        }
+        settingsPageView.onRefreshIntervalChange = { [weak self] minutes in
+            self?.onRefreshIntervalChange?(minutes)
+        }
+        settingsPageView.onRestoreDefaults = { [weak self] in
+            self?.applyReminderConfiguration(.default)
+            self?.onReminderConfigurationChange?(.default)
+        }
+        settingsPageView.onUnmuteAll = { [weak self] in
+            self?.onUnmuteAll?()
+        }
+
+        syncControlStates()
+    }
+
+    /// 设置页/页脚改动统一入口：基于当前副本改字段后走回调链持久化。
+    private func pushReminderConfiguration(_ mutate: (inout ReminderConfiguration) -> Void) {
         var configuration = reminderConfiguration
-        configuration.isEnabled = reminderEnabledButton.state == .on
-        return configuration
+        mutate(&configuration)
+        // 先更新面板副本，避免后续刷新或另一项设置把旧阈值重新写回。
+        applyReminderConfiguration(configuration)
+        onReminderConfigurationChange?(configuration)
+    }
+
+    private func syncControlStates() {
+        footer.configure(reminder: reminderConfiguration, canRestore: canRestoreMuted)
+        settingsPageView.configure(
+            reminder: reminderConfiguration,
+            refreshMinutes: refreshIntervalMinutes,
+            canRestore: canRestoreMuted
+        )
+    }
+
+    private func setShowsSettings(_ shows: Bool) {
+        quotaPage.isHidden = shows
+        settingsBlock.isHidden = !shows
+        updatePreferredContentSize()
+    }
+
+    private func replayCodexState() {
+        codexSection.apply(
+            snapshot: lastCodexSnapshot,
+            isRefreshing: lastCodexIsRefreshing,
+            error: lastCodexError,
+            accountLabel: accountLabelText
+        )
+    }
+
+    // MARK: - 尺寸自适应
+
+    /// 内容块加左右 12pt 内边距与上下自定义留白（对应原型各区块 padding）。
+    /// 内容宽度钉常量：若让容器宽度由内容反推，"内容↔容器"宽度自引用会产生
+    /// 歧义解，曾把顶栏撑出面板右缘（齿轮被裁掉）。
+    private func makeBlock(_ content: NSView, top: CGFloat, bottom: CGFloat) -> NSView {
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        content.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(content)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: PanelTheme.contentInset),
+            content.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -PanelTheme.contentInset),
+            content.topAnchor.constraint(equalTo: container.topAnchor, constant: top),
+            content.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -bottom),
+            content.widthAnchor.constraint(equalToConstant: PanelTheme.contentWidth)
+        ])
+        return container
+    }
+
+    private func makeHairline() -> NSView {
+        // 原型分隔线：--divider #26262A 的 1pt 实线，横贯面板全宽。
+        // 宽度用固定常量：若约束到 quotaPage.width，stack 在 fittingSize 求解时
+        // 宽度自引用会把全部内容高度坍缩成 0（弹窗变空白）。
+        let line = NSView()
+        line.wantsLayer = true
+        line.layer?.backgroundColor = PanelTheme.dividerColor.cgColor
+        line.translatesAutoresizingMaskIntoConstraints = false
+        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        line.widthAnchor.constraint(equalToConstant: PanelTheme.panelWidth).isActive = true
+        return line
+    }
+
+    private var quotaContentSize: NSSize {
+        let contentHeight = ceil(pageContainer.fittingSize.height) + PanelTheme.contentInset
+        return NSSize(width: PanelTheme.panelWidth, height: contentHeight)
+    }
+
+    private func updatePreferredContentSize() {
+        guard isViewLoaded else { return }
+        rootView.layoutSubtreeIfNeeded()
+        let size = quotaContentSize
+        guard preferredContentSize != size else { return }
+        preferredContentSize = size
+        onPreferredContentSizeChange?()
     }
 }
+
 
 final class TouchBarHostingVisualEffectView: NSVisualEffectView, NSTouchBarDelegate {
     let touchBarQuotaView = TouchBarQuotaView(frame: NSRect(x: 0, y: 0, width: 370, height: 30))
@@ -2234,161 +2168,6 @@ final class TouchBarHostingVisualEffectView: NSVisualEffectView, NSTouchBarDeleg
         item.customizationLabel = "Codex 余额"
         item.view = touchBarQuotaView
         return item
-    }
-}
-
-final class QuotaRowView: NSView {
-    private let placeholderTitle: String
-    private let titleLabel: NSTextField
-    private let barView = SegmentedBatteryBarView(segmentCount: 28)
-    private let detailLabel: NSTextField
-    private let titleWidth: CGFloat
-    private let detailWidth: CGFloat
-    private let barMinWidth: CGFloat
-
-    init(title: String, titleWidth: CGFloat = 52, detailWidth: CGFloat = 132, barMinWidth: CGFloat = 200) {
-        self.placeholderTitle = title
-        self.titleLabel = NSTextField(labelWithString: title)
-        self.detailLabel = NSTextField(labelWithString: "--% · --")
-        self.titleWidth = titleWidth
-        self.detailWidth = detailWidth
-        self.barMinWidth = barMinWidth
-        super.init(frame: .zero)
-        setup()
-        update(bucket: nil)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    /// 标题可能被截断（如 GLM-5-Turbo），悬停显示完整文本。
-    private func setRowTitle(_ text: String) {
-        titleLabel.stringValue = text
-        titleLabel.toolTip = text
-    }
-
-    func update(bucket: QuotaBucket?) {
-        guard let bucket else {
-            barView.isPending = false
-            setRowTitle(placeholderTitle)
-            barView.percent = 0
-            detailLabel.stringValue = "--% · --"
-            detailLabel.toolTip = nil
-            return
-        }
-
-        barView.isPending = false
-        setRowTitle(bucket.title)
-        barView.percent = bucket.remainingPercent
-        detailLabel.stringValue = "\(bucket.roundedRemainingPercent)% · \(formatReset(bucket.resetsAt))"
-    }
-
-    func update(limit: ZAILimit?) {
-        guard let limit else {
-            barView.isPending = false
-            setRowTitle(placeholderTitle)
-            barView.percent = 0
-            detailLabel.stringValue = "--% · --"
-            detailLabel.toolTip = nil
-            return
-        }
-
-        barView.isPending = false
-        setRowTitle(limit.title)
-        barView.percent = limit.remainingPercent
-        detailLabel.stringValue = "\(limit.roundedRemainingPercent)% · \(formatReset(limit.nextResetTime))"
-    }
-
-    /// 体验套餐余额行：电量条按剩余/总量，detail 显示绝对 token 数与到期时间。
-    func update(balance: ZAIBalance?) {
-        guard let balance else {
-            barView.isPending = false
-            setRowTitle(placeholderTitle)
-            barView.percent = 0
-            detailLabel.stringValue = "-- · --"
-            detailLabel.toolTip = nil
-            return
-        }
-
-        barView.isPending = false
-        setRowTitle(balance.title)
-        barView.percent = balance.remainingFraction * 100
-        detailLabel.stringValue = "\(Self.formatTokenCount(balance.remainingUnits))/\(Self.formatTokenCount(balance.totalUnits)) · \(formatReset(balance.expiresAt))"
-        let used = Self.formatTokenCount(max(balance.totalUnits - balance.remainingUnits, 0))
-        let periodText = balance.isDaily ? "每日额度" : "一次性额度"
-        let verb = balance.isDaily ? "重置" : "到期"
-        detailLabel.toolTip = "\(balance.title) · \(periodText)，\(formatReset(balance.expiresAt)) \(verb)（已用 \(used)）"
-    }
-
-    /// 待生效权益行：权益生效前余额接口只返回 entitlements（balances 为空）。
-    /// 进度条整条置灰（额度尚未启用），detail 按过期时间展示，与余额行口径一致。
-    func update(pending entitlement: ZAIPendingEntitlement?) {
-        guard let entitlement else {
-            barView.isPending = false
-            setRowTitle(placeholderTitle)
-            barView.percent = 0
-            detailLabel.stringValue = "-- · --"
-            detailLabel.toolTip = nil
-            return
-        }
-
-        barView.isPending = true
-        barView.percent = 100
-        setRowTitle(entitlement.title)
-        let grant = Self.formatTokenCount(entitlement.grantUnits)
-        let expiry = formatReset(entitlement.expiresAt)
-        let effective = formatReset(entitlement.effectiveAt)
-        detailLabel.stringValue = "\(grant) · \(expiry) 到期"
-        detailLabel.toolTip = "\(entitlement.title) · 待生效，\(effective) 起可用，\(expiry) 到期"
-    }
-
-    /// token 数格式化：100000000 → "100.0M"。
-    static func formatTokenCount(_ value: Double) -> String {
-        switch value {
-        case 1e9...: return String(format: "%.1fB", value / 1e9)
-        case 1e6...: return String(format: "%.1fM", value / 1e6)
-        case 1e3...: return String(format: "%.1fK", value / 1e3)
-        default: return String(format: "%.0f", value)
-        }
-    }
-
-    private func setup() {
-        translatesAutoresizingMaskIntoConstraints = false
-
-        titleLabel.font = .monospacedSystemFont(ofSize: 12, weight: .semibold)
-        titleLabel.textColor = .labelColor
-        titleLabel.alignment = .left
-        titleLabel.lineBreakMode = .byTruncatingTail
-        titleLabel.cell?.truncatesLastVisibleLine = true
-        titleLabel.cell?.wraps = false
-
-        detailLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .medium)
-        detailLabel.textColor = .labelColor
-        detailLabel.alignment = .right
-
-        barView.translatesAutoresizingMaskIntoConstraints = false
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-        detailLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        let row = NSStackView(views: [titleLabel, barView, detailLabel])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 10
-        row.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(row)
-
-        NSLayoutConstraint.activate([
-            row.leadingAnchor.constraint(equalTo: leadingAnchor),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor),
-            row.topAnchor.constraint(equalTo: topAnchor),
-            row.bottomAnchor.constraint(equalTo: bottomAnchor),
-            heightAnchor.constraint(equalToConstant: 22),
-            titleLabel.widthAnchor.constraint(equalToConstant: titleWidth),
-            detailLabel.widthAnchor.constraint(equalToConstant: detailWidth),
-            barView.heightAnchor.constraint(equalToConstant: 12),
-            barView.widthAnchor.constraint(greaterThanOrEqualToConstant: barMinWidth)
-        ])
     }
 }
 

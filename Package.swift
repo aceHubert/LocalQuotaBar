@@ -22,6 +22,11 @@ let package = Package(
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
             ]
+        ),
+        .testTarget(
+            name: "LocalQuotaBarTests",
+            dependencies: ["LocalQuotaBar"],
+            path: "Tests/LocalQuotaBarTests"
         )
     ]
 )
