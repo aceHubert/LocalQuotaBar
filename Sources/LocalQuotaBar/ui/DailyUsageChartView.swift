@@ -31,17 +31,38 @@ struct ChartBarLayout: Equatable {
 }
 
 /// 30 根细柱 + 日均值 + 周刻度 + 今日高亮；hover 显示某天明细。
+/// Z.AI 实例传入渠道拆分数据后支持「总量 / 叠加」两种显示：叠加模式下柱子
+/// 下段为套餐（服务端 model-usage，全设备，绿），上段为本机非套餐渠道（橙），
+/// 两段不重叠、总计即账号全部消耗；Codex 实例维持总量单色。
+enum UsageDisplayMode: String {
+    case total
+    case stacked
+}
+
 final class DailyUsageChartView: NSView {
+    /// 高度变化（图例行显隐、显示方式切换），宿主刷新 popover contentSize。
+    var onContentHeightChange: (() -> Void)?
+
     private var days: [DayUsage] = []
+    /// 与 days 按日期对齐的套餐（服务端）用量；nil = 不支持叠加（Codex 实例）。
+    private var channelTokensByDay: [Date: Double]?
     private var hasData = false
+
+    /// 偏好持久化入口；默认 .standard，单测可注入独立 suite。
+    var storage: UserDefaults = .standard
+    private(set) var displayMode: UsageDisplayMode
+    private var hasLoadedDisplayMode = false
 
     private let titleHeight: CGFloat = 14
     private let barsHeight: CGFloat = 30
+    private let legendHeight: CGFloat = 10
     private let ticksHeight: CGFloat = 11
     private let barGap: CGFloat = 2
     private let inset: CGFloat = 8
+    private var heightConstraint: NSLayoutConstraint!
 
     override init(frame frameRect: NSRect) {
+        displayMode = .stacked
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 9
@@ -50,23 +71,60 @@ final class DailyUsageChartView: NSView {
         layer?.borderColor = PanelTheme.hairlineSubtle.cgColor
         translatesAutoresizingMaskIntoConstraints = false
 
-        NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 6 + titleHeight + 4 + barsHeight + 3 + ticksHeight + 5)
-        ])
+        // 初始按无图例高度；configure 后按数据显示方式同步
+        heightConstraint = heightAnchor.constraint(
+            equalToConstant: 6 + titleHeight + 4 + barsHeight + 3 + ticksHeight + 5
+        )
+        heightConstraint.isActive = true
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    static let displayModeStorageKey = "local.codex.touchbar.quota.zaiUsageDisplayMode"
+
     /// days 需按日期升序、包含完整 30 天（无数据的天 tokens = 0）。
-    func configure(days: [DayUsage]?) {
+    /// channelDays 与 days 同日对齐；非 nil 即启用叠加显示与模式切换。
+    func configure(days: [DayUsage]?, channelDays: [DayUsage]? = nil) {
+        if !hasLoadedDisplayMode {
+            hasLoadedDisplayMode = true
+            if let raw = storage.string(forKey: Self.displayModeStorageKey),
+               let mode = UsageDisplayMode(rawValue: raw) {
+                displayMode = mode
+            }
+        }
         self.days = days ?? []
+        channelTokensByDay = channelDays.map { entries in
+            Dictionary(entries.map { ($0.date, $0.tokens) }, uniquingKeysWith: { _, last in last })
+        }
         hasData = !(days ?? []).isEmpty
+        syncLegendHeight()
         needsDisplay = true
         cancelPendingTooltip()
         tooltip.hide()
         hoveredIndex = nil
+    }
+
+    /// 切换显示方式并持久化；供图内切换点击与外部入口共用。
+    func setDisplayMode(_ mode: UsageDisplayMode) {
+        guard mode != displayMode else { return }
+        displayMode = mode
+        storage.set(mode.rawValue, forKey: Self.displayModeStorageKey)
+        syncLegendHeight()
+        needsDisplay = true
+    }
+
+    private var supportsStacking: Bool { channelTokensByDay != nil }
+
+    /// 图例只在叠加模式且有数据时占一行高度。
+    private var showsLegend: Bool { supportsStacking && displayMode == .stacked && hasData }
+
+    private func syncLegendHeight() {
+        let constant: CGFloat = 6 + titleHeight + 4 + barsHeight + 3 + ticksHeight + 5 + (showsLegend ? legendHeight : 0)
+        guard heightConstraint.constant != constant else { return }
+        heightConstraint.constant = constant
+        onContentHeightChange?()
     }
 
     var barsRect: NSRect {
@@ -97,6 +155,7 @@ final class DailyUsageChartView: NSView {
         }
         drawBars()
         drawAverageLine()
+        drawLegend()
         drawTicks()
     }
 
@@ -116,10 +175,67 @@ final class DailyUsageChartView: NSView {
                 ]
             )
             let size = avg.size()
-            // 宽度不够容纳"标题 + 日均"时跳过日均，避免文字互相压盖
-            guard title.size().width + size.width + 10 <= bounds.width - inset * 2 else { return }
-            avg.draw(at: NSPoint(x: bounds.width - inset - 1 - size.width, y: bounds.height - 6 - titleHeight + 2))
+            // 宽度不够容纳"标题 + 切换 + 日均"时跳过日均，避免文字互相压盖
+            let fits = title.size().width + size.width + 10 <= bounds.width - inset * 2
+            let avgX: CGFloat
+            if fits {
+                avgX = bounds.width - inset - 1 - size.width
+                avg.draw(at: NSPoint(x: avgX, y: bounds.height - 6 - titleHeight + 2))
+            } else {
+                avgX = bounds.width - inset - 1
+            }
+            if supportsStacking {
+                drawModeChips(rightX: avgX - 6)
+            }
         }
+    }
+
+    // MARK: 显示方式切换（总量 / 叠加）
+
+    private var chipRects: [(rect: NSRect, mode: UsageDisplayMode)] = []
+
+    /// 图卡头部的模式切换胶囊（对齐原型 mode-chips）；rect 供 mouseDown 命中。
+    private func drawModeChips(rightX: CGFloat) {
+        chipRects = []
+        let y = bounds.height - 6 - titleHeight + 1
+        var cursor = rightX
+        for mode in [UsageDisplayMode.total, .stacked].reversed() {
+            let text = NSAttributedString(string: mode == .total ? "总量" : "叠加", attributes: [
+                .font: NSFont.systemFont(ofSize: 8.5, weight: .bold),
+                .foregroundColor: mode == displayMode ? PanelTheme.primaryText : PanelTheme.tertiaryText
+            ])
+            let textSize = text.size()
+            let width = textSize.width + 12
+            cursor -= width
+            let rect = NSRect(x: cursor, y: y, width: width, height: 11)
+            chipRects.append((rect, mode))
+
+            let active = mode == displayMode
+            let pill = NSBezierPath(roundedRect: rect, xRadius: rect.height / 2, yRadius: rect.height / 2)
+            if active {
+                NSColor.white.withAlphaComponent(0.08).setFill()
+                pill.fill()
+            }
+            pill.lineWidth = 1
+            NSColor.white.withAlphaComponent(active ? 0.24 : 0.10).setStroke()
+            pill.stroke()
+            text.draw(at: NSPoint(x: rect.minX + 6, y: rect.minY + (rect.height - textSize.height) / 2))
+
+            cursor -= 3
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard supportsStacking else {
+            super.mouseDown(with: event)
+            return
+        }
+        let location = convert(event.locationInWindow, from: nil)
+        for chip in chipRects where chip.rect.contains(location) {
+            setDisplayMode(chip.mode)
+            return
+        }
+        super.mouseDown(with: event)
     }
 
     private func drawEmptyState() {
@@ -134,6 +250,10 @@ final class DailyUsageChartView: NSView {
         ))
     }
 
+    private var showsStackedBars: Bool {
+        supportsStacking && displayMode == .stacked && hasData
+    }
+
     private func drawBars() {
         let rect = barsRect
         let layout = barLayout
@@ -142,29 +262,109 @@ final class DailyUsageChartView: NSView {
 
         for (index, day) in days.enumerated() {
             let x = rect.minX + CGFloat(index) * layout.pitch
-            let ratio = day.tokens / maxTokens
-            let barHeight = max(day.tokens > 0 ? 2 : 1, rect.height * CGFloat(ratio))
-            let barRect = NSRect(x: x, y: rect.minY, width: layout.barWidth, height: barHeight)
-            let path = NSBezierPath(
-                roundedRect: barRect,
+            let isToday = Calendar.current.isDate(day.date, inSameDayAs: today)
+            let hovered = index == hoveredIndex
+
+            guard showsStackedBars, day.tokens > 0 else {
+                drawSingleBar(x: x, day: day, layout: layout, rect: rect,
+                              maxTokens: maxTokens, isToday: isToday, hovered: hovered)
+                continue
+            }
+
+            // 叠加：下段套餐（服务端、全设备，绿），上段本机非套餐渠道（橙）。
+            // 两段不重叠，柱高 = 总计（账号全部消耗），总量/叠加模式可直观对照。
+            let channelTokens = min(channelTokensByDay?[day.date] ?? 0, day.tokens)
+            let totalHeight = max(2, rect.height * CGFloat(day.tokens / maxTokens))
+            let channelHeight = max(channelTokens > 0 ? 1.5 : 0, rect.height * CGFloat(channelTokens / maxTokens))
+            let otherHeight = totalHeight - channelHeight
+
+            let channelColor = segmentColor(base: PanelTheme.green, isToday: isToday, hovered: hovered)
+            let otherColor = segmentColor(base: PanelTheme.orange, isToday: isToday, hovered: hovered)
+
+            // 整柱一个圆角胶囊，按上下区域裁剪出两段配色（原型 bar / bar-third 的观感）
+            let fullBar = NSRect(x: x, y: rect.minY, width: layout.barWidth, height: totalHeight)
+            let pill = NSBezierPath(
+                roundedRect: fullBar,
                 xRadius: min(2, layout.barWidth / 2),
                 yRadius: min(2, layout.barWidth / 2)
             )
-
-            let isToday = Calendar.current.isDate(day.date, inSameDayAs: today)
-            if index == hoveredIndex {
-                // 悬停的柱子更亮，与即时浮层提示对应
-                (PanelTheme.green.highlight(withLevel: 0.4) ?? PanelTheme.green).setFill()
-            } else if isToday {
-                // 今日高亮（更亮 + 轻微光晕感）
-                (PanelTheme.green.highlight(withLevel: 0.25) ?? PanelTheme.green).setFill()
-            } else if day.tokens > 0 {
-                // 有数据的天数用不透明绿，深底上保证清晰可读
-                PanelTheme.green.setFill()
+            if otherHeight >= 1 {
+                fillPill(pill, color: otherColor, clip: NSRect(
+                    x: x - 1, y: fullBar.minY + channelHeight - 0.5,
+                    width: layout.barWidth + 2, height: otherHeight + 1
+                ))
+                fillPill(pill, color: channelColor, clip: NSRect(
+                    x: x - 1, y: fullBar.minY - 1,
+                    width: layout.barWidth + 2, height: channelHeight + 0.5 + 1
+                ))
             } else {
-                NSColor.white.withAlphaComponent(0.06).setFill()
+                fillPill(pill, color: channelColor, clip: fullBar.insetBy(dx: -1, dy: -1))
             }
-            path.fill()
+        }
+    }
+
+    /// 在指定裁剪区域内填充胶囊路径（叠加柱的两段着色）。
+    private func fillPill(_ pill: NSBezierPath, color: NSColor, clip: NSRect) {
+        NSGraphicsContext.current?.saveGraphicsState()
+        NSBezierPath(rect: clip).addClip()
+        color.setFill()
+        pill.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+    }
+
+    /// 总量模式（或无数据天）的单段柱，维持原有配色行为。
+    private func drawSingleBar(x: CGFloat, day: DayUsage, layout: ChartBarLayout, rect: NSRect,
+                               maxTokens: Double, isToday: Bool, hovered: Bool) {
+        let barHeight = max(day.tokens > 0 ? 2 : 1, rect.height * CGFloat(day.tokens / maxTokens))
+        let barRect = NSRect(x: x, y: rect.minY, width: layout.barWidth, height: barHeight)
+        let path = NSBezierPath(
+            roundedRect: barRect,
+            xRadius: min(2, layout.barWidth / 2),
+            yRadius: min(2, layout.barWidth / 2)
+        )
+
+        if hovered {
+            // 悬停的柱子更亮，与即时浮层提示对应
+            (PanelTheme.green.highlight(withLevel: 0.4) ?? PanelTheme.green).setFill()
+        } else if isToday {
+            // 今日高亮（更亮 + 轻微光晕感）
+            (PanelTheme.green.highlight(withLevel: 0.25) ?? PanelTheme.green).setFill()
+        } else if day.tokens > 0 {
+            // 有数据的天数用不透明绿，深底上保证清晰可读
+            PanelTheme.green.setFill()
+        } else {
+            NSColor.white.withAlphaComponent(0.06).setFill()
+        }
+        path.fill()
+    }
+
+    private func segmentColor(base: NSColor, isToday: Bool, hovered: Bool) -> NSColor {
+        if hovered { return base.highlight(withLevel: 0.4) ?? base }
+        if isToday { return base.highlight(withLevel: 0.25) ?? base }
+        return base
+    }
+
+    /// 叠加模式图例行："■ 套餐（服务端） / ■ 第三方（本机）"；总量模式隐藏。
+    /// 位于日期刻度行之下（卡片最后一行）。
+    private func drawLegend() {
+        guard showsLegend else { return }
+        let y = barsRect.minY - ticksHeight + 1 - legendHeight - 2
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 8, weight: .semibold),
+            .foregroundColor: PanelTheme.tertiaryText
+        ]
+        var x = inset + 1
+        for (color, text) in [(PanelTheme.green, "套餐（服务端）"), (PanelTheme.orange, "第三方（本机）")] {
+            let square = NSBezierPath(
+                roundedRect: NSRect(x: x, y: y + 1.5, width: 4.5, height: 4.5),
+                xRadius: 1.5, yRadius: 1.5
+            )
+            color.setFill()
+            square.fill()
+            x += 7
+            let attributed = NSAttributedString(string: text, attributes: attributes)
+            attributed.draw(at: NSPoint(x: x, y: y))
+            x += attributed.size().width + 12
         }
     }
 
@@ -287,7 +487,7 @@ final class DailyUsageChartView: NSView {
         if tooltip.isShown {
             // 已显示时跟随柱子即时更新文字和位置，不再等待延迟
             tooltip.present(
-                text: tooltipText(for: index),
+                lines: tooltipLines(for: index),
                 anchor: screenAnchor(for: index),
                 hostWindow: window
             )
@@ -297,7 +497,7 @@ final class DailyUsageChartView: NSView {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.window?.isVisible == true else { return }
             self.tooltip.present(
-                text: self.tooltipText(for: index),
+                lines: self.tooltipLines(for: index),
                 anchor: self.screenAnchor(for: index),
                 hostWindow: self.window
             )
@@ -319,14 +519,28 @@ final class DailyUsageChartView: NSView {
         return barLayout.index(at: location.x - rect.minX)
     }
 
-    /// 悬停浮层上显示的明细文案。
-    func tooltipText(for index: Int) -> String {
+    /// 悬停明细的分行规则：≤2 段保持单行；超过 2 段时日期单独一行、数值合并第二行。
+    func tooltipLines(for index: Int) -> [String] {
         let day = days[index]
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.dateFormat = "M月d日"
-        let suffix = Calendar.current.isDateInToday(day.date) ? "（今天）" : ""
-        return "\(formatter.string(from: day.date))\(suffix) · \(PanelTheme.formatTokenCount(day.tokens)) tokens"
+        let date = formatter.string(from: day.date)
+            + (Calendar.current.isDateInToday(day.date) ? "（今天）" : "")
+        guard showsStackedBars, let channel = channelTokensByDay?[day.date] else {
+            return ["\(date) · \(PanelTheme.formatTokenCount(day.tokens)) tokens"]
+        }
+        // 两段不重叠：总计 = 套餐（全设备）+ 本机非套餐渠道。
+        let thirdParty = max(day.tokens - channel, 0)
+        return [
+            date,
+            "套餐 \(PanelTheme.formatTokenCount(channel)) · 第三方 \(PanelTheme.formatTokenCount(thirdParty)) · 总计 \(PanelTheme.formatTokenCount(day.tokens))",
+        ]
+    }
+
+    /// 单行形式（tooltipLines 以 " · " 连接），供测试断言。
+    func tooltipText(for index: Int) -> String {
+        tooltipLines(for: index).joined(separator: " · ")
     }
 
     /// 提示浮层的锚点：悬停柱子的顶部中心，换算到屏幕坐标。
@@ -343,15 +557,20 @@ final class DailyUsageChartView: NSView {
 // MARK: - 悬停浮层
 
 /// 轻量提示窗口：不抢焦点、不拦截鼠标，层级高于 popover，悬停即时出现。
-private final class ChartTooltipWindow {
+/// 主行 + 可选尾注行（配速图标注估算口径）。
+final class ChartTooltipWindow {
     private let panel: NSPanel
     private let label: NSTextField
+    private let detailLabel = NSTextField(labelWithString: "")
     private(set) var isShown = false
 
     init() {
         label = NSTextField(labelWithString: "")
         label.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         label.textColor = .white
+
+        detailLabel.font = NSFont.systemFont(ofSize: 8.5, weight: .medium)
+        detailLabel.textColor = PanelTheme.secondaryText
 
         let container = NSView()
         container.wantsLayer = true
@@ -361,6 +580,7 @@ private final class ChartTooltipWindow {
         container.layer?.borderWidth = 1
         container.layer?.borderColor = NSColor.white.withAlphaComponent(0.08).cgColor
         container.addSubview(label)
+        container.addSubview(detailLabel)
 
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 100, height: 24),
@@ -378,20 +598,46 @@ private final class ChartTooltipWindow {
         panel.contentView = container
     }
 
-    func present(text: String, anchor: NSPoint, hostWindow: NSWindow?) {
-        label.stringValue = text
+    func present(text: String, detail: String? = nil, anchor: NSPoint, hostWindow: NSWindow?) {
+        present(lines: [text], detail: detail, anchor: anchor, hostWindow: hostWindow)
+    }
+
+    /// 多行形式：主行逐行排布（日期/数值分行），detail 作为末尾的弱化尾注行。
+    func present(lines: [String], detail: String? = nil, anchor: NSPoint, hostWindow: NSWindow?) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .medium),
+            .foregroundColor: NSColor.white
+        ]
+        let combined = NSMutableAttributedString()
+        for (index, line) in lines.enumerated() {
+            if index > 0 { combined.append(NSAttributedString(string: "\n", attributes: attributes)) }
+            combined.append(NSAttributedString(string: line, attributes: attributes))
+        }
+        label.attributedStringValue = combined
         label.sizeToFit()
+
+        let showsDetail = detail?.isEmpty == false
+        detailLabel.isHidden = !showsDetail
+        if let detail {
+            detailLabel.stringValue = detail
+            detailLabel.sizeToFit()
+        }
+
         let textSize = label.bounds.size
+        let detailSize = showsDetail ? detailLabel.bounds.size : .zero
         let size = NSSize(
-            width: ceil(textSize.width) + 16,
-            height: ceil(textSize.height) + 10
+            width: ceil(max(textSize.width, detailSize.width)) + 16,
+            height: ceil(textSize.height) + (showsDetail ? ceil(detailSize.height) + 4 : 0) + 10
         )
         label.frame = NSRect(
             x: 8,
-            y: (size.height - textSize.height) / 2,
+            y: size.height - 5 - textSize.height,
             width: textSize.width,
             height: textSize.height
         )
+        if showsDetail {
+            detailLabel.frame = NSRect(x: 8, y: 5, width: detailSize.width, height: detailSize.height)
+        }
 
         // 始终盖在宿主窗口（NSPopover）之上
         panel.level = NSWindow.Level(rawValue: (hostWindow?.level.rawValue ?? NSWindow.Level.normal.rawValue) + 1)

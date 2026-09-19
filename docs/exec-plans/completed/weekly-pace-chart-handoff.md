@@ -9,11 +9,12 @@
   - 关注两处：弹窗 **Z.AI 区块的"近 30 天用量"叠加柱状图**（含「总量/叠加」切换与图例行）；**页面底部 `.draft` 卡片**（配速图设计稿，编号图例标注语义）
 - 执行仓库：本仓库（LocalQuotaBar，SwiftPM macOS AppKit 应用，macOS 13+，Swift 5.9）；`Tests/LocalQuotaBarTests/` 测试目标已存在（`Package.swift` 已注册）
 
-## 交付物 A：周限额配速图（新视图）
+## 交付物 A：周限额配速图（新视图，独立可复用组件）
 
 一句话：在有周限额的 provider 卡片内新增一张燃尽式点位图——对角线是理想剩余配速（左上 100% → 右下 0%），每天一个评估点位，点在线下＝用多了（红），线上＝配速内（绿）。
 
-- 挂载：`ProviderPanelSection` 内 `resetCards` 与 `usageChart`（30 天图）之间，默认 hidden。
+- **接入范围**：Codex 周窗与 Z.AI coding-plan 周限**都要接入**；**首个真机验证对象是 Codex**（当前账号有周限额，落地后即可直接测试），Z.AI coding-plan 随后验证。
+- 挂载：`ProviderPanelSection` 内 `resetCards` 与 `usageChart`（30 天图）之间，默认 hidden（Codex 与 Z.AI 两个实例各自挂一份，复用同一视图类）。
 - **坐标**：Y 轴 0–100%（100 顶、0 底）；X 轴 = **周限窗口实际覆盖的自然日**（W0 所在日 → 窗口结束日；W0 非零点时首尾为部分天格共 8 格，恰在零点 7 格），**不是固定的日历周一~周日**。
 - **对角线**：`line(t) = 100% × (1 − (t − W0) / 窗口时长)`，按真实时间戳定位（起点 x = W0 在首日格内的位置）；已过段实线（白 0.45 alpha、1.25pt），今天之后到窗口结束为虚线。线不依赖估算值。
 - **每日点位**：`100 × (1 − cum(k) / E)`（cum = W0 起周期内累计 tokens；E = 周预算估算值），3pt 圆点，相邻点 1pt 折线相连（alpha 0.25）。`cum > E` 时点 clamp 在 0%，tooltip 显示真实负值。
@@ -65,11 +66,21 @@
    - 持久化 UserDefaults，**按渠道 + 账号邮箱分桶**（邮箱来自 `loadAccount()`），账号/套餐/渠道切换自然失效。
    - 所有由 E 推出的展示值一律带 `≈`；对角线与今日点不依赖 E。
 
+## 组件封装与复用原则（用户明确要求：独立组件，后续其它可共用）
+
+- **三层分离，视图零业务耦合**：
+  1. `WeeklyPaceChartView`（绘制）：输入只有 `WeeklyPaceSnapshot` 值类型 + 主题色，**不 import / 不依赖** `QuotaBucket`、`ZAILimit`、渠道解析、SQLite 等任何 provider 专属类型。
+  2. `WeeklyPaceSnapshot` 推导（纯函数）：输入窗口锚点/窗口时长、周期内每日累计、E、服务端剩余百分比，输出点位坐标、颜色语义、tooltip 数据；同样不依赖业务类型。
+  3. `WeeklyPaceEstimator`（纯逻辑）：估算与持久化规则，与数据源无关。
+- **provider 适配放在接线层**（`main.swift` / `ProviderPanelSections` 调用处）：把 `QuotaBucket`（Codex）或 `ZAILimit`（Z.AI）映射成快照输入——窗口锚点、数据源选择（app-server 日桶 vs zcode SQLite）、渠道过滤、估算器实例各自在适配处完成。后续新配额源（如月限窗口、其它 provider）接入时**只新增适配映射，不改动视图与推导层**。
+- 快照模型字段用通用命名（`windowStart` / `windowDuration` / `dailyCumulativeTokens` / `budgetEstimateTokens` / `currentRemainingPercent`），避免 zai/codex 字样进入组件层。
+- `DailyUsageChartView` 的叠加模式改造同样遵守此原则：拆分数据 `(total, codingPlan)` 经 configure 参数传入，视图不感知渠道解析。
+
 ## 文件清单
 
 新建：
 
-- `Sources/LocalQuotaBar/ui/WeeklyPaceChartView.swift` — 视图 + `WeeklyPaceSnapshot` 纯函数推导（`make(...)` 输入窗口锚点/周期内每日累计/E/usedPercent，输出每个点位的 x、y、颜色、tooltip 数据；view 只管画）。
+- `Sources/LocalQuotaBar/ui/WeeklyPaceChartView.swift` — 视图 + `WeeklyPaceSnapshot` 纯函数推导（`make(...)` 输入窗口锚点/周期内每日累计/E/usedPercent，输出每个点位的 x、y、颜色、tooltip 数据；view 只管画）。**独立组件**：不依赖 provider 业务类型（见"组件封装与复用原则"）。
 - `Sources/LocalQuotaBar/WeeklyPaceEstimator.swift` — 估算器（建议放根目录，与 `RefreshSettings.swift` 同级先例；实现者可与推导层合并到同一文件，保持纯逻辑可单测即可）。
 - `Tests/LocalQuotaBarTests/WeeklyPaceChartTests.swift` — 单测（见下）。
 
@@ -92,7 +103,7 @@
 ## 验证方式
 
 - 命令：`swift build`；`swift test --filter WeeklyPaceChart`。
-- 手工：Codex 周窗与 Z.AI coding-plan 周窗的真机查看（对角线两端锚定真实时刻；今日点与周限格剩余百分比一致；点位随刷新更新；tooltip 明细；叠加/总量切换与持久化）。
+- 手工：**先 Codex（当前账号有周限额，可直接测试）**——对角线两端锚定真实时刻、今日点与周限格剩余百分比一致、点位随刷新更新、tooltip 明细；再 Z.AI coding-plan 周窗同样检查；最后叠加/总量切换与持久化。
 - 观测：apiKey 模式不显示配速图；新账号 `usedPercent < 5%` 只显示线 + 今日点；Z.AI coding-plan 窗口聚合 ≤ 全渠道 30 天日桶对应日之和（第三方用量大的日子差值明显）。
 - 设备项：按 AGENTS.md 记录 Touch Bar / 刘海屏实际验证情况。
 
@@ -108,8 +119,8 @@
 
 1. 通读本文件 + [weekly-pace-chart.md](weekly-pace-chart.md)（重点"背景"的调研结论与"决策记录"）；打开原型 index.html 对照两处设计。
 2. `ZCodeUsageDB` 三个查询 → `WeeklyPaceSnapshot` 推导与 `WeeklyPaceEstimator` → 单测（先红后绿）。
-3. `WeeklyPaceChartView` 绘制 → `DailyUsageChartView` 叠加模式与切换 → `ProviderPanelSections` 挂载 → `main.swift` 接线。
-4. `swift build` + `swift test`；按"验证方式"真机检查。
+3. `WeeklyPaceChartView` 绘制 → `DailyUsageChartView` 叠加模式与切换 → `ProviderPanelSections` 挂载 → `main.swift` 接线（**先接 Codex**：当前账号有周限额，接线完成即可真机验证配速图；Z.AI 随后）。
+4. `swift build` + `swift test`；按"验证方式"真机检查（Codex 优先）。
 5. 收尾：按 `docs/histories/` 规范写历史记录（`git diff --shortstat` / `--numstat`）；技术债登记到 `docs/exec-plans/tech-debt-tracker.md`（Z.AI 估算口径、月限窗口放开）；计划文档状态更新并移入 `completed/`；提交信息用 `feat(quota): ...` 风格、单一目的。
 
 ## 已定决策摘要（详见计划"决策记录"）
@@ -118,5 +129,7 @@
 - 横轴跟随周限窗口，非固定周一~周日。
 - 预算是持续修正的估算值（EMA + 5% 门槛 + 新窗口重置），展示带 `≈`；今日点锚定服务端真实百分比。
 - Z.AI 配速图用量只统计当前渠道 coding-plan（动态解析 provider_id）；30 天图总量仍为全渠道。
+- 组件独立封装：视图/推导/估算器三层不耦合 provider 业务类型，适配在接线层；Codex 与 Z.AI 共用同一视图（2026-09-16 用户确认）。
+- Codex 首先接入并作为首个真机验证对象（当前账号有周限额可测）。
 - 超配速点红色；叠加图"其他渠道"段橙色（紫→青→橙三轮定稿，2026-09-16）。
 - 原型演示数据中"今天"柱其他渠道占比人为放大，仅为展示高亮橙帽，非真实数据口径。

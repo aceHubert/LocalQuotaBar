@@ -1123,6 +1123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var codexUsageStore = CodexUsageStore(client: CodexUsageClient())
     /// Z.AI 本机日用量（zcode SQLite 聚合），额度刷新后重查。
     private let zaiUsageStore = ZAIUsageStore()
+    /// Z.AI 套餐用量的服务端口径（model-usage 增量缓存），挂在额度刷新成功后同步。
+    private let zaiServerUsageStore = ZAIServerUsageStore()
     private var accountOptions: [CodexAuthAccount] = []
     private var selectedAccountId: String?
 
@@ -1223,6 +1225,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // 本机 SQLite 快查：日用量独立于余额模式，API Key 模式也正常读取。
             self.zaiUsageStore.refresh()
+            // 额度刷新到达后重算配速图（窗口锚点可能已变）
+            self.refreshZAIPaceChart()
         }
         quotaViewController.applyZAI(
             snapshot: zaiStore.snapshot,
@@ -1230,6 +1234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             isRefreshing: zaiStore.isRefreshing,
             error: zaiStore.lastError
         )
+        refreshZAIPaceChart()
 
         store.onChange = { [weak self] snapshot, isRefreshing, error in
             guard let self else { return }
@@ -1256,6 +1261,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             self.quotaViewController.setUnmuteButtonVisible(self.reminderCenter.canRestore)
             self.updateCodexResetActions()
+            // 额度刷新到达后重算配速图（周限桶与窗口锚点可能已变）
+            self.refreshCodexPaceChart()
         }
         store.start()
         zaiStore.start()
@@ -1263,13 +1270,139 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 日用量图表：先回放缓存，再接变更回调并启动官方用量拉取
         quotaViewController.applyCodexUsage(codexUsageStore.snapshot?.last30Days)
         codexUsageStore.onChange = { [weak self] snapshot in
-            self?.quotaViewController.applyCodexUsage(snapshot?.last30Days)
+            guard let self else { return }
+            self.quotaViewController.applyCodexUsage(snapshot?.last30Days)
+            // 用量刷新同样触发配速图重算（历史点位依赖日桶）
+            self.refreshCodexPaceChart()
         }
         codexUsageStore.start()
-        zaiUsageStore.onChange = { [weak self] days in
-            self?.quotaViewController.applyZAIUsage(days)
+        zaiUsageStore.onChange = { [weak self] _, _ in
+            self?.recomputeZAIUsage()
+        }
+        zaiUsageStore.onPaceChange = { [weak self] daily, total in
+            self?.finishZAIPaceChart(daily: daily, total: total)
         }
         zaiUsageStore.refresh()
+        // 套餐用量服务端同步：额度刷新成功后带着已捕获凭证增量拉取，缓存更新后重组图表。
+        zaiStore.onUsageSyncContext = { [weak self] context in
+            self?.zaiServerUsageStore.sync(context: context)
+        }
+        zaiServerUsageStore.onChange = { [weak self] _ in
+            self?.recomputeZAIUsage()
+            self?.refreshZAIPaceChart()
+        }
+        // 启动回放当前账号的服务端用量缓存：首次网络同步到达前图表先有昨日读数。
+        if let selection = ZAISettings.resolveProviderSelection(), selection.kind == .codingPlan {
+            zaiServerUsageStore.preload(bucket: ZAIUsageSyncContext.bucket(
+                domain: selection.domain,
+                email: ZAISettings.loadAccount()?.email,
+                teamContext: selection.teamContext
+            ))
+        }
+    }
+
+    // MARK: - Z.AI 用量组合（服务端套餐 + 本机非套餐，不双计）
+
+    /// coding-plan 模式：总量 = 服务端套餐日桶（账号维度、全设备，已含本机套餐
+    /// 部分）+ 本机非套餐渠道日桶；叠加高亮 = 服务端套餐。其余模式仅本机全渠道。
+    /// 服务端缓存未建立时展示空图，不回落全渠道。
+    private func recomputeZAIUsage() {
+        guard let selection = ZAISettings.resolveProviderSelection() else { return }
+        guard selection.kind == .codingPlan else {
+            quotaViewController.applyZAIUsage(zaiUsageStore.days, channelDays: nil)
+            return
+        }
+        guard let serverDays = zaiServerUsageStore.last30DayUsage() else {
+            quotaViewController.applyZAIUsage(nil, channelDays: nil)
+            return
+        }
+        let thirdPartyByDay = Dictionary(
+            (zaiUsageStore.thirdPartyDays ?? []).map { (ZAIServerUsageCacheLogic.dayKey($0.date), $0.tokens) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let combined = serverDays.map { day -> DayUsage in
+            let key = ZAIServerUsageCacheLogic.dayKey(day.date)
+            return DayUsage(date: day.date, tokens: day.tokens + (thirdPartyByDay[key] ?? 0))
+        }
+        quotaViewController.applyZAIUsage(combined, channelDays: serverDays)
+    }
+
+    // MARK: - 周配速图接线（额度刷新与用量刷新任一到达都重算）
+
+    /// Z.AI 配速窗口参数（refreshZAIPaceChart 记录，估算器重算时使用）。
+    private var zaiPaceWindow: (start: Date, end: Date, bucket: String)?
+
+    /// Codex：周限桶 + 官方日桶（首日折算）→ 估算器 → 配速图快照。
+    /// 月限窗口（Codex free）不启用：仅 7±1 天的周限窗按周配速展示。
+    private func refreshCodexPaceChart() {
+        guard let bucket = store.snapshot?.weekly,
+              let resetsAt = bucket.resetsAt,
+              // 与 QuotaBucket.displayTitles 同一判定：|mins − 7天| ≤ 1 天才算周限窗
+              abs(bucket.windowDurationMins - 7 * 24 * 60) <= 24 * 60 else {
+            quotaViewController.applyCodexPace(nil)
+            return
+        }
+
+        let windowStart = resetsAt.addingTimeInterval(TimeInterval(-bucket.windowDurationMins * 60))
+        let naturalDays = codexUsageStore.snapshot?.last30Days ?? []
+        let daily = WeeklyPaceCodexBridge.windowDailyUsage(
+            naturalDays: naturalDays, windowStart: windowStart, now: Date()
+        )
+        let windowTokens = daily.reduce(0) { $0 + $1.tokens }
+        // E 持久化按渠道 + 账号分桶：Codex 用当前账号 ID
+        let estimator = WeeklyPaceEstimator(bucket: "codex|\(selectedAccountId ?? "default")")
+        let budget = estimator.update(windowEnd: resetsAt, windowTokens: windowTokens, usedPercent: bucket.usedPercent)
+        let snapshot = WeeklyPaceSnapshot.make(
+            windowStart: windowStart,
+            windowEnd: resetsAt,
+            now: Date(),
+            dailyUsage: daily,
+            budgetEstimate: budget,
+            usedPercent: bucket.usedPercent
+        )
+        quotaViewController.applyCodexPace(snapshot)
+    }
+
+    /// Z.AI：coding-plan 周限桶 → 窗口锚点 → 服务端 hourly 缓存切窗（同步读取，
+    /// 缓存由 ZAIServerUsageStore 在额度刷新后增量维护）。
+    private func refreshZAIPaceChart() {
+        guard let selection = ZAISettings.resolveProviderSelection(),
+              selection.kind == .codingPlan,
+              let snapshot = zaiStore.snapshot, snapshot.kind == .codingPlan,
+              let limit = snapshot.limits.first(where: { $0.unit == .weekly }),
+              let resetTime = limit.nextResetTime else {
+            zaiPaceWindow = nil
+            quotaViewController.applyZAIPace(nil)
+            return
+        }
+
+        let windowDays = 7 * max(limit.number, 1)
+        let windowStart = resetTime.addingTimeInterval(TimeInterval(-windowDays * 86400))
+        // E 持久化按渠道（domain + 套餐）+ 账号邮箱分桶，不受 CLI 渠道 id 前缀迁移影响
+        let email = zaiStore.account?.email ?? snapshot.email ?? ""
+        zaiPaceWindow = (windowStart, resetTime, "\(selection.domain)-coding-plan|\(email)")
+        let windowUsage = zaiServerUsageStore.windowUsage(windowStart: windowStart)
+        finishZAIPaceChart(daily: windowUsage?.daily, total: windowUsage?.total)
+    }
+
+    /// Z.AI 读库结果回来：估算器重算 E → 配速图快照。
+    private func finishZAIPaceChart(daily: [DayUsage]?, total: Double?) {
+        guard let window = zaiPaceWindow,
+              let snapshot = zaiStore.snapshot, snapshot.kind == .codingPlan,
+              let limit = snapshot.limits.first(where: { $0.unit == .weekly }) else { return }
+        let estimator = WeeklyPaceEstimator(bucket: window.bucket)
+        let budget = estimator.update(
+            windowEnd: window.end, windowTokens: total ?? 0, usedPercent: limit.usedPercent
+        )
+        let pace = WeeklyPaceSnapshot.make(
+            windowStart: window.start,
+            windowEnd: window.end,
+            now: Date(),
+            dailyUsage: daily ?? [],
+            budgetEstimate: budget,
+            usedPercent: limit.usedPercent
+        )
+        quotaViewController.applyZAIPace(pace)
     }
 
     private func codexResetAction(for card: ResetCreditCard) -> ResetCardsRow.ResetAction {
@@ -1319,6 +1452,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
+    /// 重置调用结束后弹出结果提示；失败时展示具体原因，仅有"关闭"一个按钮。
+    private func presentResetResultAlert(success: Bool, failureMessage: String?) {
+        let alert = NSAlert()
+        alert.alertStyle = success ? .informational : .warning
+        alert.messageText = success ? "重置成功" : "重置失败"
+        if !success {
+            alert.informativeText = failureMessage ?? "重置未完成，请重试"
+        }
+        alert.addButton(withTitle: "关闭")
+        alert.runModal()
+    }
+
     private func useCodexResetCredit(_ creditID: String) {
         guard let accountID = selectedAccountId,
               let card = store.snapshot?.resetCreditCards?.first(where: { $0.id == creditID }),
@@ -1332,9 +1477,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.resetRequestInFlight = false
                 self.updateAllResetActions()
             }
-            if await self.codexResetService.use(accountID: accountID, creditID: creditID) {
+            let succeeded = await self.codexResetService.use(accountID: accountID, creditID: creditID)
+            if succeeded {
                 self.store.refreshAfterReset()
             }
+            var failureMessage: String?
+            if !succeeded,
+               case .failed(let message) = self.codexResetService.state(accountID: accountID, creditID: creditID) {
+                failureMessage = message
+            }
+            self.presentResetResultAlert(success: succeeded, failureMessage: failureMessage)
         }
     }
 
@@ -1388,9 +1540,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.resetRequestInFlight = false
                 self.updateAllResetActions()
             }
-            if await self.zaiResetService.use(context: context, kind: kind) {
+            let succeeded = await self.zaiResetService.use(context: context, kind: kind)
+            if succeeded {
                 self.zaiStore.refreshAfterReset()
             }
+            var failureMessage: String?
+            if !succeeded,
+               case .failed(let message) = self.zaiResetService.state(scopeID: context.scopeID, kind: kind) {
+                failureMessage = message
+            }
+            self.presentResetResultAlert(success: succeeded, failureMessage: failureMessage)
         }
     }
 
@@ -1913,8 +2072,18 @@ final class QuotaViewController: NSViewController {
         updatePreferredContentSize()
     }
 
-    func applyZAIUsage(_ days: [DayUsage]?) {
-        zaiSection.applyUsage(days: days)
+    func applyZAIUsage(_ days: [DayUsage]?, channelDays: [DayUsage]? = nil) {
+        zaiSection.applyUsage(days: days, channelDays: channelDays)
+        // 叠加图例行显隐会改变高度
+        updatePreferredContentSize()
+    }
+
+    func applyCodexPace(_ snapshot: WeeklyPaceSnapshot?) {
+        codexSection.applyPace(snapshot)
+    }
+
+    func applyZAIPace(_ snapshot: WeeklyPaceSnapshot?) {
+        zaiSection.applyPace(snapshot)
     }
 
     // MARK: - 布局

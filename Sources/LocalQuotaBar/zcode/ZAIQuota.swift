@@ -22,12 +22,36 @@ struct ZAIProviderSelection: Equatable {
     /// （start-plan / individual-coding-plan / team-coding-plan）。legacy 路径下为 nil。
     /// 团队版判定依赖它：新格式不再写 selectedKey，team 只能从这里认出来。
     let connectionKind: String?
+    /// 团队 Coding Plan 的作用域；个人套餐和 legacy 配置为 nil。
+    let teamContext: ZAITeamContext?
 
-    init(domain: String, kind: ZAIPlanKind, selectedKey: String?, connectionKind: String? = nil) {
+    init(domain: String, kind: ZAIPlanKind, selectedKey: String?, connectionKind: String? = nil,
+         teamContext: ZAITeamContext? = nil) {
         self.domain = domain
         self.kind = kind
         self.selectedKey = selectedKey
         self.connectionKind = connectionKind
+        self.teamContext = teamContext
+    }
+}
+
+/// Team Coding Plan 请求所需的服务端作用域。
+struct ZAITeamContext: Equatable, Codable {
+    let productId: String?
+    let organizationId: String
+    let projectId: String
+}
+
+/// 官方 MCP 聚合额度；它与 Coding Plan 的 5 小时/周限额不是同一口径。
+struct ZAIMCPUsage: Equatable, Codable {
+    let used: Double
+    let limit: Double
+    let remaining: Double
+    let nextRefreshAt: Date?
+
+    var remainingPercent: Double {
+        guard limit > 0 else { return 0 }
+        return max(0, min(100, remaining / limit * 100))
     }
 }
 
@@ -46,16 +70,8 @@ extension ZAIPlanKind {
 struct ZAILimit: Equatable, Codable {
     enum WindowUnit: Int, Codable {
         case hourly = 3
-        case weekly = 4
+        case weekly = 6
         case unknown = -1
-
-        init?(rawValue: Int) {
-            switch rawValue {
-            case 3: self = .hourly
-            case 4: self = .weekly
-            default: self = .unknown
-            }
-        }
     }
 
     let unit: WindowUnit
@@ -158,6 +174,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
     let planEndAt: Date?
     /// start-plan 权益项（plans[].entitlements[]）；生效前 balances 为空、用它展示待生效额度。
     let pendingEntitlements: [ZAIPendingEntitlement]
+    let mcpUsage: ZAIMCPUsage?
 
     init(kind: ZAIPlanKind? = nil,
          limits: [ZAILimit] = [],
@@ -172,7 +189,8 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
          planStatus: String? = nil,
          planStartAt: Date? = nil,
          planEndAt: Date? = nil,
-         pendingEntitlements: [ZAIPendingEntitlement] = []) {
+         pendingEntitlements: [ZAIPendingEntitlement] = [],
+         mcpUsage: ZAIMCPUsage? = nil) {
         self.kind = kind
         self.limits = limits
         self.balances = balances
@@ -187,6 +205,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         self.planStartAt = planStartAt
         self.planEndAt = planEndAt
         self.pendingEntitlements = pendingEntitlements
+        self.mcpUsage = mcpUsage
     }
 
     /// 新增字段用 decodeIfPresent，保证 UserDefaults 里的旧缓存仍能解码。
@@ -206,6 +225,7 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         planStartAt = try container.decodeIfPresent(Date.self, forKey: .planStartAt)
         planEndAt = try container.decodeIfPresent(Date.self, forKey: .planEndAt)
         pendingEntitlements = try container.decodeIfPresent([ZAIPendingEntitlement].self, forKey: .pendingEntitlements) ?? []
+        mcpUsage = try container.decodeIfPresent(ZAIMCPUsage.self, forKey: .mcpUsage)
     }
 }
 
@@ -265,8 +285,10 @@ enum ZAISettings {
 
         if let connectionKind = connectionSelectionKind(object: object, domain: domain),
            let kind = ZAIPlanKind(connectionKind: connectionKind) {
+            let teamContext = teamContext(object: object, domain: domain, connectionKind: connectionKind)
             return ZAIProviderSelection(domain: domain, kind: kind,
-                                        selectedKey: selectedKey, connectionKind: connectionKind)
+                                        selectedKey: selectedKey, connectionKind: connectionKind,
+                                        teamContext: teamContext)
         }
 
         let kind: ZAIPlanKind
@@ -294,6 +316,23 @@ enum ZAISettings {
         else { return nil }
         guard let kind = entry["kind"] as? String, !kind.isEmpty else { return nil }
         return kind
+    }
+
+    private static func teamContext(object: [String: Any], domain: String,
+                                    connectionKind: String) -> ZAITeamContext? {
+        guard connectionKind == "team-coding-plan",
+              let selections = object["providerFamilyConnectionSelections"] as? [String: Any],
+              let entry = selections[domain] as? [String: Any],
+              let organizationId = nonEmptyString(entry["organizationId"]),
+              let projectId = nonEmptyString(entry["projectId"]) else { return nil }
+        return ZAITeamContext(productId: nonEmptyString(entry["productId"]),
+                              organizationId: organizationId, projectId: projectId)
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        guard let value = value as? String else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private static func fallbackKind(object: [String: Any], domain: String) -> ZAIPlanKind {
@@ -488,12 +527,67 @@ enum ZAIQuotaEndpoint {
         URL(string: domain == "bigmodel" ? "https://open.bigmodel.cn" : "https://api.z.ai")!
     }
 
-    static func makeCodingPlanRequest(token: String, domain: String) -> URLRequest {
-        var request = URLRequest(url: codingPlanBaseURL(domain: domain)
-            .appendingPathComponent("api/monitor/usage/quota/limit"))
+    static func makeCodingPlanRequest(token: String, domain: String,
+                                      teamContext: ZAITeamContext? = nil,
+                                      authorization: String? = nil) -> URLRequest {
+        var components = URLComponents(url: codingPlanBaseURL(domain: domain)
+            .appendingPathComponent("api/monitor/usage/quota/limit"), resolvingAgainstBaseURL: false)!
+        if teamContext != nil { components.queryItems = [URLQueryItem(name: "type", value: "2")] }
+        var request = URLRequest(url: components.url!)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue(authorization ?? "Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let teamContext {
+            request.setValue(teamContext.organizationId, forHTTPHeaderField: "bigmodel-organization")
+            request.setValue(teamContext.projectId, forHTTPHeaderField: "bigmodel-project")
+        }
+        request.timeoutInterval = 15
+        return request
+    }
+
+    static func makeMCPUsageRequest(jwt: String, oauthToken: String,
+                                    teamContext: ZAITeamContext?) -> URLRequest {
+        var request = URLRequest(url: URL(string: "https://zcode.z.ai/api/v1/mcp/usage")!)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(oauthToken)", forHTTPHeaderField: "X-Bigmodel-Authorization")
+        request.setValue(teamContext == nil ? "PERSONAL" : "TEAM", forHTTPHeaderField: "Bigmodel-Target-Type")
+        if let teamContext {
+            request.setValue(teamContext.organizationId, forHTTPHeaderField: "Bigmodel-Organization")
+            request.setValue(teamContext.projectId, forHTTPHeaderField: "Bigmodel-Project")
+        }
+        request.timeoutInterval = 15
+        return request
+    }
+
+    static func makeTeamCustomerInfoRequest(oauthToken: String, domain: String) -> URLRequest {
+        var request = URLRequest(url: codingPlanBaseURL(domain: domain)
+            .appendingPathComponent("api/biz/customer/getCustomerInfo"))
+        request.httpMethod = "GET"
+        request.setValue(oauthToken, forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 15
+        return request
+    }
+
+    static func makeTeamAPIKeysRequest(oauthToken: String, domain: String,
+                                       teamContext: ZAITeamContext, apiKey: String? = nil) -> URLRequest {
+        var url = codingPlanBaseURL(domain: domain)
+            .appendingPathComponent("api/biz/v1/organization")
+            .appendingPathComponent(teamContext.organizationId)
+            .appendingPathComponent("projects")
+            .appendingPathComponent(teamContext.projectId)
+            .appendingPathComponent("api_keys")
+        if let apiKey {
+            url.appendPathComponent("copy")
+            url.appendPathComponent(apiKey)
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(oauthToken, forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(teamContext.organizationId, forHTTPHeaderField: "bigmodel-organization")
+        request.setValue(teamContext.projectId, forHTTPHeaderField: "bigmodel-project")
         request.timeoutInterval = 15
         return request
     }
@@ -526,13 +620,18 @@ enum ZAIQuotaEndpoint {
 
     /// coding-plan 重置额度状态。z.ai / bigmodel 两渠道共用 zcode.z.ai，
     /// 靠 X-Bigmodel-Authorization 里的 OAuth token 区分账号体系。
-    static func makeCodingPlanResetStatusRequest(jwt: String, oauthToken: String) -> URLRequest {
+    static func makeCodingPlanResetStatusRequest(jwt: String, oauthToken: String,
+                                                 teamContext: ZAITeamContext? = nil) -> URLRequest {
         var request = URLRequest(url: URL(string: "https://zcode.z.ai/api/v1/coding-plan/reset/status")!)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(jwt)", forHTTPHeaderField: "Authorization")
-        request.setValue(oauthToken, forHTTPHeaderField: "X-Bigmodel-Authorization")
-        request.setValue("PERSONAL", forHTTPHeaderField: "Bigmodel-Target-Type")
+        request.setValue("Bearer \(oauthToken)", forHTTPHeaderField: "X-Bigmodel-Authorization")
+        request.setValue(teamContext == nil ? "PERSONAL" : "TEAM", forHTTPHeaderField: "Bigmodel-Target-Type")
+        if let teamContext {
+            request.setValue(teamContext.organizationId, forHTTPHeaderField: "Bigmodel-Organization")
+            request.setValue(teamContext.projectId, forHTTPHeaderField: "Bigmodel-Project")
+        }
         request.timeoutInterval = 15
         return request
     }
@@ -557,6 +656,10 @@ final class ZAIQuotaStore {
     private var timer: Timer?
 
     var onChange: ((ZAIQuotaSnapshot?, ZAIAccount?, Bool, String?) -> Void)?
+    /// coding-plan 额度刷新成功后触发，携带发起时刻捕获的凭证与作用域；
+    /// ZAIServerUsageStore 挂此回调做 model-usage 增量同步，复用同一凭证。
+    var onUsageSyncContext: ((ZAIUsageSyncContext) -> Void)?
+    private var pendingUsageSyncContext: ZAIUsageSyncContext?
 
     init() {
         let configuration = URLSessionConfiguration.ephemeral
@@ -618,6 +721,7 @@ final class ZAIQuotaStore {
         isRefreshing = true
         lastRefreshStartedAt = Date()
         lastResetScopeID = nil
+        pendingUsageSyncContext = nil
         account = ZAISettings.loadAccount()
         onChange?(snapshot, account, true, lastError)
 
@@ -628,6 +732,9 @@ final class ZAIQuotaStore {
                 account = ZAIAccount(email: next.email ?? account?.email)
                 lastError = nil
                 ZAIQuotaCache.save(next)
+                if let usageContext = pendingUsageSyncContext {
+                    onUsageSyncContext?(usageContext)
+                }
             } catch {
                 lastError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
@@ -815,7 +922,7 @@ final class ZAIQuotaStore {
         return lastPayload
     }
 
-    /// 个人付费 Coding Plan：GET api/monitor/usage/quota/limit（Bearer OAuth token）。
+    /// Coding Plan 额度。个人使用 OAuth；团队使用项目 API Key/Secret 与 type=2。
     private func fetchCodingPlanSnapshot(selection: ZAIProviderSelection) async throws -> ZAIQuotaSnapshot {
         let (token, userInfo) = try ZAISettings.loadCredentials(domain: selection.domain)
         // 身份标识和两个查询都使用同一组已捕获凭证，不能在 await 后重读切换中的账号。
@@ -825,7 +932,24 @@ final class ZAIQuotaStore {
                 selection: selection, jwt: resetJWT, oauthToken: token, userInfo: userInfo
             ).scopeID
         }
-        let request = ZAIQuotaEndpoint.makeCodingPlanRequest(token: token, domain: selection.domain)
+        let teamContext = selection.teamContext
+        if selection.connectionKind == "team-coding-plan" && teamContext == nil {
+            throw ZAIQuotaError.requestFailed("团队套餐缺少 organizationId 或 projectId")
+        }
+        let projectAuthorization: String?
+        if let teamContext {
+            projectAuthorization = try await fetchTeamProjectAuthorization(
+                selection: selection, token: token, context: teamContext
+            )
+        } else {
+            projectAuthorization = nil
+        }
+        let request = ZAIQuotaEndpoint.makeCodingPlanRequest(
+            token: token,
+            domain: selection.domain,
+            teamContext: teamContext,
+            authorization: projectAuthorization
+        )
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
@@ -842,30 +966,9 @@ final class ZAIQuotaStore {
         else { throw ZAIQuotaError.malformedResponse }
 
         let rawLimits = (dataPayload["limits"] as? [[String: Any]]) ?? []
-        // 仅保留 TOKENS_LIMIT，过滤工具配额 TIME_LIMIT。
-        let limits: [ZAILimit] = rawLimits.compactMap { limit in
-            guard (limit["type"] as? String) == "TOKENS_LIMIT" else { return nil }
-            guard let unitRaw = limit["unit"] as? Int,
-                  let unit = ZAILimit.WindowUnit(rawValue: unitRaw),
-                  unit != .unknown
-            else { return nil }
-            let usedPercent: Double
-            if let pct = limit["percentage"] as? Double {
-                usedPercent = pct
-            } else if let pct = limit["percentage"] as? Int {
-                usedPercent = Double(pct)
-            } else {
-                usedPercent = 0
-            }
-            let resetTime = (limit["nextResetTime"] as? Double).map { Date(timeIntervalSince1970: $0 / 1000) }
-                ?? (limit["nextResetTime"] as? Int).map { Date(timeIntervalSince1970: Double($0) / 1000) }
-            return ZAILimit(
-                unit: unit,
-                number: (limit["number"] as? NSNumber)?.intValue ?? 1,
-                usedPercent: usedPercent,
-                nextResetTime: resetTime
-            )
-        }.sorted { $0.unit.rawValue < $1.unit.rawValue }
+        // 账号版本不同会返回 TOKENS_LIMIT / TIME_LIMIT / CREDIT_LIMIT；
+        // 统一按窗口 unit 归一化，避免旧 Token 口径漏掉 v3 积分口径。
+        let limits = Self.parseCodingPlanLimits(rawLimits)
 
         let level = dataPayload["level"] as? String
         let email = userInfo?["email"] as? String
@@ -873,24 +976,164 @@ final class ZAIQuotaStore {
         // 重置额度是增量信息：单独容错，失败不影响主额度展示。
         let resetCreditCards: [ZAIResetCreditCard]?
         if let resetJWT {
-            resetCreditCards = try? await fetchResetCreditCards(jwt: resetJWT, oauthToken: token)
+            resetCreditCards = try? await fetchResetCreditCards(
+                jwt: resetJWT, oauthToken: token, teamContext: teamContext
+            )
         } else {
             resetCreditCards = nil
         }
+
+        let mcpUsage: ZAIMCPUsage?
+        if let resetJWT {
+            mcpUsage = try? await fetchMCPUsage(jwt: resetJWT, oauthToken: token, teamContext: teamContext)
+        } else {
+            mcpUsage = nil
+        }
+
+        // 用量同步上下文：与额度查询同一组已捕获凭证（团队含项目 Key/Secret），
+        // ZAIServerUsageStore 复用它请求 model-usage，避免重复换取项目 Key。
+        pendingUsageSyncContext = ZAIUsageSyncContext(
+            domain: selection.domain,
+            email: email,
+            teamContext: teamContext,
+            authorization: projectAuthorization ?? "Bearer \(token)"
+        )
 
         return ZAIQuotaSnapshot(
             kind: .codingPlan,
             limits: limits,
             resetCreditCards: resetCreditCards,
             level: level,
-            email: email
+            email: email,
+            mcpUsage: mcpUsage
         )
+    }
+
+    nonisolated static func parseCodingPlanLimits(_ rawLimits: [[String: Any]]) -> [ZAILimit] {
+        rawLimits.compactMap { limit in
+            let number = (limit["number"] as? NSNumber)?.intValue ?? 1
+            let unit: ZAILimit.WindowUnit
+            if let unitRaw = Self.limitUnitRawValue(limit["unit"]),
+               let parsed = ZAILimit.WindowUnit(rawValue: unitRaw), parsed != .unknown {
+                unit = parsed
+            } else if let unitName = (limit["unit"] as? String)?.uppercased() {
+                switch unitName {
+                case "HOUR", "HOURLY", "5H", "5_HOUR", "5_HOURS": unit = .hourly
+                case "WEEK", "WEEKLY", "1W", "1_WEEK", "1_WEEKLY": unit = .weekly
+                default: return nil
+                }
+            } else {
+                return nil
+            }
+            let usedPercent: Double
+            if let percentage = (limit["percentage"] as? NSNumber)?.doubleValue {
+                usedPercent = percentage
+            } else if let current = (limit["currentValue"] as? NSNumber)?.doubleValue,
+                      let remaining = (limit["remaining"] as? NSNumber)?.doubleValue {
+                let total = current + remaining
+                usedPercent = total > 0 ? current / total * 100 : 0
+            } else {
+                usedPercent = 0
+            }
+            let resetTime = (limit["nextResetTime"] as? NSNumber).map {
+                Date(timeIntervalSince1970: $0.doubleValue / 1000)
+            }
+            return ZAILimit(
+                unit: unit,
+                number: number,
+                usedPercent: usedPercent,
+                nextResetTime: resetTime
+            )
+        }.sorted { $0.unit.rawValue < $1.unit.rawValue }
+    }
+
+    private nonisolated static func limitUnitRawValue(_ value: Any?) -> Int? {
+        if let number = value as? NSNumber { return number.intValue }
+        if let string = value as? String { return Int(string.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        return nil
+    }
+
+    private func fetchTeamProjectAuthorization(selection: ZAIProviderSelection,
+                                               token: String,
+                                               context: ZAITeamContext) async throws -> String {
+        let customerRequest = ZAIQuotaEndpoint.makeTeamCustomerInfoRequest(
+            oauthToken: token, domain: selection.domain
+        )
+        let (customerData, customerResponse) = try await session.data(for: customerRequest)
+        guard let customerHTTP = customerResponse as? HTTPURLResponse,
+              customerHTTP.statusCode == 200,
+              let customer = try? JSONSerialization.jsonObject(with: customerData) as? [String: Any]
+        else { throw ZAIQuotaError.requestFailed("团队项目身份校验失败") }
+
+        let organizations = ((customer["data"] as? [String: Any])?["organizations"] as? [[String: Any]])
+            ?? (customer["organizations"] as? [[String: Any]]) ?? []
+        let projectExists = organizations.contains { organization in
+            guard (organization["organizationId"] as? String) == context.organizationId else { return false }
+            return ((organization["projects"] as? [[String: Any]]) ?? []).contains {
+                ($0["projectId"] as? String) == context.projectId
+            }
+        }
+        guard projectExists else { throw ZAIQuotaError.requestFailed("团队项目不存在或无权限") }
+
+        let listRequest = ZAIQuotaEndpoint.makeTeamAPIKeysRequest(
+            oauthToken: token, domain: selection.domain, teamContext: context
+        )
+        let (listData, listResponse) = try await session.data(for: listRequest)
+        guard let listHTTP = listResponse as? HTTPURLResponse,
+              listHTTP.statusCode == 200,
+              let list = try? JSONSerialization.jsonObject(with: listData) as? [String: Any]
+        else { throw ZAIQuotaError.requestFailed("团队项目 API Key 查询失败") }
+
+        let keys = ((list["data"] as? [Any]) ?? []).compactMap { $0 as? [String: Any] }
+        guard let projectKey = keys.first(where: {
+            ($0["name"] as? String) == "zcode-team-api-key"
+                && (($0["keyType"] as? NSNumber)?.intValue ?? -1) == 2
+        }), let apiKey = projectKey["apiKey"] as? String, !apiKey.isEmpty else {
+            throw ZAIQuotaError.requestFailed("团队项目 API Key 不可用")
+        }
+
+        let copyRequest = ZAIQuotaEndpoint.makeTeamAPIKeysRequest(
+            oauthToken: token, domain: selection.domain, teamContext: context, apiKey: apiKey
+        )
+        let (copyData, copyResponse) = try await session.data(for: copyRequest)
+        guard let copyHTTP = copyResponse as? HTTPURLResponse,
+              copyHTTP.statusCode == 200,
+              let copy = try? JSONSerialization.jsonObject(with: copyData) as? [String: Any],
+              let copyPayload = copy["data"] as? [String: Any],
+              let secret = copyPayload["secretKey"] as? String, !secret.isEmpty else {
+            throw ZAIQuotaError.requestFailed("团队项目 API Key Secret 不可用")
+        }
+        return "\(apiKey).\(secret)"
+    }
+
+    private func fetchMCPUsage(jwt: String, oauthToken: String,
+                               teamContext: ZAITeamContext?) async throws -> ZAIMCPUsage {
+        let request = ZAIQuotaEndpoint.makeMCPUsageRequest(
+            jwt: jwt, oauthToken: oauthToken, teamContext: teamContext
+        )
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let dataPayload = object["data"] as? [String: Any],
+              let usage = dataPayload["total_usage"] as? [String: Any],
+              let limit = (usage["limit"] as? NSNumber)?.doubleValue,
+              let remaining = (usage["remaining"] as? NSNumber)?.doubleValue else {
+            throw ZAIQuotaError.malformedResponse
+        }
+        let used = (usage["used"] as? NSNumber)?.doubleValue ?? max(0, limit - remaining)
+        let nextRefresh = (dataPayload["next_refresh_at"] as? NSNumber).map {
+            Date(timeIntervalSince1970: $0.doubleValue)
+        }
+        return ZAIMCPUsage(used: used, limit: limit, remaining: remaining, nextRefreshAt: nextRefresh)
     }
 
     /// coding-plan 重置额度：GET zcode.z.ai/api/v1/coding-plan/reset/status。
     /// 响应 data.available_five_hour_resets / available_week_resets 各是 {expire_at} 数组。
-    private func fetchResetCreditCards(jwt: String, oauthToken: String) async throws -> [ZAIResetCreditCard]? {
-        let request = ZAIQuotaEndpoint.makeCodingPlanResetStatusRequest(jwt: jwt, oauthToken: oauthToken)
+    private func fetchResetCreditCards(jwt: String, oauthToken: String,
+                                       teamContext: ZAITeamContext?) async throws -> [ZAIResetCreditCard]? {
+        let request = ZAIQuotaEndpoint.makeCodingPlanResetStatusRequest(
+            jwt: jwt, oauthToken: oauthToken, teamContext: teamContext
+        )
 
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200,

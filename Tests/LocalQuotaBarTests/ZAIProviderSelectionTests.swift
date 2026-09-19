@@ -32,6 +32,33 @@ final class ZAIProviderSelectionTests: XCTestCase {
         }
     }
 
+    func testTeamConnectionParsesScope() throws {
+        let resolved = try XCTUnwrap(selection([
+            "providerFamilyDomain": "bigmodel",
+            "providerFamilyConnectionSelections": [
+                "bigmodel": [
+                    "kind": "team-coding-plan",
+                    "productId": "product-9cef7c",
+                    "organizationId": "org-test",
+                    "projectId": "proj_test"
+                ]
+            ]
+        ]))
+        XCTAssertEqual(resolved.teamContext?.productId, "product-9cef7c")
+        XCTAssertEqual(resolved.teamContext?.organizationId, "org-test")
+        XCTAssertEqual(resolved.teamContext?.projectId, "proj_test")
+    }
+
+    func testIncompleteTeamScopeIsUnavailable() throws {
+        let resolved = try XCTUnwrap(selection([
+            "providerFamilyDomain": "bigmodel",
+            "providerFamilyConnectionSelections": [
+                "bigmodel": ["kind": "team-coding-plan", "organizationId": "org-test"]
+            ]
+        ]))
+        XCTAssertNil(resolved.teamContext)
+    }
+
     func testLegacySelectedKeyUsedWhenConnectionSelectionMissing() throws {
         // api-key 模式不写连接选择，仍由 modelProviderFamilySelectedKeys 表达。
         let resolved = try XCTUnwrap(selection([

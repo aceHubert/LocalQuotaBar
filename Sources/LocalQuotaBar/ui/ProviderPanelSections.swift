@@ -14,6 +14,7 @@ final class ProviderPanelSection: NSView {
     let modeHintLabel = NSTextField(labelWithString: "")
     let grid = NSStackView()
     let resetCards = ResetCardsRow()
+    let paceChart = WeeklyPaceChartView()
     let usageChart = DailyUsageChartView()
     let errorBanner = ErrorBannerView()
 
@@ -41,6 +42,8 @@ final class ProviderPanelSection: NSView {
         grid.distribution = .fillEqually
 
         resetCards.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
+        // 图例显隐 / 配速图显隐都会改变区块高度
+        usageChart.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
         errorBanner.onRetry = { [weak self] in
             self?.retryFromError()
         }
@@ -49,7 +52,10 @@ final class ProviderPanelSection: NSView {
         modeHintLabel.textColor = PanelTheme.tertiaryText
         modeHintLabel.isHidden = true
 
-        let stack = NSStackView(views: [header, modeHintLabel, grid, resetCards, usageChart, errorBanner])
+        // 周限配速图默认隐藏；无周限桶的 provider 不占空间
+        paceChart.isHidden = true
+
+        let stack = NSStackView(views: [header, modeHintLabel, grid, resetCards, paceChart, usageChart, errorBanner])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
@@ -62,6 +68,7 @@ final class ProviderPanelSection: NSView {
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
             resetCards.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            paceChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             usageChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             errorBanner.widthAnchor.constraint(equalTo: stack.widthAnchor),
             // 宽度钉常量：面板固定 322、内容 322-24。若只靠子视图互约束，
@@ -279,6 +286,16 @@ final class CodexPanelSection: NSView {
         section.usageChart.configure(days: days)
     }
 
+    /// 周配速图：nil（无周限桶）时整图隐藏；显隐变化通知宿主刷新 contentSize。
+    func applyPace(_ snapshot: WeeklyPaceSnapshot?) {
+        let wasHidden = section.paceChart.isHidden
+        section.paceChart.configure(snapshot)
+        section.paceChart.isHidden = snapshot == nil
+        if wasHidden != section.paceChart.isHidden {
+            onContentHeightChange?()
+        }
+    }
+
     /// 临时状态（如"已切换账号，正在刷新…"），下一次 apply 成功后自然清除。
     func showTransientStatus(_ text: String) {
         transientStatus = text
@@ -400,7 +417,13 @@ final class ZAIPanelSection: NSView {
             showsResetCards = false
 
         case .codingPlan:
-            tagText = snapshot?.level
+            let mcpTag: String? = if selection?.teamContext != nil, let mcpUsage = snapshot?.mcpUsage {
+                "MCP 剩余 \(Int(mcpUsage.remainingPercent.rounded()))%"
+            } else {
+                nil
+            }
+            tagText = [snapshot?.level, mcpTag].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            if tagText?.isEmpty == true { tagText = nil }
             let limits = snapshot?.limits ?? []
             let units: [ZAILimit.WindowUnit] = [.hourly, .weekly]
             for (unit, cell) in zip(units, [firstCell, secondCell]) {
@@ -416,7 +439,7 @@ final class ZAIPanelSection: NSView {
                     cell.configure(
                         title: unit == .hourly ? "5小时" : "周限额",
                         countdown: nil,
-                        content: .placeholder
+                        content: unit == .hourly ? .placeholder : .unlimited
                     )
                 }
                 cells.append(cell)
@@ -488,8 +511,18 @@ final class ZAIPanelSection: NSView {
         }
     }
 
-    func applyUsage(days: [DayUsage]?) {
-        section.usageChart.configure(days: days)
+    func applyUsage(days: [DayUsage]?, channelDays: [DayUsage]? = nil) {
+        section.usageChart.configure(days: days, channelDays: channelDays)
+    }
+
+    /// 周配速图：仅 coding-plan 且存在周限时接线层才会给出快照，nil 时整图隐藏。
+    func applyPace(_ snapshot: WeeklyPaceSnapshot?) {
+        let wasHidden = section.paceChart.isHidden
+        section.paceChart.configure(snapshot)
+        section.paceChart.isHidden = snapshot == nil
+        if wasHidden != section.paceChart.isHidden {
+            onContentHeightChange?()
+        }
     }
 
     private func isResetSoon(_ resetsAt: Date?) -> Bool {

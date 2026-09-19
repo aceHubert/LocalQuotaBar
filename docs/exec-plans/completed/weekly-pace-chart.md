@@ -1,8 +1,8 @@
 # 周限额配速图（剩余百分比点位图 + 对角线）
 
-- 状态：进行中（设计草稿，方案待确认后进入实现）
+- 状态：已完成（2026-09-18 实现落地；真机 Touch Bar / 刘海屏项待用户复核，见"实际结果"）
 - 创建日期：2026-09-15
-- 最后更新：2026-09-16
+- 最后更新：2026-09-18
 
 ## 目标
 
@@ -151,7 +151,10 @@ E    = windowTokens ÷ p           // 周预算估算值（tokens）
 - 手工检查：对角线两端锚定 W0 与窗口结束的真实时刻；今日点与周限格的剩余百分比一致；点位随刷新更新；hover tooltip 明细。
 - 观测检查：无周限 provider（apiKey 模式）不显示新图；新账号 `usedPercent < 5%` 时只显示线 + 今日点；Z.AI coding-plan 窗口聚合 ≤ 全渠道 30 天日桶对应日之和，且第三方用量大的日子两者差值明显（两条口径并存的直接证据）。
 - 边界用例（单测 + 手工）：zai ↔ bigmodel 切渠道后 provider 过滤与 monitor 口径同步跟随；Codex 网关后端换账号的 `usedPercent` 跳变被"新窗口直接采用"吸收；同渠道切换账号后 E 持久化分桶不串值。
-- 实际结果与未覆盖场景：（实现后填写）
+- 实际结果与未覆盖场景：（2026-09-18 实现会话填写）
+  - 已验证：`swift build`（debug 与 release 均 0 警告 0 错误）；`swift test` 131 用例全部通过（含新增 `WeeklyPaceChartTests` 25 项：窗口切分 8/7 格、Codex 首日折算、E 估算门槛/EMA/新窗口/分桶、压线着色与 clamp、渠道 id 解析、降级阶梯、tooltip 文案）；配速图与叠加图离屏渲染 4x PNG 经视觉核验（对角线单一直线且虚实分段、红绿点分布、空心今日点、图例、切换胶囊、叠加柱两段等宽）；三个新 SQL 查询对本机 `~/.zcode/cli/db/db.sqlite` 只读冒烟通过（coding-plan 渠道过滤在 2026-09-16 前后两种 provider_id 前缀下均能取到数据）。
+  - 实现期发现：ZCode 3.12.3+ 将 coding-plan 用量的 `provider_id` 从 `builtin:zai-coding-plan` 迁移为 `account:zai-individual-coding-plan`（setting.json 的 selectedKey 仍冻结在旧值）；渠道解析按双前缀集合过滤，E 持久化分桶改用 `domain-coding-plan|邮箱` 规避 id 迁移导致的估算历史断裂。
+  - 未覆盖（待用户真机复核）：Codex / Z.AI 真实额度刷新链路下的配速图展示与降级回落、hover tooltip 实机表现、叠加/总量切换持久化在重启后的生效、Touch Bar / 刘海屏设备项。
 
 ## 进度记录
 
@@ -166,10 +169,11 @@ E    = windowTokens ÷ p           // 周预算估算值（tokens）
 - [x] 两条实现路径（zcode 精确聚合 / Codex 日桶折算）连同调研依据落盘至本文档。
 - [x] Z.AI 30 天图叠加显示模式（coding plan 绿 / 其他渠道橙，tooltip = 日期 · coding plan · 总计）已画入 open-design 设计稿并同步本计划；配色经紫→青→橙三轮确认定稿，截图验收通过。
 - [x] 实现 handoff 文件已生成：[weekly-pace-chart-handoff.md](weekly-pace-chart-handoff.md)（自包含实现交接，含规格、文件清单、单测清单、执行步骤）。
-- [ ] 确认整体方案后进入实现。
-- [ ] 推导层 + 估算器 + 单测。
-- [ ] 视图与接线，完成验证。
-- [ ] 技术债登记（ZAI 估算口径、月限窗口放开）并归档。
+- [x] Handoff 增补（2026-09-16 用户确认）：配速图组件按"独立可复用"封装（视图/推导/估算器三层不耦合 provider 类型，适配在接线层）；Codex 与 Z.AI 共用同一视图，**Codex 首先接入作为首个真机验证对象**（当前账号有周限额可测）。
+- [x] 确认整体方案后进入实现。
+- [x] 推导层 + 估算器 + 单测。（2026-09-18：`WeeklyPaceSnapshot.make` 纯函数推导 + `WeeklyPaceEstimator` + 25 个单测；横轴按等宽自然日格实现，对角线锚定 W0 真实时刻）
+- [x] 视图与接线，完成验证。（2026-09-18：`WeeklyPaceChartView` 绘制、`DailyUsageChartView` 叠加模式、`ProviderPanelSections` 挂载、main.swift 双路接线；`swift build`（debug/release）与 `swift test` 131 用例全绿；配速图/叠加图离屏渲染 4x PNG 经视觉核验；真实 zcode SQLite 三查询冒烟通过）
+- [x] 技术债登记（ZAI 估算口径、月限窗口放开、渠道 id 前缀迁移监测）并归档。
 
 ## 决策记录
 
@@ -185,3 +189,4 @@ E    = windowTokens ÷ p           // 周预算估算值（tokens）
 - 2026-09-15：今日点用服务端 `usedPercent` 锚定真实值，历史点用 E 重建；E 变化时历史点整体重算，保证与最新刷新自洽。
 - 2026-09-15：周预算是持续修正的估算值（同窗口 EMA、新窗口首个可信观测直接采用、`usedPercent < 5%` 不更新），而非瞬时比值；展示一律带 `≈`。
 - 2026-09-15：首期仅启用 7±1 天窗口；算法按 `windowDays` 泛化，月限窗口后续放开。
+- 2026-09-18（实现期实测）：ZCode 3.12.3+ 把 coding-plan 用量的 `provider_id` 前缀从 `builtin:` 迁移为 `account:<domain>-<connection>-coding-plan`（本机 2026-09-16 起新行均为新前缀，setting.json selectedKey 冻结在旧值）；渠道过滤改为双前缀 id 集合（builtin 兜底 + individual/team 两种 account 形态 + selectedKey 后段），E 分桶键用 `domain-coding-plan|邮箱` 而非具体 provider_id，避免 CLI id 迁移打断估算历史。
