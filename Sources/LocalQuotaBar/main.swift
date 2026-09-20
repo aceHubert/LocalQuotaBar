@@ -1123,7 +1123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var codexUsageStore = CodexUsageStore(client: CodexUsageClient())
     /// Z.AI 本机日用量（zcode SQLite 聚合），额度刷新后重查。
     private let zaiUsageStore = ZAIUsageStore()
-    /// Z.AI 套餐用量的服务端口径（model-usage 增量缓存），挂在额度刷新成功后同步。
+    /// Z.AI 套餐用量的服务端口径（credit-usage 增量缓存），挂在额度刷新成功后同步。
     private let zaiServerUsageStore = ZAIServerUsageStore()
     private var accountOptions: [CodexAuthAccount] = []
     private var selectedAccountId: String?
@@ -1203,6 +1203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         zaiStore.onChange = { [weak self] snapshot, account, isRefreshing, error in
             guard let self else { return }
+            // 渠道切换（zai ↔ bigmodel）后标题、区块显隐必须按新 selection 重算。
+            self.updateZAISectionVisibility()
             self.quotaViewController.applyZAI(
                 snapshot: snapshot,
                 account: account,
@@ -1225,7 +1227,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // 本机 SQLite 快查：日用量独立于余额模式，API Key 模式也正常读取。
             self.zaiUsageStore.refresh()
-            // 额度刷新到达后重算配速图（窗口锚点可能已变）
+            // 视图顺序：套餐列表已随文件监听更新 → active 快照已到达 →
+            // 再按新 active 重算用量与配速，避免沿用旧渠道缓存。
+            self.recomputeZAIUsage()
             self.refreshZAIPaceChart()
         }
         quotaViewController.applyZAI(
@@ -1602,9 +1606,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.autoenablesItems = false
 
-        let switchItem = NSMenuItem(title: "切换账号", action: nil, keyEquivalent: "")
+        let switchItem = NSMenuItem(title: "Codex账号切换", action: nil, keyEquivalent: "")
         switchItem.submenu = makeAccountSubmenu()
         menu.addItem(switchItem)
+
+        let zaiPlanItem = NSMenuItem(title: "ZCode套餐切换", action: nil, keyEquivalent: "")
+        zaiPlanItem.submenu = makeZAIPlanViewSubmenu()
+        menu.addItem(zaiPlanItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1641,6 +1649,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.isEnabled = true
         return item
     }
+
+    // MARK: - Z.AI 套餐视图切换
+
+    /// Zcode 3.14.0 起套餐选择是会话级、不落盘，应用无从得知各会话实际所用套餐，
+    /// 由用户在此指定要展示与查询的套餐；未设置时跟随 setting.json 的默认套餐。
+    /// 可选项按 codex-cliproxy 的文件判定法（setting.json 连接形态槽位），
+    /// 每次右键现读文件——不依赖网络探测，也不占用定时刷新周期。
+    private func makeZAIPlanViewSubmenu() -> NSMenu {
+        let submenu = NSMenu()
+        submenu.autoenablesItems = false
+        let selection = ZAISettings.resolveProviderSelection()
+
+        // api-key / 未连接：套餐间不可切换。
+        guard selection?.kind == .codingPlan || selection?.kind == .startPlan else {
+            let item = NSMenuItem(title: "当前连接不可切换套餐", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            submenu.addItem(item)
+            return submenu
+        }
+
+        let options = ZAISettings.planMenuOptions(object: ZAISettings.loadSettingObject())
+        let entries: [(option: ZAIPlanViewOverride, shown: Bool, checked: Bool)] = [
+            (.startPlan, options.startPlan, selection?.kind == .startPlan),
+            (.codingPlan, options.personal,
+             selection?.kind == .codingPlan && selection?.teamContext == nil),
+            (.teamCodingPlan, options.team,
+             selection?.kind == .codingPlan && selection?.teamContext != nil),
+        ]
+        var addedCount = 0
+        for entry in entries where entry.shown {
+            let item = NSMenuItem(title: entry.option.title,
+                                  action: #selector(zaiPlanViewSelected(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = entry.option.rawValue
+            item.state = entry.checked ? .on : .off
+            item.isEnabled = true
+            submenu.addItem(item)
+            addedCount += 1
+        }
+        if addedCount == 0 {
+            let none = NSMenuItem(title: "无可用套餐", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+            submenu.addItem(none)
+        }
+        return submenu
+    }
+
+    @objc private func zaiPlanViewSelected(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let option = ZAIPlanViewOverride(rawValue: raw),
+              option != ZAIPlanViewSettings.load() else { return }
+        ZAIPlanViewSettings.save(option, accountID: ZAISettings.currentAccountIdentity())
+        // 立即按新视图重查额度（查询中则排队），用量口径同步重算。
+        zaiStore.refreshAfterPlanViewChange()
+        recomputeZAIUsage()
+    }
+
 
     private func makeRefreshIntervalSubmenu() -> NSMenu {
         let submenu = NSMenu()

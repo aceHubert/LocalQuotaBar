@@ -111,4 +111,98 @@ final class ZAIQuotaEndpointTests: XCTestCase {
         XCTAssertFalse(ZAIQuotaStore.isStartPlanLogProviderID("builtin:zai-coding-plan", domain: "zai"))
         XCTAssertFalse(ZAIQuotaStore.isStartPlanLogProviderID("account:zai-start-plan", domain: "bigmodel"))
     }
+
+    @MainActor
+    func testStartPlanUsesBalanceOwningPlanMetadata() throws {
+        // 同一响应可同时包含“待生效 Global Build”和“已生效 Start Plan”。
+        // 展示必须跟 balances 对应的套餐走，不能取 plans[] 里第一个 active 项。
+        let payload: [String: Any] = [
+            "code": 0,
+            "data": [
+                "plans": [
+                    [
+                        "name": "ZCode Global Build",
+                        "description": "ZCode Global Build",
+                        "priority": 110,
+                        "status": "active",
+                        "starts_at": 1_789_802_823,
+                        "ends_at": 1_789_866_000,
+                        "entitlements": [
+                            [
+                                "entitlement_id": "future-flash",
+                                "show_name": "GLM-5.3-Flash",
+                                "grant_units": 100_000_000,
+                                "effective_at": 1_789_830_000,
+                                "period": "one_time"
+                            ]
+                        ]
+                    ],
+                    [
+                        "name": "ZCode Start Plan",
+                        "description": "免费 GLM 旗舰模型体验",
+                        "priority": 90,
+                        "status": "active",
+                        "starts_at": 1_789_784_492,
+                        "ends_at": 1_790_179_199,
+                        "entitlements": [
+                            [
+                                "entitlement_id": "daily-glm",
+                                "show_name": "GLM-5.3",
+                                "grant_units": 3_000_000,
+                                "effective_at": 0,
+                                "period": "daily"
+                            ],
+                            [
+                                "entitlement_id": "daily-flash",
+                                "show_name": "GLM-5.3-Flash",
+                                "grant_units": 5_000_000,
+                                "effective_at": 0,
+                                "period": "daily"
+                            ]
+                        ]
+                    ]
+                ],
+                "balances": [
+                    [
+                        "entitlement_id": "daily-glm",
+                        "show_name": "GLM-5.3",
+                        "total_units": 3_000_000,
+                        "remaining_units": 2_000_000,
+                        "priority": 110,
+                        "period_start": 1_789_747_200,
+                        "period_end": 1_789_833_599,
+                        "expires_at": 1_789_833_599
+                    ],
+                    [
+                        "entitlement_id": "daily-flash",
+                        "show_name": "GLM-5.3-Flash",
+                        "total_units": 5_000_000,
+                        "remaining_units": 4_000_000,
+                        "priority": 80,
+                        "period_start": 1_789_747_200,
+                        "period_end": 1_789_833_599,
+                        "expires_at": 1_789_833_599
+                    ]
+                ]
+            ]
+        ]
+        let selection = ZAIProviderSelection(domain: "zai", kind: .startPlan, selectedKey: nil)
+        let snapshot = try ZAIQuotaStore.parseStartPlanSnapshot(
+            payload: payload,
+            selection: selection,
+            fetchedAt: Date(timeIntervalSince1970: 0),
+            now: Date(timeIntervalSince1970: 1_789_784_492)
+        )
+
+        XCTAssertEqual(snapshot.planName, "ZCode Start Plan")
+        XCTAssertEqual(snapshot.balances.map(\.title), ["GLM-5.3", "GLM-5.3-Flash"])
+        XCTAssertTrue(snapshot.pendingEntitlements.isEmpty)
+        XCTAssertEqual(snapshot.planItems.map(\.name), ["ZCode Global Build", "ZCode Start Plan"])
+        XCTAssertEqual(snapshot.planItems.map(\.status), [.upcoming, .active])
+        XCTAssertEqual(snapshot.planItems[0].pendingEntitlements.map(\.title), ["GLM-5.3-Flash"])
+        XCTAssertEqual(snapshot.planItems[0].startsAt, Date(timeIntervalSince1970: 1_789_802_823))
+        XCTAssertEqual(snapshot.planItems[1].balances.map(\.title), ["GLM-5.3", "GLM-5.3-Flash"])
+        XCTAssertEqual(snapshot.planStartAt, Date(timeIntervalSince1970: 1_789_784_492))
+        XCTAssertEqual(snapshot.planEndAt, Date(timeIntervalSince1970: 1_790_179_199))
+    }
 }

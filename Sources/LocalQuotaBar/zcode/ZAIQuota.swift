@@ -13,14 +13,16 @@ enum ZAIPlanKind: String, Codable {
     case apiKey
 }
 
-/// 从 ~/.zcode setting.json 解析出的当前渠道与所选 provider。
+/// 从 ~/.zcode setting.json 解析出的当前渠道与默认所选 provider。
+/// ZCode 3.14.0 起实际会话可各自选套餐（不落盘），这里只反映文件里的默认值。
 struct ZAIProviderSelection: Equatable {
     let domain: String
     let kind: ZAIPlanKind
     let selectedKey: String?
-    /// ZCode 3.12.3+ 写入 `providerFamilyConnectionSelections[domain].kind` 的原始值
-    /// （start-plan / individual-coding-plan / team-coding-plan）。legacy 路径下为 nil。
-    /// 团队版判定依赖它：新格式不再写 selectedKey，team 只能从这里认出来。
+    /// `providerFamilyConnectionSelections[domain].kind` 的原始值。3.12.3 及更早可为
+    /// 套餐级 `start-plan`（该版本切换只写这里）；3.14.0 起只区分连接形态
+    /// （individual-coding-plan / team-coding-plan），不再锁定套餐。不可识别的值为 nil。
+    /// 团队版作用域（org/project）只能从这里认出来。
     let connectionKind: String?
     /// 团队 Coding Plan 的作用域；个人套餐和 legacy 配置为 nil。
     let teamContext: ZAITeamContext?
@@ -42,6 +44,82 @@ struct ZAITeamContext: Equatable, Codable {
     let projectId: String
 }
 
+/// Z.AI 套餐视图的手动切换。ZCode 3.14.0 起套餐选择是会话级、不落盘，
+/// 应用无从得知各会话实际所用套餐，由用户显式指定要展示与查询的套餐。
+/// 账号有哪些套餐槽位按 setting.json 连接形态判定（codex-cliproxy 同款，
+/// 见 `ZAISettings.planMenuOptions`），右键菜单每次现读文件。
+enum ZAIPlanViewOverride: String, CaseIterable {
+    /// 体验套餐（start-plan，免费额度，如周末活动包）
+    case startPlan
+    /// Coding Plan 个人订阅
+    case codingPlan
+    /// Coding Plan 团队订阅（bigmodel 团队连接 + org/project 作用域）
+    case teamCodingPlan
+
+    var title: String {
+        switch self {
+        case .startPlan: return "Start Plan（免费）"
+        case .codingPlan: return "Coding Plan（个人订阅）"
+        case .teamCodingPlan: return "Coding Plan（团队订阅）"
+        }
+    }
+}
+
+/// 套餐视图偏好的持久化（状态栏右键菜单写入）。
+/// 未设置（nil）时跟随 setting.json 的默认套餐。
+enum ZAIPlanViewSettings {
+    static let overrideKey = "local.codex.touchbar.quota.zai.planViewOverride"
+    private static let domainKey = "local.codex.touchbar.quota.zai.lastProviderDomain"
+    static let accountKey = "local.codex.touchbar.quota.zai.planViewAccount"
+    private static let lastAccountKey = "local.codex.touchbar.quota.zai.lastAccountIdentity"
+
+    static func load(defaults: UserDefaults = .standard) -> ZAIPlanViewOverride? {
+        guard let raw = defaults.string(forKey: overrideKey) else { return nil }
+        return ZAIPlanViewOverride(rawValue: raw)
+    }
+
+    static func save(_ value: ZAIPlanViewOverride,
+                     accountID: String? = nil,
+                     defaults: UserDefaults = .standard) {
+        defaults.set(value.rawValue, forKey: overrideKey)
+        defaults.set(accountID, forKey: accountKey)
+    }
+
+    static func clear(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: overrideKey)
+        defaults.removeObject(forKey: accountKey)
+    }
+
+    static func loadLastDomain(defaults: UserDefaults = .standard) -> String? {
+        defaults.string(forKey: domainKey)
+    }
+
+    static func saveLastDomain(_ domain: String?, defaults: UserDefaults = .standard) {
+        defaults.set(domain, forKey: domainKey)
+    }
+
+    static func loadAccountID(defaults: UserDefaults = .standard) -> String? {
+        defaults.string(forKey: accountKey)
+    }
+
+    static func loadLastAccountID(defaults: UserDefaults = .standard) -> String? {
+        defaults.string(forKey: lastAccountKey)
+    }
+
+    static func saveLastAccountID(_ accountID: String?, defaults: UserDefaults = .standard) {
+        defaults.set(accountID, forKey: lastAccountKey)
+    }
+
+    /// override 只在保存它的账号上下文中有效；账号切换后必须回退文件默认套餐。
+    static func isValid(for accountID: String?, defaults: UserDefaults = .standard) -> Bool {
+        guard load(defaults: defaults) != nil else { return false }
+        // 旧版本未绑定账号：当前若已能识别账号，视为跨账号残留并失效；
+        // 身份也无法识别时保持可用，避免无凭证场景误清用户选择。
+        guard let accountID else { return loadAccountID(defaults: defaults) == nil }
+        return loadAccountID(defaults: defaults) == accountID
+    }
+}
+
 /// 官方 MCP 聚合额度；它与 Coding Plan 的 5 小时/周限额不是同一口径。
 struct ZAIMCPUsage: Equatable, Codable {
     let used: Double
@@ -56,8 +134,9 @@ struct ZAIMCPUsage: Equatable, Codable {
 }
 
 extension ZAIPlanKind {
-    /// ZCode 3.12.3+ 的连接类型归一化；未知值返回 nil，交给 legacy 路径兜底。
-    /// api-key 模式不写连接选择，仍由 modelProviderFamilySelectedKeys 表达。
+    /// 连接类型归一化；未知值返回 nil，交给 selectedKey / mode 路径兜底。
+    /// 3.14.0 起该字段只表达连接形态（不含套餐选择）；
+    /// `start-plan` 是 3.12.3 及更早的套餐级标记；api-key 模式不写连接选择。
     init?(connectionKind: String) {
         switch connectionKind {
         case "start-plan": self = .startPlan
@@ -139,6 +218,24 @@ struct ZAIPendingEntitlement: Equatable, Codable {
     }
 }
 
+/// 单个 start-plan 套餐的完整展示数据；同一账号可同时存在多个 active 套餐。
+struct ZAIPlanItem: Equatable, Codable {
+    enum Status: String, Codable {
+        case active
+        case upcoming
+        case ended
+        case unknown
+    }
+
+    let name: String
+    let description: String?
+    let status: Status
+    let startsAt: Date?
+    let endsAt: Date?
+    let balances: [ZAIBalance]
+    let pendingEntitlements: [ZAIPendingEntitlement]
+}
+
 /// coding-plan 的重置额度卡，来自 zcode.z.ai 的 coding-plan/reset/status。
 struct ZAIResetCreditCard: Equatable, Codable {
     enum Kind: String, Codable {
@@ -174,6 +271,11 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
     let planEndAt: Date?
     /// start-plan 权益项（plans[].entitlements[]）；生效前 balances 为空、用它展示待生效额度。
     let pendingEntitlements: [ZAIPendingEntitlement]
+    /// 当前已有生效套餐时，另一个尚未开始的 start-plan 套餐名称与开始时间。
+    let upcomingPlanName: String?
+    let upcomingPlanStartAt: Date?
+    /// start-plan 多套餐列表；非 start-plan 为空。
+    let planItems: [ZAIPlanItem]
     let mcpUsage: ZAIMCPUsage?
 
     init(kind: ZAIPlanKind? = nil,
@@ -190,6 +292,9 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
          planStartAt: Date? = nil,
          planEndAt: Date? = nil,
          pendingEntitlements: [ZAIPendingEntitlement] = [],
+         upcomingPlanName: String? = nil,
+         upcomingPlanStartAt: Date? = nil,
+         planItems: [ZAIPlanItem] = [],
          mcpUsage: ZAIMCPUsage? = nil) {
         self.kind = kind
         self.limits = limits
@@ -205,6 +310,9 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         self.planStartAt = planStartAt
         self.planEndAt = planEndAt
         self.pendingEntitlements = pendingEntitlements
+        self.upcomingPlanName = upcomingPlanName
+        self.upcomingPlanStartAt = upcomingPlanStartAt
+        self.planItems = planItems
         self.mcpUsage = mcpUsage
     }
 
@@ -225,6 +333,9 @@ struct ZAIQuotaSnapshot: Equatable, Codable {
         planStartAt = try container.decodeIfPresent(Date.self, forKey: .planStartAt)
         planEndAt = try container.decodeIfPresent(Date.self, forKey: .planEndAt)
         pendingEntitlements = try container.decodeIfPresent([ZAIPendingEntitlement].self, forKey: .pendingEntitlements) ?? []
+        upcomingPlanName = try container.decodeIfPresent(String.self, forKey: .upcomingPlanName)
+        upcomingPlanStartAt = try container.decodeIfPresent(Date.self, forKey: .upcomingPlanStartAt)
+        planItems = try container.decodeIfPresent([ZAIPlanItem].self, forKey: .planItems) ?? []
         mcpUsage = try container.decodeIfPresent(ZAIMCPUsage.self, forKey: .mcpUsage)
     }
 }
@@ -263,53 +374,272 @@ enum ZAISettings {
     }
 
     /// 从 setting.json 解析当前渠道（zai/bigmodel）与所选 provider 对应的账号形态。
-    /// selectedKey 形如 "coding-plan:builtin:zai-start-plan" / "api-key:builtin:zai"。
+    /// 返回**有效**选择：文件解析结果叠加用户的套餐视图 override（右键菜单切换），
+    /// 并校验对应渠道的 OAuth 凭证是否存在；额度查询、面板展示、重置与用量统计
+    /// 都以此为准。失效 override（例如已删除的个人凭证）回退到文件当前连接。
     static func resolveProviderSelection() -> ZAIProviderSelection? {
+        guard let object = loadSettingObject() else { return nil }
+        let accountID = currentAccountIdentity()
+        let override = ZAIPlanViewSettings.isValid(for: accountID) ? ZAIPlanViewSettings.load() : nil
+        let selection = resolveEffectiveSelection(object: object, override: override)
+        guard let selection else { return nil }
+        guard selection.kind != .startPlan else { return selection }
+        return hasOAuthCredential(domain: selection.domain) ? selection : nil
+    }
+
+    /// 当前 Z.AI 账号身份：优先 credentials.json 的 user_info.id，
+    /// 再回退 user_id、email；JWT subject 仅作为额外兜底。
+    /// 用于隔离套餐 override，避免同渠道换号后沿用上一个账号的套餐视图。
+    /// 这里只读 credentials.json，不经过 loadAccount/resolveProviderSelection，
+    /// 否则 JWT 无法解析时会形成递归调用。
+    static func currentAccountIdentity() -> String? {
+        let domain = (loadSettingObject()?["providerFamilyDomain"] as? String) ?? "zai"
+        guard let v2 = zcodeV2URL,
+              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        else { return nil }
+        let cipher = ZAICredentialCipher()
+        // 与 loadCredentials 的键选择保持一致：先精确 domain，再回退 zai。
+        let encryptedUser = object["oauth:\(domain):user_info"] ?? object["oauth:zai:user_info"]
+        if let encryptedUser,
+           !encryptedUser.isEmpty,
+           let plain = try? cipher.decrypt(encryptedUser),
+           let jsonData = plain.data(using: .utf8),
+           let userInfo = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+           let identity = accountIdentity(from: userInfo) {
+            return identity
+        }
+        let encryptedToken = object["oauth:\(domain):access_token"] ?? object["oauth:zai:access_token"]
+        if let encryptedToken,
+           !encryptedToken.isEmpty,
+           let token = try? cipher.decrypt(encryptedToken),
+           let subject = tokenSubject(token) {
+            return "sub:\(subject)"
+        }
+        return nil
+    }
+
+    /// 账号身份优先级：id → user_id → email（顶层优先，再查嵌套 user）。
+    static func accountIdentity(from userInfo: [String: Any]) -> String? {
+        let nestedUser = userInfo["user"] as? [String: Any]
+        for key in ["id", "user_id"] {
+            for source in [userInfo, nestedUser] {
+                if let value = source?[key] as? String {
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !trimmed.isEmpty { return "\(key):\(trimmed)" }
+                }
+                if let value = source?[key] as? NSNumber {
+                    return "\(key):\(value.stringValue)"
+                }
+            }
+        }
+        for source in [userInfo, nestedUser] {
+            if let email = source?["email"] as? String {
+                let trimmed = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !trimmed.isEmpty { return "email:\(trimmed)" }
+            }
+        }
+        return nil
+    }
+
+    /// 读取 JWT payload 里的稳定 subject；不验证签名，仅作本机账号分桶。
+    static func tokenSubject(_ token: String) -> String? {
+        let bare = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "^Bearer\\s+", with: "", options: [.regularExpression, .caseInsensitive])
+        let parts = bare.split(separator: ".")
+        guard parts.count == 3 else { return nil }
+        var payload = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        payload += String(repeating: "=", count: (4 - payload.count % 4) % 4)
+        guard let data = Data(base64Encoded: payload),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        for key in ["sub", "user_id", "userId", "uid"] {
+            if let value = object[key] as? String, !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    /// 读取 setting.json 原始字典。
+    static func loadSettingObject() -> [String: Any]? {
         guard let url = settingURLs.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
               let data = try? Data(contentsOf: url),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return nil }
-        return resolveProviderSelection(object: object)
+        return object
+    }
+
+    /// 文件解析结果 + 套餐视图 override → 有效选择（纯函数，供单测注入）。
+    /// override 仅在 OAuth 套餐间生效（api-key 连接不受影响）：
+    /// - startPlan：切换 kind，保留文件当前渠道；查询不使用团队作用域。
+    /// - codingPlan：改用文件里的个人连接（跨 domain 扫描），不能只清空团队作用域，
+    ///   否则请求仍按 team-coding-plan 形态发送。
+    /// - teamCodingPlan：改用文件里的团队连接（跨 domain 扫描，含 org/project）；
+    ///   文件没有团队连接时保持文件原样（override 无效）。
+    static func resolveEffectiveSelection(object: [String: Any],
+                                          override: ZAIPlanViewOverride?,
+                                          hasCredential: (String) -> Bool = ZAISettings.hasOAuthCredential)
+        -> ZAIProviderSelection? {
+        guard let base = resolveProviderSelection(object: object) else { return nil }
+        guard let override, base.kind == .codingPlan || base.kind == .startPlan else { return base }
+        switch override {
+        case .startPlan:
+            guard base.kind != .startPlan else { return base }
+            return ZAIProviderSelection(domain: base.domain, kind: .startPlan,
+                                        selectedKey: base.selectedKey,
+                                        connectionKind: base.connectionKind, teamContext: nil)
+        case .codingPlan:
+            guard let personal = personalSelection(object: object),
+                  hasCredential(personal.domain) else { return base }
+            return personal
+        case .teamCodingPlan:
+            guard let team = teamSelection(object: object),
+                  hasCredential(team.domain) else { return base }
+            return team
+        }
+    }
+
+    /// 文件里的个人连接（providerFamilyConnectionSelections 中
+    /// kind=individual-coding-plan 的条目，当前渠道优先，另一渠道兜底）。
+    static func personalSelection(object: [String: Any]) -> ZAIProviderSelection? {
+        for domain in orderedDomains(object: object) {
+            guard connectionSelectionKind(object: object, domain: domain) == "individual-coding-plan"
+            else { continue }
+            let selectedKey = (object["modelProviderFamilySelectedKeys"] as? [String: String])?[domain]
+            return ZAIProviderSelection(domain: domain, kind: .codingPlan,
+                                        selectedKey: selectedKey,
+                                        connectionKind: "individual-coding-plan", teamContext: nil)
+        }
+        return nil
+    }
+
+    /// 文件里的团队连接（providerFamilyConnectionSelections 中 kind=team-coding-plan
+    /// 的条目，当前渠道优先，另一渠道兜底），带 org/project 作用域；没有则 nil。
+    static func teamSelection(object: [String: Any]) -> ZAIProviderSelection? {
+        for domain in orderedDomains(object: object) {
+            guard let connectionKind = connectionSelectionKind(object: object, domain: domain),
+                  connectionKind == "team-coding-plan",
+                  let context = teamContext(object: object, domain: domain, connectionKind: connectionKind)
+            else { continue }
+            let selectedKey = (object["modelProviderFamilySelectedKeys"] as? [String: String])?[domain]
+            return ZAIProviderSelection(domain: domain, kind: .codingPlan,
+                                        selectedKey: selectedKey, connectionKind: connectionKind,
+                                        teamContext: context)
+        }
+        return nil
+    }
+
+    /// 跨渠道扫描顺序：setting.json 当前 providerFamilyDomain 优先，另一渠道兜底。
+    /// zai ↔ bigmodel 切换后必须跟随新渠道，不能固定按 zai 优先。
+    private static func orderedDomains(object: [String: Any]) -> [String] {
+        object["providerFamilyDomain"] as? String == "bigmodel"
+            ? ["bigmodel", "zai"] : ["zai", "bigmodel"]
+    }
+
+    /// 任意渠道的连接形态是否为指定 kind（codex-cliproxy 的槽位判定法）。
+    static func hasConnectionKind(_ kind: String, object: [String: Any]) -> Bool {
+        for domain in ["zai", "bigmodel"] {
+            if connectionSelectionKind(object: object, domain: domain) == kind { return true }
+        }
+        return false
+    }
+
+    /// 右键菜单的套餐可选项判定（对齐 codex-cliproxy 的文件判定，每次右键现读
+    /// setting.json / config.json，不做网络探测、不进定时刷新）：
+    /// - start-plan 永远可选——连接形态无关，资格由 billing/balance 在额度查询时
+    ///   判定，上游最终拒绝（免费档始终暴露；provider 镜像状态可能冻结，不可信）；
+    /// - 个人订阅 ⇔ 任意渠道存在 individual-coding-plan 连接，且该渠道有 OAuth 凭证；
+    /// - 团队订阅 ⇔ 存在 team-coding-plan 连接（含 org/project 作用域），且该渠道有
+    ///   OAuth 凭证。
+    /// provider 镜像状态可能冻结，不能作为资格判据；没有凭证的残留槽位直接隐藏。
+    static func planMenuOptions(object: [String: Any]?,
+                                hasCredential: (String) -> Bool = ZAISettings.hasOAuthCredential)
+        -> (startPlan: Bool, personal: Bool, team: Bool) {
+        guard let object, let base = resolveProviderSelection(object: object) else {
+            return (false, false, false)
+        }
+        let personalSelection = personalSelection(object: object)
+        let personal = personalSelection.map { hasCredential($0.domain) }
+            ?? (base.kind == .codingPlan && base.teamContext == nil)
+        let team = teamSelection(object: object).map { hasCredential($0.domain) } ?? false
+        return (true, personal, team)
+    }
+
+    /// 对应渠道是否存在 OAuth access token；只做 key 存在性检查，不读取或记录内容。
+    /// 必须按渠道精确匹配：bigmodel 不能回退到 zai，否则切到 zai 个人后仍会显示团队套餐。
+    static func hasOAuthCredential(object: [String: String], domain: String) -> Bool {
+        guard let token = object["oauth:\(domain):access_token"] else { return false }
+        return !token.isEmpty
+    }
+
+    static func hasOAuthCredential(domain: String) -> Bool {
+        guard let v2 = zcodeV2URL,
+              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
+        else { return false }
+        return hasOAuthCredential(object: object, domain: domain)
     }
 
     /// 纯解析入口，供单测直接注入 setting.json 的字典内容。
-    /// ZCode 3.12.3 起切换套餐只写 `providerFamilyConnectionSelections[domain].kind`，
-    /// `modelProviderFamilySelectedKeys` 已冻结在旧值上；连接选择存在时必须以它为准，
-    /// 否则会跟着冻结的旧套餐走（例如切到 start-plan 后仍查 coding-plan 额度）。
+    /// ZCode 3.14.0 起套餐在会话级模型选择器里选择（按 workspace 记忆），切换不落盘；
+    /// setting.json 的 `modelProviderFamilySelectedKeys[domain]` 只是**默认套餐**
+    /// （无默认时官方回退到第一个权益 active 的套餐），
+    /// `providerFamilyConnectionSelections[domain].kind` 只区分连接形态（individual/team）。
+    /// 应用侧单套餐展示只能跟随默认值；判定优先级：
+    /// 1. 旧版（3.12.3）套餐级连接标记 `start-plan`：该版本切换只写连接选择，
+    ///    标记只可能来自旧语义，优先认出；
+    /// 2. selectedKey 的套餐标记（默认选择；ZCode 已不随切换回写，值可能滞后于实际会话）；
+    /// 3. 连接形态兜底（selectedKey 缺失或无套餐信息时按 individual/team 记 coding-plan）。
+    /// 团队作用域（org/project）始终从连接形态读取，与套餐 kind 正交。
+    /// 「第一个 active」的权益回退与多套餐并存展示需服务端探测，见技术债表。
     static func resolveProviderSelection(object: [String: Any]) -> ZAIProviderSelection? {
         guard let domain = object["providerFamilyDomain"] as? String,
               domain == "zai" || domain == "bigmodel"
         else { return nil }
 
         let selectedKey = (object["modelProviderFamilySelectedKeys"] as? [String: String])?[domain]
-
-        if let connectionKind = connectionSelectionKind(object: object, domain: domain),
-           let kind = ZAIPlanKind(connectionKind: connectionKind) {
-            let teamContext = teamContext(object: object, domain: domain, connectionKind: connectionKind)
-            return ZAIProviderSelection(domain: domain, kind: kind,
-                                        selectedKey: selectedKey, connectionKind: connectionKind,
-                                        teamContext: teamContext)
+        let rawConnectionKind = connectionSelectionKind(object: object, domain: domain)
+        // 仅回吐可识别的连接形态；未知值不外泄，由 selectedKey / mode 兜底。
+        var connectionKind: String? = nil
+        if let rawConnectionKind, ZAIPlanKind(connectionKind: rawConnectionKind) != nil {
+            connectionKind = rawConnectionKind
         }
 
         let kind: ZAIPlanKind
-        if let key = selectedKey?.lowercased() {
-            if key.contains("start-plan") {
-                kind = .startPlan
-            } else if key.contains("coding-plan") {
-                kind = .codingPlan
-            } else if key.hasPrefix("api-key") {
-                kind = .apiKey
-            } else {
-                kind = fallbackKind(object: object, domain: domain)
-            }
+        if rawConnectionKind == "start-plan" {
+            kind = .startPlan
+        } else if let selectedKind = planKind(fromSelectedKey: selectedKey) {
+            kind = selectedKind
+        } else if let connectionKind, let parsed = ZAIPlanKind(connectionKind: connectionKind) {
+            kind = parsed
         } else {
             kind = fallbackKind(object: object, domain: domain)
         }
-        return ZAIProviderSelection(domain: domain, kind: kind, selectedKey: selectedKey)
+
+        let resolvedTeamContext: ZAITeamContext?
+        if let connectionKind, connectionKind == "team-coding-plan" {
+            resolvedTeamContext = teamContext(object: object, domain: domain, connectionKind: connectionKind)
+        } else {
+            resolvedTeamContext = nil
+        }
+        return ZAIProviderSelection(domain: domain, kind: kind,
+                                    selectedKey: selectedKey, connectionKind: connectionKind,
+                                    teamContext: resolvedTeamContext)
+    }
+
+    /// selectedKey（形如 "coding-plan:builtin:zai-coding-plan" / "api-key:builtin:zai"）
+    /// 里的套餐标记；无法识别时返回 nil，交给连接形态或 mode 兜底。
+    private static func planKind(fromSelectedKey selectedKey: String?) -> ZAIPlanKind? {
+        guard let key = selectedKey?.lowercased() else { return nil }
+        if key.contains("start-plan") { return .startPlan }
+        if key.contains("coding-plan") { return .codingPlan }
+        if key.hasPrefix("api-key") { return .apiKey }
+        return nil
     }
 
     /// `providerFamilyConnectionSelections[domain].kind`；条目缺失或形状非法时返回 nil，
-    /// 由 legacy 路径接管（api-key 模式、未重启的惰性迁移窗口、team 连接未解析）。
+    /// 由 selectedKey / mode 兜底（api-key 模式不写连接选择）。
     private static func connectionSelectionKind(object: [String: Any], domain: String) -> String? {
         guard let selections = object["providerFamilyConnectionSelections"] as? [String: Any],
               let entry = selections[domain] as? [String: Any]
@@ -356,6 +686,16 @@ enum ZAISettings {
         ]
     }
 
+    /// 文件监控实际关注的文件，固定顺序（stamps 数组按此对齐）：
+    /// setting.json 兼容根目录与 v2 两处，credentials.json 只存在于 v2。
+    static var settingsFileURLs: [URL] {
+        var urls = settingURLs
+        if let v2 = zcodeV2URL {
+            urls.append(v2.appendingPathComponent("credentials.json"))
+        }
+        return urls
+    }
+
     /// 从 credentials.json 解密出 OAuth access token 与用户信息。
     /// bigmodel 渠道优先找 oauth:bigmodel:*，回退 oauth:zai:*（两渠道共用 zai OAuth 的历史布局）。
     static func loadCredentials(domain: String = "zai", allowZaiFallback: Bool = true) throws -> (accessToken: String, userInfo: [String: Any]?) {
@@ -398,7 +738,7 @@ enum ZAISettings {
     // MARK: config.json（provider 明文配置）
 
     /// 读取 config.json 中某个 provider 的配置块。
-    private static func providerConfig(_ providerID: String) -> [String: Any]? {
+    static func providerConfig(_ providerID: String) -> [String: Any]? {
         guard let v2 = zcodeV2URL,
               let data = try? Data(contentsOf: v2.appendingPathComponent("config.json")),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -637,11 +977,50 @@ enum ZAIQuotaEndpoint {
     }
 }
 
+// MARK: - zcode 设置文件变化识别
+
+/// credentials.json / setting.json 单文件观察摘要：mtime + 字节数，文件缺失时为 nil。
+/// 目录里的其他文件（tasks-index.sqlite-wal、telemetry-state.json 等）不会改变
+/// 这两个文件的 stamps，据此先把目录事件过滤成"文件事件"。
+struct ZAISettingsFileStamp: Equatable {
+    let modifiedAt: Date?
+    let byteCount: Int?
+}
+
+/// 语义级摘要：账号身份 + 文件级 provider 选择（domain / 套餐 / 连接形态 / 团队作用域）。
+/// token 轮换、recentProjects 之类的重写不改变它，只有换号或切渠道 / 套餐 / 连接才会变。
+struct ZAISettingsFileIdentity: Equatable {
+    let account: String?
+    let selection: ZAIProviderSelection?
+}
+
+/// 文件事件过滤后的动作。applySettingsChange：账号 / 渠道 / 套餐确实变了，
+/// 只更新本地展示参数（清理过期快照、刷新账号标签），不发网络请求；
+/// 真正的额度刷新由周期定时器、手动刷新与套餐视图切换 / 重置触发。
+enum ZAISettingsChangeAction: Equatable {
+    case ignore
+    case applySettingsChange
+}
+
+enum ZAISettingsChangeResolver {
+    /// 纯函数决策，供 ZAIQuotaStore 与单测使用：
+    /// 1. stamps 未变 → 目录噪声，忽略；
+    /// 2. stamps 变了但语义摘要未变 → 只是 token 轮换等无关重写，忽略；
+    /// 3. 语义变了 → applySettingsChange（仅本地状态，不触发网络刷新）。
+    static func resolve(previousStamps: [ZAISettingsFileStamp],
+                        currentStamps: [ZAISettingsFileStamp],
+                        previousIdentity: ZAISettingsFileIdentity?,
+                        currentIdentity: ZAISettingsFileIdentity?) -> ZAISettingsChangeAction {
+        guard currentStamps != previousStamps else { return .ignore }
+        guard currentIdentity != previousIdentity else { return .ignore }
+        return .applySettingsChange
+    }
+}
+
 // MARK: - ZAI 额度 Store
 
 @MainActor
 final class ZAIQuotaStore {
-    static let refreshCooldown: TimeInterval = 5 * 60
     /// 后台周期刷新间隔，默认与 Codex 一致，可在状态栏右键菜单调整。
     private(set) var refreshInterval: TimeInterval
     private let session: URLSession
@@ -652,12 +1031,20 @@ final class ZAIQuotaStore {
     private(set) var lastError: String?
     private(set) var lastRefreshStartedAt: Date?
     private(set) var lastResetScopeID: String?
+    /// 上次已应用的 providerFamilyDomain；识别 zai ↔ bigmodel 切换并清掉旧渠道快照。
+    private var lastAppliedDomain: String?
     private var needsRefreshAfterCurrent = false
     private var timer: Timer?
+    /// zcode 换号/改配置重写凭证与设置文件时的监听源。
+    private var settingsWatchers: [DispatchSourceFileSystemObject] = []
+    private var settingsChangeDebounce: Task<Void, Never>?
+    /// 目录事件判定基线：上次观察到的文件 stamps 与语义摘要。
+    private var lastSeenSettingsStamps: [ZAISettingsFileStamp] = []
+    private var lastSeenSettingsIdentity: ZAISettingsFileIdentity?
 
     var onChange: ((ZAIQuotaSnapshot?, ZAIAccount?, Bool, String?) -> Void)?
     /// coding-plan 额度刷新成功后触发，携带发起时刻捕获的凭证与作用域；
-    /// ZAIServerUsageStore 挂此回调做 model-usage 增量同步，复用同一凭证。
+    /// ZAIServerUsageStore 挂此回调做 credit-usage 用量增量同步，复用同一凭证。
     var onUsageSyncContext: ((ZAIUsageSyncContext) -> Void)?
     private var pendingUsageSyncContext: ZAIUsageSyncContext?
 
@@ -678,6 +1065,7 @@ final class ZAIQuotaStore {
         timer?.invalidate()
         refresh()
         scheduleTimer()
+        watchSettingsFiles()
     }
 
     func stop() {
@@ -701,19 +1089,121 @@ final class ZAIQuotaStore {
         }
     }
 
+    // MARK: - zcode 换号 / 配置变化感知
+
+    /// 监听 ~/.zcode 与 ~/.zcode/v2 目录（zcode 换号、改连接、改默认套餐都会
+    /// 重写 credentials.json / setting.json）。监听目录而不是文件，避免 zcode
+    /// 原子替换文件后 DispatchSource 绑定的旧 inode 失效。目录里的其他文件
+    /// （tasks-index.sqlite-wal、telemetry-state.json 等）同样会触发目录事件，
+    /// 由 handleSettingsFilesChange 按 stamps + 语义摘要过滤掉。
+    private func watchSettingsFiles() {
+        guard settingsWatchers.isEmpty else { return }
+        let zcodeURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".zcode", isDirectory: true)
+        let candidates = [
+            zcodeURL,
+            zcodeURL.appendingPathComponent("v2", isDirectory: true),
+        ]
+        for url in candidates where FileManager.default.fileExists(atPath: url.path) {
+            let descriptor = open(url.path, O_EVTONLY)
+            guard descriptor >= 0 else { continue }
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: descriptor,
+                eventMask: [.write, .delete, .rename],
+                queue: .main
+            )
+            source.setEventHandler { [weak self] in
+                self?.scheduleSettingsChangeRefresh()
+            }
+            source.setCancelHandler { close(descriptor) }
+            source.resume()
+            settingsWatchers.append(source)
+        }
+        lastSeenSettingsStamps = Self.readSettingsFileStamps()
+        lastSeenSettingsIdentity = Self.readSettingsFileIdentity()
+    }
+
+    /// zcode 换号会连续重写文件，防抖 1 秒合并为一次判定。
+    private func scheduleSettingsChangeRefresh() {
+        settingsChangeDebounce?.cancel()
+        settingsChangeDebounce = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.handleSettingsFilesChange()
+        }
+    }
+
+    /// 目录事件 ≠ 两个文件变了，逐层过滤：
+    /// 1. stamps 未变 → sqlite-wal 等目录噪声，忽略；
+    /// 2. 语义摘要未变 → token 轮换 / recentProjects 等无关重写，忽略；
+    /// 3. 账号 / 渠道 / 套餐真的变了 → 只更新本地状态：清掉旧上下文的快照与
+    ///    override、重读账号标签并通知 UI。不发起任何网络请求——下一次额度
+    ///    刷新由周期定时器、手动刷新或套餐视图切换 / 重置触发，fetchSnapshot
+    ///    执行时现读文件，自然用上最新参数。
+    private func handleSettingsFilesChange() {
+        let currentStamps = Self.readSettingsFileStamps()
+        let currentIdentity = Self.readSettingsFileIdentity()
+        let action = ZAISettingsChangeResolver.resolve(
+            previousStamps: lastSeenSettingsStamps,
+            currentStamps: currentStamps,
+            previousIdentity: lastSeenSettingsIdentity,
+            currentIdentity: currentIdentity
+        )
+        lastSeenSettingsStamps = currentStamps
+        lastSeenSettingsIdentity = currentIdentity
+        guard action == .applySettingsChange else { return }
+        applyCurrentDomainIfChanged()
+        account = ZAISettings.loadAccount()
+        onChange?(snapshot, account, false, lastError)
+    }
+
+    /// 与 ZAISettings 读取一致的文件清单，按固定顺序取 (mtime, size)。
+    private static func readSettingsFileStamps() -> [ZAISettingsFileStamp] {
+        ZAISettings.settingsFileURLs.map { url in
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            return ZAISettingsFileStamp(
+                modifiedAt: attributes?[.modificationDate] as? Date,
+                byteCount: (attributes?[.size] as? NSNumber)?.intValue
+            )
+        }
+    }
+
+    /// 语义摘要：账号身份 + 文件级 provider 选择。不含套餐视图 override——
+    /// override 存在 UserDefaults，变化走 refreshAfterPlanViewChange 立即刷新。
+    private static func readSettingsFileIdentity() -> ZAISettingsFileIdentity {
+        ZAISettingsFileIdentity(
+            account: ZAISettings.currentAccountIdentity(),
+            selection: ZAISettings.loadSettingObject().flatMap {
+                ZAISettings.resolveProviderSelection(object: $0)
+            }
+        )
+    }
+
     /// 已弃用：start() 与 timer 回调直接调 refresh()，行为与 Codex `refresh(force:)` 一致。
     /// 保留以兼容可能存在的旧调用点（实际目前已无人调用）。
     func refreshIfNeeded() {
         refresh()
     }
 
-    /// 重置成功后必须开始一次新查询；已有查询尚未结束时排队执行。
-    func refreshAfterReset() {
+    /// 外部状态变更（重置成功、套餐视图切换）后必须开始一次新查询；
+    /// 已有查询尚未结束时排队执行，避免停留在旧口径展示。
+    private func queueRefreshAfterCurrent() {
         if isRefreshing {
             needsRefreshAfterCurrent = true
         } else {
             refresh()
         }
+    }
+
+    /// 重置成功后必须开始一次新查询。
+    func refreshAfterReset() {
+        queueRefreshAfterCurrent()
+    }
+
+    /// 套餐视图切换后必须按新视图重查（refresh 每次重读有效 selection，
+    /// override 已持久化，无需额外传参）。
+    func refreshAfterPlanViewChange() {
+        queueRefreshAfterCurrent()
     }
 
     func refresh() {
@@ -722,6 +1212,7 @@ final class ZAIQuotaStore {
         lastRefreshStartedAt = Date()
         lastResetScopeID = nil
         pendingUsageSyncContext = nil
+        applyCurrentDomainIfChanged()
         account = ZAISettings.loadAccount()
         onChange?(snapshot, account, true, lastError)
 
@@ -746,6 +1237,30 @@ final class ZAIQuotaStore {
             }
         }
     }
+
+    /// providerFamilyDomain 或账号变化时，旧快照/override 都属于旧上下文，必须清掉。
+    private func applyCurrentDomainIfChanged() {
+        let domain = ZAISettings.resolveProviderSelection()?.domain
+        let previousDomain = ZAIPlanViewSettings.loadLastDomain()
+        let accountID = ZAISettings.currentAccountIdentity()
+        let previousAccountID = ZAIPlanViewSettings.loadLastAccountID()
+        let domainChanged = previousDomain != nil && domain != previousDomain
+        // 只有两边都识别出身份且不同，才算换号；首次识别仅记录，不误清缓存。
+        let accountChanged = previousAccountID != nil && accountID != nil && accountID != previousAccountID
+        let shouldRecordAccount = accountID != nil && accountID != previousAccountID
+        guard domain != previousDomain || accountChanged || shouldRecordAccount else { return }
+        if accountChanged || domainChanged {
+            ZAIPlanViewSettings.clear()
+            snapshot = nil
+            account = nil
+            lastError = nil
+        }
+        ZAIPlanViewSettings.saveLastDomain(domain)
+        ZAIPlanViewSettings.saveLastAccountID(accountID)
+        lastAppliedDomain = domain
+    }
+
+
 
     private func fetchSnapshot() async throws -> ZAIQuotaSnapshot {
         guard let selection = ZAISettings.resolveProviderSelection() else {
@@ -805,9 +1320,10 @@ final class ZAIQuotaStore {
     }
 
     /// 解析 billing/balance 响应（payload：{code,msg,data:{plans,balances}}），网络与 host 日志共用。
-    private static func parseStartPlanSnapshot(payload: [String: Any],
-                                               selection: ZAIProviderSelection,
-                                               fetchedAt: Date = Date()) throws -> ZAIQuotaSnapshot {
+    static func parseStartPlanSnapshot(payload: [String: Any],
+                                       selection: ZAIProviderSelection,
+                                       fetchedAt: Date = Date(),
+                                       now: Date = Date()) throws -> ZAIQuotaSnapshot {
         try Self.checkBusinessError(payload)
 
         guard let dataPayload = payload["data"] as? [String: Any]
@@ -815,15 +1331,60 @@ final class ZAIQuotaStore {
 
         // plans[] 提供套餐名；entitlements[] 提供权益生效时间与额度。
         let plans = (dataPayload["plans"] as? [[String: Any]]) ?? []
-        let activePlan = plans.first { ($0["status"] as? String) == "active" } ?? plans.first
+        // balances 对应的权益才是当前已生效口径；套餐元数据必须按 entitlement_id
+        // 反查，不能只看 plans[] 的首个 active 项（同一响应可含多个 active 套餐）。
+        let balancesByPriority: [(priority: Int, entitlementID: String?, balance: [String: Any])] =
+            ((dataPayload["balances"] as? [[String: Any]]) ?? []).compactMap { balance in
+                let totalUnits = (balance["total_units"] as? NSNumber)?.doubleValue ?? 0
+                guard totalUnits > 0 else { return nil }
+                return (
+                    priority: (balance["priority"] as? NSNumber)?.intValue ?? 0,
+                    entitlementID: balance["entitlement_id"] as? String,
+                    balance: balance
+                )
+            }.sorted { $0.priority > $1.priority }
+
+        let balanceEntitlementIDs = Set(balancesByPriority.compactMap(\.entitlementID))
+        let balancePlans = plans.filter { plan in
+            ((plan["entitlements"] as? [[String: Any]]) ?? []).contains { entitlement in
+                guard let id = entitlement["entitlement_id"] as? String else { return false }
+                return balanceEntitlementIDs.contains(id)
+            }
+        }
+        let displayPlan = balancePlans.max { lhs, rhs in
+            let lhsPriority = (lhs["priority"] as? NSNumber)?.intValue ?? 0
+            let rhsPriority = (rhs["priority"] as? NSNumber)?.intValue ?? 0
+            return lhsPriority < rhsPriority
+        } ?? plans.first { ($0["status"] as? String) == "active" } ?? plans.first
 
         // 套餐级信息：权益生效前（新规则：套餐未到开始时间）接口 balances 为空，
         // 只返回 plans[].entitlements[]，这里保留用于「待生效」展示，不算错误。
-        let planStatus = activePlan?["status"] as? String
-        let planStartAt = activePlan.flatMap { Self.secondLevelDate($0["starts_at"]) }
-        let planEndAt = activePlan.flatMap { Self.secondLevelDate($0["ends_at"]) }
-        let pendingEntitlements: [ZAIPendingEntitlement] =
-            ((activePlan?["entitlements"] as? [[String: Any]]) ?? []).compactMap { item in
+        let planStatus = displayPlan?["status"] as? String
+        let planStartAt = displayPlan.flatMap { Self.secondLevelDate($0["starts_at"]) }
+        let planEndAt = displayPlan.flatMap { Self.secondLevelDate($0["ends_at"]) }
+        // “待开始”可能表现为套餐 starts_at 未到，也可能 starts_at 已到但权益
+        // effective_at 未到（本机 Global Build 实测形态）。只展示另一个套餐的提示，
+        // 不把它混进当前 active 额度。
+        let displayPlanID = displayPlan?["user_plan_id"] as? String
+        let upcomingPlan = plans
+            .filter { $0["status"] as? String == "active" }
+            .filter { ($0["user_plan_id"] as? String) != displayPlanID }
+            .filter { plan in
+                let start = Self.secondLevelDate(plan["starts_at"])
+                let entitlementEffectiveAt = ((plan["entitlements"] as? [[String: Any]]) ?? [])
+                    .compactMap { Self.secondLevelDate($0["effective_at"]) }
+                    .filter { $0 > now }
+                    .min()
+                return (start.map { $0 > now } ?? false) || entitlementEffectiveAt != nil
+            }
+            .max { lhs, rhs in
+                let lhsPriority = (lhs["priority"] as? NSNumber)?.intValue ?? 0
+                let rhsPriority = (rhs["priority"] as? NSNumber)?.intValue ?? 0
+                return lhsPriority < rhsPriority
+            }
+        let pendingEntitlements: [ZAIPendingEntitlement]
+        if balancesByPriority.isEmpty {
+            pendingEntitlements = ((displayPlan?["entitlements"] as? [[String: Any]]) ?? []).compactMap { item in
                 let title = (item["show_name"] as? String) ?? ""
                 guard !title.isEmpty else { return nil }
                 return ZAIPendingEntitlement(
@@ -834,7 +1395,10 @@ final class ZAIQuotaStore {
                     expiresAt: Self.secondLevelDate(item["expires_at"]) ?? planEndAt
                 )
             }
-            .filter { $0.effectiveAt.map { $0 > Date() } ?? true }
+            .filter { $0.effectiveAt.map { $0 > now } ?? true }
+        } else {
+            pendingEntitlements = []
+        }
 
         var periodByEntitlement: [String: String] = [:]
         for plan in plans {
@@ -846,39 +1410,97 @@ final class ZAIQuotaStore {
             }
         }
 
-        let balances: [(priority: Int, balance: ZAIBalance)] = ((dataPayload["balances"] as? [[String: Any]]) ?? []).compactMap { balance in
-            let totalUnits = (balance["total_units"] as? NSNumber)?.doubleValue ?? 0
-            guard totalUnits > 0 else { return nil }
-            let entitlementID = balance["entitlement_id"] as? String
+        let balances: [(priority: Int, balance: ZAIBalance)] = balancesByPriority.map { item in
+            let balance = item.balance
+            let entitlementID = item.entitlementID
             // period 缺失时按周期跨度推断：跨天视为 one_time，当天内视为 daily。
             let period = entitlementID.flatMap { periodByEntitlement[$0] }
                 ?? Self.inferPeriod(start: (balance["period_start"] as? NSNumber)?.doubleValue,
                                     end: (balance["period_end"] as? NSNumber)?.doubleValue)
             return (
-                priority: (balance["priority"] as? NSNumber)?.intValue ?? 0,
+                priority: item.priority,
                 balance: ZAIBalance(
                     title: (balance["show_name"] as? String) ?? "额度",
-                    totalUnits: totalUnits,
+                    totalUnits: (balance["total_units"] as? NSNumber)?.doubleValue ?? 0,
                     remainingUnits: (balance["remaining_units"] as? NSNumber)?.doubleValue
                         ?? (balance["available_units"] as? NSNumber)?.doubleValue ?? 0,
                     expiresAt: Self.secondLevelDate(balance["expires_at"]),
                     period: period
                 )
             )
-        }.sorted { $0.priority > $1.priority }
+        }
         let visibleBalances = balances.map(\.balance)
+        let balanceByEntitlementID: [String: ZAIBalance] = Dictionary(
+            uniqueKeysWithValues: balancesByPriority.compactMap { item -> (String, ZAIBalance)? in
+                guard let entitlementID = item.entitlementID else { return nil }
+                let raw = item.balance
+                let period = periodByEntitlement[entitlementID]
+                    ?? Self.inferPeriod(start: (raw["period_start"] as? NSNumber)?.doubleValue,
+                                        end: (raw["period_end"] as? NSNumber)?.doubleValue)
+                return (entitlementID, ZAIBalance(
+                    title: (raw["show_name"] as? String) ?? "额度",
+                    totalUnits: (raw["total_units"] as? NSNumber)?.doubleValue ?? 0,
+                    remainingUnits: (raw["remaining_units"] as? NSNumber)?.doubleValue
+                        ?? (raw["available_units"] as? NSNumber)?.doubleValue ?? 0,
+                    expiresAt: Self.secondLevelDate(raw["expires_at"]),
+                    period: period
+                ))
+            }
+        )
+        let planItems: [ZAIPlanItem] = plans.compactMap { plan -> ZAIPlanItem? in
+            guard let name = plan["name"] as? String, !name.isEmpty else { return nil }
+            let startsAt = Self.secondLevelDate(plan["starts_at"])
+            let endsAt = Self.secondLevelDate(plan["ends_at"])
+            let planBalances = ((plan["entitlements"] as? [[String: Any]]) ?? [])
+                .compactMap { $0["entitlement_id"] as? String }
+                .compactMap { balanceByEntitlementID[$0] }
+            let pending: [ZAIPendingEntitlement] = ((plan["entitlements"] as? [[String: Any]]) ?? []).compactMap { item in
+                let title = (item["show_name"] as? String) ?? ""
+                guard !title.isEmpty else { return nil }
+                return ZAIPendingEntitlement(
+                    title: title,
+                    grantUnits: (item["grant_units"] as? NSNumber)?.doubleValue ?? 0,
+                    effectiveAt: Self.secondLevelDate(item["effective_at"]),
+                    period: (item["period"] as? String) ?? "one_time",
+                    expiresAt: Self.secondLevelDate(item["expires_at"]) ?? endsAt
+                )
+            }
+            let hasPending = pending.contains { $0.effectiveAt.map { $0 > now } ?? false }
+            let status: ZAIPlanItem.Status
+            if planBalances.isEmpty && hasPending {
+                status = .upcoming
+            } else if let endsAt, endsAt < now {
+                status = .ended
+            } else if planBalances.isEmpty {
+                status = .unknown
+            } else {
+                status = .active
+            }
+            return ZAIPlanItem(
+                name: name,
+                description: plan["description"] as? String,
+                status: status,
+                startsAt: startsAt,
+                endsAt: endsAt,
+                balances: planBalances,
+                pendingEntitlements: pending
+            )
+        }
 
         return ZAIQuotaSnapshot(
             kind: .startPlan,
             balances: Array(visibleBalances),
-            planName: activePlan?["name"] as? String,
-            planDescription: activePlan?["description"] as? String,
+            planName: displayPlan?["name"] as? String,
+            planDescription: displayPlan?["description"] as? String,
             email: ZAISettings.loadAccount()?.email,
             fetchedAt: fetchedAt,
             planStatus: planStatus,
             planStartAt: planStartAt,
             planEndAt: planEndAt,
-            pendingEntitlements: pendingEntitlements
+            pendingEntitlements: pendingEntitlements,
+            upcomingPlanName: upcomingPlan?["name"] as? String,
+            upcomingPlanStartAt: upcomingPlan.flatMap { Self.secondLevelDate($0["starts_at"]) },
+            planItems: planItems
         )
     }
 
@@ -892,7 +1514,7 @@ final class ZAIQuotaStore {
     /// 从 ~/.zcode/v2/logs/<当天>.log 取最新一条 start-plan 的 billing/balance 响应 payload。
     /// host 每 ~秒把完整响应写进 [usage-stats]/[coding-plan-availability] 行，
     /// 只认 providerId 为 start-plan 的条目（前缀见 isStartPlanLogProviderID）。
-    private static func latestStartPlanBalancePayload(domain: String) -> [String: Any]? {
+    private nonisolated static func latestStartPlanBalancePayload(domain: String) -> [String: Any]? {
         let logs = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".zcode", isDirectory: true)
             .appendingPathComponent("v2", isDirectory: true)
@@ -991,7 +1613,7 @@ final class ZAIQuotaStore {
         }
 
         // 用量同步上下文：与额度查询同一组已捕获凭证（团队含项目 Key/Secret），
-        // ZAIServerUsageStore 复用它请求 model-usage，避免重复换取项目 Key。
+        // ZAIServerUsageStore 复用它请求 credit-usage，避免重复换取项目 Key。
         pendingUsageSyncContext = ZAIUsageSyncContext(
             domain: selection.domain,
             email: email,

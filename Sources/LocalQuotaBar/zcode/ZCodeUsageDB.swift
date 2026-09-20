@@ -15,12 +15,16 @@ enum ZCodeUsageDB {
         guard FileManager.default.fileExists(atPath: dbURL.path) else { return nil }
 
         var handle: OpaquePointer?
-        guard sqlite3_open_v2(dbURL.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        // Zcode 数据库处于 WAL 模式；READONLY 连接在 wal/shm 伴文件被清理后，
+        // prepare 可能因无法重建共享内存返回 SQLITE_CANTOPEN。这里以 READWRITE
+        // 打开并立即启用 query_only，保持应用侧不写入数据库的只读语义。
+        guard sqlite3_open_v2(dbURL.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
             sqlite3_close(handle)
             return nil
         }
         defer { sqlite3_close(handle) }
         sqlite3_busy_timeout(handle, 400)
+        sqlite3_exec(handle, "PRAGMA query_only = ON", nil, nil, nil)
 
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
@@ -200,12 +204,14 @@ enum ZCodeUsageDB {
         guard FileManager.default.fileExists(atPath: dbURL.path) else { return nil }
 
         var handle: OpaquePointer?
-        guard sqlite3_open_v2(dbURL.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+        // 同上：WAL 数据库需要可写连接来恢复共享内存；query_only 防止业务查询写入。
+        guard sqlite3_open_v2(dbURL.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK else {
             sqlite3_close(handle)
             return nil
         }
         defer { sqlite3_close(handle) }
         sqlite3_busy_timeout(handle, 400)
+        sqlite3_exec(handle, "PRAGMA query_only = ON", nil, nil, nil)
 
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK else {

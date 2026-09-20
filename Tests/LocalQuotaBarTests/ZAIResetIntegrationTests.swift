@@ -21,8 +21,9 @@ final class ZAIResetIntegrationTests: XCTestCase {
         for kind: ZAIPlanKind in [.apiKey, .startPlan] {
             XCTAssertThrowsError(try context(.init(domain: "zai", kind: kind, selectedKey: nil)))
         }
+        // legacy selectedKey 认出的团队连接缺少组织/项目时不能发请求。
         XCTAssertThrowsError(try context(.init(domain: "zai", kind: .codingPlan, selectedKey: "team:project")))
-        // ZCode 3.12.3+ 不写 selectedKey，团队版只能从 connectionKind 认出来。
+        // ZCode 3.12.3+ 团队连接必须有完整团队作用域。
         XCTAssertThrowsError(try ZAIResetContextResolver.makeContext(
             selection: .init(domain: "zai", kind: .codingPlan, selectedKey: nil,
                              connectionKind: "team-coding-plan"),
@@ -34,6 +35,20 @@ final class ZAIResetIntegrationTests: XCTestCase {
                              connectionKind: "individual-coding-plan"),
             jwt: token(["sub": "owner", "exp": 1]), oauthToken: token(["sub": "account", "exp": 1]), userInfo: nil
         ))
+        // 完整团队作用域必须放行，并进入团队重置链路。
+        let teamContext = ZAITeamContext(productId: "product-a", organizationId: "org-a", projectId: "project-a")
+        let team = try ZAIResetContextResolver.makeContext(
+            selection: .init(domain: "bigmodel", kind: .codingPlan, selectedKey: nil,
+                             connectionKind: "team-coding-plan", teamContext: teamContext),
+            jwt: token(["sub": "owner", "exp": 1]), oauthToken: token(["sub": "account", "exp": 1]), userInfo: nil
+        )
+        XCTAssertEqual(team.teamContext, teamContext)
+        XCTAssertNotEqual(team.scopeID, try ZAIResetContextResolver.makeContext(
+            selection: .init(domain: "bigmodel", kind: .codingPlan, selectedKey: nil,
+                             connectionKind: "team-coding-plan",
+                             teamContext: .init(productId: nil, organizationId: "org-b", projectId: "project-a")),
+            jwt: token(["sub": "owner", "exp": 1]), oauthToken: token(["sub": "account", "exp": 1]), userInfo: nil
+        ).scopeID)
         XCTAssertThrowsError(try ZAIResetContextResolver.makeContext(
             selection: .init(domain: "zai", kind: .codingPlan, selectedKey: nil),
             jwt: token(["exp": 123]), oauthToken: "opaque", userInfo: nil

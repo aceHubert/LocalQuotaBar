@@ -5,11 +5,13 @@ import Foundation
 enum ZAIResetContextResolver {
     enum ContextError: LocalizedError {
         case unsupportedPlan
+        case missingTeamContext
         case missingIdentity
 
         var errorDescription: String? {
             switch self {
-            case .unsupportedPlan: return "仅支持个人 Coding Plan 重置"
+            case .unsupportedPlan: return "仅支持 Coding Plan 重置"
+            case .missingTeamContext: return "团队套餐缺少组织或项目信息，无法重置"
             case .missingIdentity: return "无法确认当前账号身份，请重新登录 ZCode"
             }
         }
@@ -35,10 +37,10 @@ enum ZAIResetContextResolver {
         userInfo: [String: Any]?
     ) throws -> ZAIResetContext {
         guard selection.kind == .codingPlan,
-              ["zai", "bigmodel"].contains(selection.domain),
-              !Self.isTeamConnection(selection) else {
+              ["zai", "bigmodel"].contains(selection.domain) else {
             throw ContextError.unsupportedPlan
         }
+        let teamContext = try Self.teamContext(selection)
         let nestedUser = userInfo?["user"] as? [String: Any]
         guard let zcodeIdentity = identity(in: claims(jwt)),
               let platformIdentity = identity(in: claims(oauthToken))
@@ -47,18 +49,28 @@ enum ZAIResetContextResolver {
               !oauthToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ContextError.missingIdentity
         }
-        let identityData = try JSONEncoder().encode([selection.domain, zcodeIdentity, platformIdentity])
+        let scopeParts = [selection.domain, zcodeIdentity, platformIdentity,
+                          teamContext?.organizationId, teamContext?.projectId].compactMap { $0 }
+        let identityData = try JSONEncoder().encode(scopeParts)
         let scope = SHA256.hash(data: identityData).map { String(format: "%02x", $0) }.joined()
-        return ZAIResetContext(scopeID: scope, jwt: jwt, oauthToken: oauthToken)
+        return ZAIResetContext(scopeID: scope, jwt: jwt, oauthToken: oauthToken,
+                               teamContext: teamContext)
     }
 
-    /// 团队版没有个人重置卡。新格式（ZCode 3.12.3+）不写 selectedKey，team 只能从
-    /// providerFamilyConnectionSelections 的 connectionKind 认出来；legacy 才看 selectedKey。
-    private static func isTeamConnection(_ selection: ZAIProviderSelection) -> Bool {
+    /// 团队连接必须同时具备组织与项目作用域；新格式优先看 connectionKind，
+    /// legacy 配置才回退到 selectedKey。
+    private static func teamContext(_ selection: ZAIProviderSelection) throws -> ZAITeamContext? {
+        let isTeam: Bool
         if let connectionKind = selection.connectionKind {
-            return connectionKind == "team-coding-plan"
+            isTeam = connectionKind == "team-coding-plan"
+        } else {
+            isTeam = selection.selectedKey?.lowercased().contains("team") ?? false
         }
-        return selection.selectedKey?.lowercased().contains("team") ?? false
+        guard isTeam else { return nil }
+        guard let context = selection.teamContext else {
+            throw ContextError.missingTeamContext
+        }
+        return context
     }
 
     private static func identity(in object: [String: Any]?) -> String? {

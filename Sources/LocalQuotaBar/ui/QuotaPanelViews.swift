@@ -545,6 +545,164 @@ final class QuotaCellView: NSView {
     }
 }
 
+/// Start Plan 多套餐卡片列表：每个套餐一张卡，卡片内保留现有额度格样式。
+final class StartPlanListView: NSView {
+    private let stack = NSStackView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 7
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(plans: [ZAIPlanItem]) {
+        stack.arrangedSubviews.forEach { stack.removeView($0) }
+        for plan in plans {
+            let card = StartPlanCardView(plan: plan)
+            stack.addArrangedSubview(card)
+            card.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+    }
+}
+
+/// 单个 Start Plan 卡片。
+private final class StartPlanCardView: NSView {
+    init(plan: ZAIPlanItem) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 8
+        layer?.backgroundColor = PanelTheme.cardBackground.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = PanelTheme.hairlineSubtle.cgColor
+
+        let title = NSTextField(labelWithString: plan.name)
+        title.font = .systemFont(ofSize: 11, weight: .bold)
+        title.textColor = PanelTheme.primaryText
+        title.maximumNumberOfLines = 1
+        title.lineBreakMode = .byTruncatingTail
+
+        let status = NSTextField(labelWithString: Self.statusText(plan))
+        status.font = .systemFont(ofSize: 9.5, weight: .medium)
+        status.textColor = Self.statusColor(plan)
+        status.maximumNumberOfLines = 1
+        status.lineBreakMode = .byTruncatingTail
+
+        let cells = plan.balances.map { balance -> QuotaCellView in
+            let cell = QuotaCellView()
+            cell.configure(
+                title: balance.title,
+                countdown: PanelTheme.formatCountdown(until: balance.expiresAt),
+                countdownSoon: Self.isSoon(balance.expiresAt),
+                content: .percent(remaining: balance.remainingFraction * 100),
+                tooltip: Self.balanceTooltip(balance, plan: plan)
+            )
+            return cell
+        }
+        let pendingCells = plan.status == .upcoming
+            ? plan.pendingEntitlements.prefix(2).map { entitlement -> QuotaCellView in
+                let cell = QuotaCellView()
+                cell.configure(
+                    title: entitlement.title,
+                    countdown: PanelTheme.formatCountdown(until: entitlement.expiresAt),
+                    countdownSoon: false,
+                    content: .pending(text: PanelTheme.formatTokenCount(entitlement.grantUnits)),
+                    tooltip: Self.pendingTooltip(entitlement)
+                )
+                return cell
+            }
+            : []
+        let visibleCells = Array((cells.isEmpty ? pendingCells : cells).prefix(2))
+
+        let grid = NSStackView(views: visibleCells)
+        grid.orientation = .horizontal
+        grid.alignment = .top
+        grid.spacing = 7
+        grid.distribution = .fillEqually
+
+        let rows = NSStackView(views: [title, status, grid])
+        rows.orientation = .vertical
+        rows.alignment = .leading
+        rows.spacing = 5
+        rows.translatesAutoresizingMaskIntoConstraints = false
+        grid.widthAnchor.constraint(equalTo: rows.widthAnchor).isActive = true
+
+        addSubview(rows)
+        NSLayoutConstraint.activate([
+            rows.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            rows.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            rows.topAnchor.constraint(equalTo: topAnchor, constant: 8),
+            rows.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    private static func statusText(_ plan: ZAIPlanItem) -> String {
+        switch plan.status {
+        case .upcoming:
+            let effectiveAt = plan.pendingEntitlements.compactMap(\.effectiveAt).filter { $0 > Date() }.min()
+            let start = effectiveAt ?? plan.startsAt
+            return "待生效 \(formatDateTime(start)) · 过期时间 \(formatDateTime(plan.endsAt))"
+        case .ended:
+            return "已结束 \(formatDateTime(plan.endsAt))"
+        case .active:
+            return "过期时间 \(formatDateTime(plan.endsAt))"
+        case .unknown:
+            return "状态未知"
+        }
+    }
+
+    private static func statusColor(_ plan: ZAIPlanItem) -> NSColor {
+        switch plan.status {
+        case .upcoming: return PanelTheme.orange
+        case .ended: return PanelTheme.tertiaryText
+        case .active: return PanelTheme.secondaryText
+        case .unknown: return PanelTheme.tertiaryText
+        }
+    }
+
+    private static func isSoon(_ date: Date?) -> Bool {
+        guard let date else { return false }
+        return Date().distance(to: date) < PanelTheme.resetSoonThreshold
+    }
+
+    private static func balanceTooltip(_ balance: ZAIBalance, plan: ZAIPlanItem) -> String {
+        let used = PanelTheme.formatTokenCount(max(balance.totalUnits - balance.remainingUnits, 0))
+        let periodText = balance.isDaily ? "每日额度" : "一次性额度"
+        return "\(plan.name) · \(balance.title) · \(periodText)，剩余 \(PanelTheme.formatTokenCount(balance.remainingUnits))/\(PanelTheme.formatTokenCount(balance.totalUnits))（已用 \(used)）"
+    }
+
+    private static func pendingTooltip(_ entitlement: ZAIPendingEntitlement) -> String {
+        "\(entitlement.title) · 待生效，\(PanelTheme.formatCountdown(until: entitlement.effectiveAt) ?? "--") 后可用"
+    }
+
+    private static func formatDateTime(_ date: Date?) -> String {
+        guard let date else { return "--" }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+        formatter.dateFormat = "M月d日 HH:mm"
+        return formatter.string(from: date)
+    }
+}
+
 /// 重置卡 chip + 展开卡列表。支持多枚 chip（ZAI 的 5h/周各一枚）。
 final class ResetCardsRow: NSView {
     private static let controlHeight: CGFloat = 18

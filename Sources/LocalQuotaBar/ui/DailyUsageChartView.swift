@@ -32,7 +32,7 @@ struct ChartBarLayout: Equatable {
 
 /// 30 根细柱 + 日均值 + 周刻度 + 今日高亮；hover 显示某天明细。
 /// Z.AI 实例传入渠道拆分数据后支持「总量 / 叠加」两种显示：叠加模式下柱子
-/// 下段为套餐（服务端 model-usage，全设备，绿），上段为本机非套餐渠道（橙），
+/// 下段为套餐（服务端 credit-usage，全设备，绿），上段为本机非套餐渠道（橙），
 /// 两段不重叠、总计即账号全部消耗；Codex 实例维持总量单色。
 enum UsageDisplayMode: String {
     case total
@@ -344,7 +344,7 @@ final class DailyUsageChartView: NSView {
         return base
     }
 
-    /// 叠加模式图例行："■ 套餐（服务端） / ■ 第三方（本机）"；总量模式隐藏。
+    /// 叠加模式图例行："■ 套餐 / ■ 第三方（本机）"；总量模式隐藏。
     /// 位于日期刻度行之下（卡片最后一行）。
     private func drawLegend() {
         guard showsLegend else { return }
@@ -354,7 +354,7 @@ final class DailyUsageChartView: NSView {
             .foregroundColor: PanelTheme.tertiaryText
         ]
         var x = inset + 1
-        for (color, text) in [(PanelTheme.green, "套餐（服务端）"), (PanelTheme.orange, "第三方（本机）")] {
+        for (color, text) in [(PanelTheme.green, "套餐"), (PanelTheme.orange, "第三方（本机）")] {
             let square = NSBezierPath(
                 roundedRect: NSRect(x: x, y: y + 1.5, width: 4.5, height: 4.5),
                 xRadius: 1.5, yRadius: 1.5

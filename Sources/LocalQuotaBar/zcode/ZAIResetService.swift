@@ -6,6 +6,8 @@ struct ZAIResetContext {
     let scopeID: String
     let jwt: String
     let oauthToken: String
+    /// 团队 Coding Plan 的重置请求必须携带组织与项目作用域；个人套餐为 nil。
+    let teamContext: ZAITeamContext?
 }
 
 enum ZAIResetState: Equatable {
@@ -147,7 +149,12 @@ final class ZAIResetService {
         let authorization = jwt.lowercased().hasPrefix("bearer ") ? jwt : "Bearer \(jwt)"
         request.setValue(authorization, forHTTPHeaderField: "Authorization")
         request.setValue(context.oauthToken, forHTTPHeaderField: "X-Bigmodel-Authorization")
-        request.setValue("PERSONAL", forHTTPHeaderField: "Bigmodel-Target-Type")
+        request.setValue(context.teamContext == nil ? "PERSONAL" : "TEAM",
+                         forHTTPHeaderField: "Bigmodel-Target-Type")
+        if let teamContext = context.teamContext {
+            request.setValue(teamContext.organizationId, forHTTPHeaderField: "Bigmodel-Organization")
+            request.setValue(teamContext.projectId, forHTTPHeaderField: "Bigmodel-Project")
+        }
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode([
             "idempotency_key": idempotencyKey,

@@ -4,6 +4,29 @@ import XCTest
 
 final class ZAIUsagePresentationTests: XCTestCase {
     @MainActor
+    func testStartPlanShowsUpcomingPlanHintBelowHeader() throws {
+        let section = ZAIPanelSection(resolveSelection: {
+            ZAIProviderSelection(domain: "bigmodel", kind: .startPlan, selectedKey: nil)
+        })
+        let start = Date(timeIntervalSince1970: 1_789_802_823)
+        let snapshot = ZAIQuotaSnapshot(
+            kind: .startPlan,
+            planName: "ZCode Start Plan",
+            fetchedAt: Date(timeIntervalSince1970: 0),
+            upcomingPlanName: "ZCode Global Build",
+            upcomingPlanStartAt: start
+        )
+
+        section.apply(snapshot: snapshot, account: nil, isRefreshing: false, error: nil, titleOverride: "BigModel")
+
+        let providerSection = try providerSection(in: section)
+        XCTAssertFalse(providerSection.modeHintLabel.isHiddenOrHasHiddenAncestor)
+        XCTAssertTrue(providerSection.modeHintLabel.stringValue.contains("ZCode Global Build"))
+        XCTAssertTrue(providerSection.modeHintLabel.stringValue.contains("开始"))
+        XCTAssertFalse(providerSection.modeHintLabel.isDescendant(of: providerSection.header))
+    }
+
+    @MainActor
     func testAPIKeyModeShowsSeparateHintAndKeepsDailyUsageVisible() async throws {
         _ = NSApplication.shared
         let panel = ZAIPanelSection(resolveSelection: { nil })

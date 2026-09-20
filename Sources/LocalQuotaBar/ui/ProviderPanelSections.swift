@@ -13,6 +13,7 @@ final class ProviderPanelSection: NSView {
     let header = ProviderHeaderView()
     let modeHintLabel = NSTextField(labelWithString: "")
     let grid = NSStackView()
+    let startPlanList = StartPlanListView()
     let resetCards = ResetCardsRow()
     let paceChart = WeeklyPaceChartView()
     let usageChart = DailyUsageChartView()
@@ -55,7 +56,8 @@ final class ProviderPanelSection: NSView {
         // 周限配速图默认隐藏；无周限桶的 provider 不占空间
         paceChart.isHidden = true
 
-        let stack = NSStackView(views: [header, modeHintLabel, grid, resetCards, paceChart, usageChart, errorBanner])
+        startPlanList.isHidden = true
+        let stack = NSStackView(views: [header, modeHintLabel, grid, startPlanList, resetCards, paceChart, usageChart, errorBanner])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
@@ -68,6 +70,7 @@ final class ProviderPanelSection: NSView {
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
             resetCards.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            startPlanList.widthAnchor.constraint(equalTo: stack.widthAnchor),
             paceChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             usageChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             errorBanner.widthAnchor.constraint(equalTo: stack.widthAnchor),
@@ -364,7 +367,8 @@ final class ZAIPanelSection: NSView {
         error: String?,
         titleOverride: String?
     ) {
-        // setting.json 是当前事实；快照可能还是切换账号/套餐前的旧缓存。
+        // 当前 selection（setting.json + 套餐视图 override）是事实；
+        // 快照可能还是切换账号/套餐视图前的旧缓存。
         quotaIsRefreshing = isRefreshing
         updateResetBusyState()
         let selection = resolveSelection()
@@ -374,6 +378,7 @@ final class ZAIPanelSection: NSView {
         var tagText: String?
         var cells: [QuotaCellView] = []
         var showsResetCards = false
+        var showsStartPlanList = false
 
         switch kind {
         case .apiKey:
@@ -385,6 +390,13 @@ final class ZAIPanelSection: NSView {
         case .startPlan:
             let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
             tagText = planName
+            let planItems = snapshot?.planItems ?? []
+            if planItems.count > 1 {
+                showsStartPlanList = true
+                section.startPlanList.configure(plans: planItems)
+                showsResetCards = false
+                break
+            }
             let tooltipBase = snapshot?.planDescription.flatMap { $0.isEmpty ? nil : $0 }
                 ?? snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 }
 
@@ -448,6 +460,7 @@ final class ZAIPanelSection: NSView {
         }
 
         section.grid.isHidden = cells.isEmpty
+        section.startPlanList.isHidden = !showsStartPlanList
         for cell in [firstCell, secondCell] where !cells.contains(cell) {
             cell.isHidden = true
         }
@@ -461,7 +474,22 @@ final class ZAIPanelSection: NSView {
 
         // 本机日用量是全渠道统计，不受 API Key 是否支持余额查询限制。
         section.usageChart.isHidden = false
-        section.setModeHint(kind == .apiKey ? "API Key 模式，无余额功能" : nil)
+        let modeHint: String?
+        switch kind {
+        case .apiKey:
+            modeHint = "API Key 模式，无余额功能"
+        case .startPlan:
+            if showsStartPlanList {
+                modeHint = nil
+            } else if let name = snapshot?.upcomingPlanName, let start = snapshot?.upcomingPlanStartAt {
+                modeHint = "\(name) 将于 \(Self.formatCompactDateTime(start)) 开始"
+            } else {
+                modeHint = nil
+            }
+        case .codingPlan:
+            modeHint = nil
+        }
+        section.setModeHint(modeHint)
         section.header.setRefreshAvailable(kind != .apiKey)
 
         // 头部状态

@@ -21,7 +21,7 @@ final class ZAIResetServiceTests: XCTestCase {
     }
 
     private func context(_ scope: String = "account-a", jwt: String = "test-jwt") -> ZAIResetContext {
-        ZAIResetContext(scopeID: scope, jwt: jwt, oauthToken: "test-oauth")
+        ZAIResetContext(scopeID: scope, jwt: jwt, oauthToken: "test-oauth", teamContext: nil)
     }
 
     private func response(_ request: URLRequest, status: Int = 200,
@@ -65,6 +65,27 @@ final class ZAIResetServiceTests: XCTestCase {
         XCTAssertEqual(body["reset_type"], "FIVE_HOUR")
         XCTAssertNotNil(UUID(uuidString: try XCTUnwrap(body["idempotency_key"])))
         XCTAssertEqual(try storedKeys(url).count, 0)
+    }
+
+    @MainActor
+    func testTeamRequestCarriesOrganizationAndProjectScope() async throws {
+        let url = try temporaryStorage()
+        var request: URLRequest?
+        let service = ZAIResetService(storageURL: url, transport: { sent in
+            request = sent
+            return self.response(sent)
+        })
+        let teamContext = ZAITeamContext(productId: "product-test",
+                                         organizationId: "org-test", projectId: "project-test")
+        let succeeded = await service.use(
+            context: ZAIResetContext(scopeID: "team-account", jwt: "test-jwt",
+                                     oauthToken: "test-oauth", teamContext: teamContext),
+            kind: .week
+        )
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Bigmodel-Target-Type"), "TEAM")
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Bigmodel-Organization"), "org-test")
+        XCTAssertEqual(request?.value(forHTTPHeaderField: "Bigmodel-Project"), "project-test")
     }
 
     @MainActor
