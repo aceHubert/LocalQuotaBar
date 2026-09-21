@@ -1114,6 +1114,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     /// 两个供应商共用点击锁；进入异步任务前同步上锁，避免快速连点。
     private var resetRequestInFlight = false
+    /// Codex app-server 重启进行中；期间禁用账号切换，避免并发切换与停止进程交错。
+    private var codexRestartInFlight = false
     private let zaiStore = ZAIQuotaStore()
     private let zaiResetService = ZAIResetService()
     private var presentedResetScopeID: String?
@@ -1820,7 +1822,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = account.fileName
             item.state = account.accountId == selectedAccountId ? .on : .off
-            item.isEnabled = !resetRequestInFlight
+            item.isEnabled = !resetRequestInFlight && !codexRestartInFlight
             submenu.addItem(item)
         }
 
@@ -1828,16 +1830,91 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func accountMenuItemSelected(_ sender: NSMenuItem) {
-        guard !resetRequestInFlight, let fileName = sender.representedObject as? String else { return }
+        guard !resetRequestInFlight, !codexRestartInFlight,
+              let fileName = sender.representedObject as? String else { return }
         do {
             try authManager.switchAccount(to: fileName)
             initializeAccountSwitcher()
-            quotaViewController.showAccountSwitchStatus("已切换账号，正在刷新…")
-            store.refresh(force: true)
+            guard confirmRestartCodexAfterSwitch(label: currentAccountLabel()) else {
+                // 不重启也刷新：本应用的读取进程每次新拉起，直接读新 auth.json。
+                quotaViewController.showAccountSwitchStatus("已切换账号，重启 Codex 后新账号生效")
+                store.refresh(force: true)
+                // 取消重启必须给出明确反馈，避免误以为新账号已对 Codex 客户端生效。
+                presentSwitchDeferredAlert()
+                return
+            }
+            codexRestartInFlight = true
+            quotaViewController.showAccountSwitchStatus("已切换账号，正在重启 Codex…")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                // ps 枚举与 2 秒等待都在后台线程执行，不阻塞主线程。
+                let outcome = await Task.detached(priority: .userInitiated) {
+                    CodexAppServerRestartService.stopAppServers()
+                }.value
+                self.codexRestartInFlight = false
+                self.presentRestartOutcome(outcome)
+                self.store.refresh(force: true)
+            }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             quotaViewController.showAccountSwitchStatus(message)
         }
+    }
+
+    /// 切换账号成功后的重启确认弹框。
+    /// “取消”放第一个成为默认按钮，回车即取消：重启会中断 Codex 正在执行的任务，默认动作必须保守。
+    private func confirmRestartCodexAfterSwitch(label: String?) -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "立即重启 Codex？"
+        let switchedTo = label.map { "已切换到 \($0)。" } ?? "已切换账号。"
+        alert.informativeText = switchedTo
+            + "将停止当前用户的 Codex app-server 进程（正在执行的任务可能被中断），"
+            + "Codex 会自动拉起新进程并使用新账号。"
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "立即重启")
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// 取消重启后的结果提示：切换的账号要等 Codex 重启后才对 Codex 客户端生效。
+    private func presentSwitchDeferredAlert() {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "已切换账号"
+        alert.informativeText = "切换的账号将在 Codex 重启后生效。"
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
+    private func presentRestartOutcome(_ outcome: CodexAppServerRestartOutcome) {
+        switch outcome {
+        case .finished(let stopped, let notStopped) where notStopped.isEmpty:
+            quotaViewController.showAccountSwitchStatus(
+                "已停止 \(stopped.count) 个 Codex app-server，Codex 重新拉起后新账号生效"
+            )
+        case .finished(_, let notStopped):
+            presentRestartFailureAlert(
+                messageText: "部分 Codex app-server 未停止",
+                informativeText: "未停止的进程 PID：\(notStopped.map(String.init).joined(separator: "、"))。"
+                    + "账号已切换；建议重启 ChatGPT.app 或结束对应会话使新账号生效。"
+            )
+        case .noneFound:
+            quotaViewController.showAccountSwitchStatus("已切换账号，未发现运行中的 Codex app-server")
+        case .unknownScan(let message):
+            presentRestartFailureAlert(
+                messageText: "无法确认 Codex app-server 状态",
+                informativeText: "\(message)。账号已切换；建议重启 ChatGPT.app 使新账号生效。"
+            )
+        }
+    }
+
+    private func presentRestartFailureAlert(messageText: String, informativeText: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = messageText
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: "关闭")
+        alert.runModal()
     }
 
     /// 手动测试提醒投递链；无可用通道（无 Touch Bar 且无刘海屏）时给出提示。
