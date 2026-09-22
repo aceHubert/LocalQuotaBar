@@ -1118,6 +1118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var codexRestartInFlight = false
     private let zaiStore = ZAIQuotaStore()
     private let zaiResetService = ZAIResetService()
+    private let deepSeekStore = DeepSeekStore()
     private var presentedResetScopeID: String?
     private let authManager = CodexAuthManager()
     private let reminderCenter = ReminderCenter()
@@ -1168,6 +1169,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             zaiUsageStore.refresh()
         }
+        quotaViewController.onDeepSeekRefresh = { [weak self] in
+            self?.deepSeekStore.refresh()
+        }
         quotaViewController.onResetCodexCredit = { [weak self] creditID in
             self?.useCodexResetCredit(creditID)
         }
@@ -1183,6 +1187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let interval = TimeInterval(minutes) * 60
             store.setRefreshInterval(interval)
             zaiStore.setRefreshInterval(interval)
+            deepSeekStore.setRefreshInterval(interval)
             quotaViewController.applyRefreshInterval(minutes: minutes)
         }
         reminderCenter.start { [weak self] in
@@ -1203,6 +1208,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaViewController.applyReminderConfiguration(reminderCenter.configuration)
         initializeAccountSwitcher()
 
+        deepSeekStore.onChange = { [weak self] snapshot, isRefreshing, error in
+            guard let self else { return }
+            quotaViewController.applyDeepSeek(
+                snapshot: snapshot,
+                isRefreshing: isRefreshing,
+                error: error,
+                profileCount: deepSeekStore.lastProfileCount
+            )
+        }
         zaiStore.onChange = { [weak self] snapshot, account, isRefreshing, error in
             guard let self else { return }
             // 渠道切换（zai ↔ bigmodel）后标题、区块显隐必须按新 selection 重算。
@@ -1272,6 +1286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         store.start()
         zaiStore.start()
+        deepSeekStore.start()
 
         // 日用量图表：先回放缓存，再接变更回调并启动官方用量拉取
         quotaViewController.applyCodexUsage(codexUsageStore.snapshot?.last30Days)
@@ -1586,6 +1601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         reminderCenter.retractAll()
         store.stop()
         zaiStore.stop()
+        deepSeekStore.stop()
     }
 
     @objc private func handleStatusItemClick(_ sender: Any?) {
@@ -1963,6 +1979,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let interval = TimeInterval(minutes) * 60
         store.setRefreshInterval(interval)
         zaiStore.setRefreshInterval(interval)
+        deepSeekStore.setRefreshInterval(interval)
         quotaViewController.applyRefreshInterval(minutes: minutes)
     }
 
@@ -2017,6 +2034,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class QuotaViewController: NSViewController {
     var onRefresh: (() -> Void)?
     var onZAIRefresh: (() -> Void)?
+    var onDeepSeekRefresh: (() -> Void)?
     var onUseZAIResetCard: ((ZAIResetCreditCard.Kind) -> Void)?
     var onResetCodexCredit: ((String) -> Void)?
     var onPreferredContentSizeChange: (() -> Void)?
@@ -2046,6 +2064,7 @@ final class QuotaViewController: NSViewController {
     private let tabBar = PanelTabBarView()
     private let codexSection = CodexPanelSection()
     private let zaiSection = ZAIPanelSection()
+    private let deepSeekSection = DeepSeekPanelSection()
     private var panelBlocks: [QuotaTabID: NSView] = [:]
     private let footer = PanelFooterView()
     private var activeTab: QuotaTabID = .codex
@@ -2061,6 +2080,10 @@ final class QuotaViewController: NSViewController {
     private var lastZAISnapshot: ZAIQuotaSnapshot?
     private var lastZAIError: String?
     private var lastZAITitleOverride: String?
+
+    /// 最近一次 DeepSeek 状态，供 tab 摘要使用。
+    private var lastDeepSeekSnapshot: DeepSeekSnapshot?
+    private var lastDeepSeekError: String?
 
     /// 顶部更新时间：跟随 active tab 各自最近一次成功刷新的时刻。快照只在成功时生成，
     /// 刷新中的重放会带旧 fetchedAt，每个 tab 取 max 防止乱序回放把时间回退。
@@ -2151,6 +2174,16 @@ final class QuotaViewController: NSViewController {
         lastZAITitleOverride = title
         zaiSection.apply(snapshot: snapshot, account: account, isRefreshing: isRefreshing, error: error, titleOverride: title)
         recordRefreshedAt(.zai, snapshot?.fetchedAt)
+        syncTabBar()
+        updateLastUpdatedLabel()
+        updatePreferredContentSize()
+    }
+
+    func applyDeepSeek(snapshot: DeepSeekSnapshot?, isRefreshing: Bool, error: String?, profileCount: Int) {
+        deepSeekSection.apply(snapshot: snapshot, isRefreshing: isRefreshing, error: error, profileCount: profileCount)
+        lastDeepSeekSnapshot = snapshot
+        lastDeepSeekError = error
+        recordRefreshedAt(.deepSeek, snapshot?.fetchedAt)
         syncTabBar()
         updateLastUpdatedLabel()
         updatePreferredContentSize()
@@ -2345,6 +2378,11 @@ final class QuotaViewController: NSViewController {
         zaiSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
         panelBlocks[.zai] = makeBlock(zaiSection, top: 8, bottom: 10)
 
+        deepSeekSection.onRefresh = { [weak self] in self?.onDeepSeekRefresh?() }
+        deepSeekSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshButton() }
+        deepSeekSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
+        panelBlocks[.deepSeek] = makeBlock(deepSeekSection, top: 8, bottom: 10)
+
         for id in QuotaTabID.allCases {
             guard let block = panelBlocks[id] else { continue }
             quotaPage.addArrangedSubview(block)
@@ -2356,9 +2394,9 @@ final class QuotaViewController: NSViewController {
 
     // MARK: - Tab 切换与刷新语义（顶栏刷新只作用于当前 active tab）
 
-    /// 当前可见 tab：Codex 常驻；Z.AI 由 ZAISettings 决定；DeepSeek / CodeBuddy 在后续阶段接入。
+    /// 当前可见 tab：Codex / DeepSeek 常驻；Z.AI 由 ZAISettings 决定；CodeBuddy 后续阶段接入。
     private var visibleTabs: Set<QuotaTabID> {
-        var tabs: Set<QuotaTabID> = [.codex]
+        var tabs: Set<QuotaTabID> = [.codex, .deepSeek]
         if isZAITabVisible { tabs.insert(.zai) }
         return tabs
     }
@@ -2401,7 +2439,8 @@ final class QuotaViewController: NSViewController {
         switch activeTab {
         case .codex: return codexSection.canRequestRefresh
         case .zai: return zaiSection.canRequestRefresh
-        case .deepSeek, .codeBuddy: return false
+        case .deepSeek: return deepSeekSection.canRequestRefresh
+        case .codeBuddy: return false
         }
     }
 
@@ -2420,7 +2459,8 @@ final class QuotaViewController: NSViewController {
         switch activeTab {
         case .codex: codexSection.requestRefresh()
         case .zai: zaiSection.requestRefresh()
-        case .deepSeek, .codeBuddy: break
+        case .deepSeek: deepSeekSection.requestRefresh()
+        case .codeBuddy: break
         }
     }
 
@@ -2446,7 +2486,31 @@ final class QuotaViewController: NSViewController {
         zai.summary = zaiTabSummary()
         statuses[.zai] = zai
 
+        var deepSeek = PanelTabStatus()
+        deepSeek.isFailed = lastDeepSeekError != nil
+        if let snapshot = lastDeepSeekSnapshot, let balance = snapshot.primaryBalance {
+            let symbol = DeepSeekSnapshot.currencySymbol(balance.currency)
+            deepSeek.ring = .text("\(symbol)\(String(format: "%.2f", balance.amount))")
+        }
+        deepSeek.summary = deepSeekTabSummary()
+        statuses[.deepSeek] = deepSeek
+
         return statuses
+    }
+
+    private func deepSeekTabSummary() -> String? {
+        guard let snapshot = lastDeepSeekSnapshot else { return nil }
+        var parts: [String] = []
+        if let balance = snapshot.primaryBalance {
+            let symbol = DeepSeekSnapshot.currencySymbol(balance.currency)
+            parts.append("充值 \(symbol)\(String(format: "%.2f", balance.amount))")
+        }
+        if snapshot.usage.totalAmount > 0 {
+            let symbol = DeepSeekSnapshot.currencySymbol(snapshot.usage.currency)
+            parts.append("近 30 天消费 \(symbol)\(String(format: "%.2f", snapshot.usage.totalAmount))")
+        }
+        parts.append("Chrome · \(snapshot.profileName)")
+        return parts.joined(separator: " · ")
     }
 
     private func codexTabSummary() -> String? {
