@@ -126,16 +126,25 @@
   - 错误态：Codex（关 ChatGPT.app / 断网）、DeepSeek（无 token / 会话过期）、CodeBuddy（Keychain 拒绝 / Cookie 失效）各自头部错误行正确，重试可恢复。
   - popover 高度：逐 tab 打开、展开收起列表、设置页往返不裁切不跳闪。
 - 观测检查：token / Cookie 不出现在日志、错误详情与调试输出；切 tab 不触发数据请求（纯 UI 切换）；刷新失败不清空卡片。
-- 实际结果与未覆盖场景：尚未执行；本计划当前只完成方案收敛。
+- 实际结果与未覆盖场景（2026-09-22 实施轮）：
+  - 编译：`swift build`、`swift build -c release` 均通过（Apple Swift 6.3.3，arm64）。
+  - 测试：`arch -arm64 swift test` 237 项通过、0 失败（2 项 live 探针默认 skip；DeepSeek live 探针在 `LOCALQUOTABAR_DEEPSEEK_LIVE=1` 下已实跑通过）。
+  - DeepSeek 真实登录态：本机 Chrome Default profile `userToken` 导入成功；summary / amount / cost 三接口真实请求成功。实测修正三处口径：① bucket 时间字段为 `time`（非 timestamp）；② cost 金额字段为 `cost`；③ 窗口必须对齐自然日（end=明天 0 点，传当前时刻返回 INVALID_PARAM）。快照实测：充值 ¥4.3042 / 累计消费 ¥10.6958 / 近 30 天消费 ¥6.0988（16.37M tokens、9 个有数据日）。
+  - CodeBuddy 国际版：Chrome Cookie 解密（Keychain）成功，`session`（4001 字符）/`session_2`（1566 字符）值完整可读；但 `get-user-resource-summary` 经 URLSession 与 curl 双通道、全量域名 Cookie（12 条含 KEYCLOAK_*）+ 浏览器同款头（Content-Type / X-Client-Platform: web / Origin / UA）均被 APISIX 网关 401 拒绝。前端 JS 逆向确认：Web 平台不携带 Bearer（仅小程序平台从 sessionStorage 取 growth-center-token），即请求形态已与浏览器一致。待复核：① 用户在 Chrome 打开 www.codebuddy.ai 确认登录态是否已过期（服务端会话过期最可能）；② 若浏览器已登录仍 401，则判定网关存在浏览器指纹校验，需另立计划（如经浏览器会话中转）。探针保留：`LOCALQUOTABAR_CODEBUDDY_LIVE=1 swift test --filter CodeBuddyLiveProbeTests`。
+  - Codex / Z.AI 红线对照：既有 PanelRendering / ZAIUsagePresentation / ResetCard* / Chart* 等测试全绿；胶囊网格、重置卡、配速图、用量图与叠加模式代码路径零改动。
+  - 未覆盖：四 tab UI 目检（popover 逐 tab 高度、展开列表、设置页往返）、CodeBuddy Keychain 授权弹窗实机走查、DeepSeek 会话过期态实测、Touch Bar / 刘海屏通道——留待用户复核（无屏录权限，沿用辅助功能只读核对 + 单元测试口径）。
 
 ## 进度记录
 
 - [x] 确认范围和约束（2026-09-22，含用户四点指令：active-tab 刷新、Codex / Z.AI 看板原样、DeepSeek / CodeBuddy 实现并验证、CodeBuddy 国际版先行）。
-- [ ] 完成阶段 0（依赖引入与口径对齐）。
-- [ ] 完成阶段 1（Tab 外壳与刷新语义，含 Codex / Z.AI 红线对照验证）。
-- [ ] 完成阶段 2（DeepSeek 数据链路、面板与错误态）。
-- [ ] 完成阶段 3（CodeBuddy 国际版数据链路、面板与错误态）。
-- [ ] 完成阶段 4（全量验证、国内版登记技术债、归档）。
+- [x] 完成阶段 0（SweetCookieKit 0.5.3 依赖引入，95178d1）。
+- [x] 完成阶段 1（Tab 外壳与刷新语义，219 项测试全过 + 启动冒烟，0faf6cd）。
+- [x] 完成阶段 2（DeepSeek 全链路 + 真实登录态端到端验证通过，3e91c5e）。
+- [x] 完成阶段 3（CodeBuddy 国际版全链路，b4a4d4c；真实接口 401 待用户复核，见验证记录）。
+- [x] 完成阶段 4 自动化部分（237 项测试全过、debug/release 构建通过、四 store 启动冒烟、国内版已登记技术债、历史记录）。
+- [ ] 用户复核项：CodeBuddy 真实登录态、四 tab UI 目检（含 popover 高度与 Keychain 授权路径）；通过后归档到 completed/。
+
+分支：`quota-popup-tabs-redesign`（worktree `../LocalQuotaBar-tabs`，上游 origin 同名分支）。
 
 ## 决策记录
 
@@ -146,6 +155,10 @@
 - 2026-09-22：DeepSeek / CodeBuddy 面板展示层以 tabs.html 定稿为准，两份数据计划的 UI 章节仅作数据口径参考（冲突仲裁规则写入「背景」）。理由：tabs.html 是用户在来源会话逐项确认的最新定稿。
 - 2026-09-22：CodeBuddy 每日 Credits 趋势图不入首版。理由：tabs.html 定稿的 CodeBuddy 面板无图表；趋势接口为可选项，待有展示需求再评估。
 - 2026-09-22：Tab 顺序固定、默认 Codex、不持久化选择。理由：与「弹窗重开回额度页」现状一致，避免新增持久化面。
+- 2026-09-22（实施）：凭证读取基础设施采用 `steipete/SweetCookieKit` 0.5.3（CodexBar 同源），同时覆盖 localStorage LevelDB（DeepSeek token）与 Cookie Keychain 解密（CodeBuddy），自带 `withUserInteractionDisallowed` 满足后台禁 UI 需求。
+- 2026-09-22（实施）：DeepSeek 多 Chrome profile 场景首版自动选择 leveldb 修改时间最新者，并在面板提示「检测到 N 个登录态」；显式 profile 选择菜单（右键菜单）推迟。理由：本机实测仅 Default 一个候选，先保证单候选路径零交互可用。profile 标识持久化结构已预留（DeepSeekStore.preferredProfileID）。
+- 2026-09-22（实施）：错误重试语义随横幅删除而变化——失败后的重试入口即顶栏刷新（当前 tab），遵守同一 60 秒冷却（旧横幅重试可绕过冷却）。理由：tabs.html 定稿已删除横幅与重试按钮；顶栏刷新语义统一。
+- 2026-09-22（实施）：DeepSeek 用量窗口按实测对齐自然日（start=今天-29 天 0 点、end=明天 0 点）；解析按本地自然日聚合、窗口外桶丢弃。CodeBuddy 请求头带 `X-Client-Platform: web`（前端逆向实证，Web 平台无 Bearer）。
 
 ## 推迟项：CodeBuddy 国内版看板（留档计划草案）
 
