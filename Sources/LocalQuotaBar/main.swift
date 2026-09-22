@@ -1446,16 +1446,102 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateZAIResetActions()
     }
 
+    /// 将原生提示窗口放到当前交互屏幕的可视区域中央。
+    /// 菜单栏应用没有主窗口时，NSAlert 的默认定位可能受上一次活动窗口影响。
+    @discardableResult
+    private func runCenteredAlert(
+        _ alert: NSAlert,
+        initialFirstResponder: NSControl? = nil
+    ) -> NSApplication.ModalResponse {
+        alert.layout()
+        let window = alert.window
+
+        let buttons = alert.buttons
+        if buttons.count > 1 {
+            window.autorecalculatesKeyViewLoop = false
+            for (index, button) in buttons.enumerated() {
+                button.refusesFirstResponder = false
+                button.focusRingType = .default
+                button.nextKeyView = buttons[(index + 1) % buttons.count]
+            }
+        }
+
+        if let initialFirstResponder {
+            initialFirstResponder.refusesFirstResponder = false
+            initialFirstResponder.focusRingType = .default
+            window.initialFirstResponder = initialFirstResponder
+        }
+
+        if let screen = alertScreen() {
+            let visibleFrame = screen.visibleFrame
+            let size = window.frame.size
+            window.setFrameOrigin(NSPoint(
+                x: visibleFrame.midX - size.width / 2,
+                y: visibleFrame.midY - size.height / 2
+            ))
+        } else {
+            window.center()
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        if let initialFirstResponder {
+            window.makeFirstResponder(initialFirstResponder)
+            initialFirstResponder.needsDisplay = true
+        }
+
+        var tabMonitor: Any?
+        if initialFirstResponder != nil, buttons.count > 1 {
+            tabMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak window] event in
+                guard (event.keyCode == 48 || event.charactersIgnoringModifiers == "\t"),
+                      let window else { return event }
+                let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                let isShiftPressed = modifiers.contains(.shift)
+                let currentIndex = buttons.firstIndex { button in
+                    guard let firstResponder = window.firstResponder else { return false }
+                    return firstResponder === button
+                } ?? (isShiftPressed ? 0 : buttons.count - 1)
+                let nextIndex = isShiftPressed
+                    ? (currentIndex + buttons.count - 1) % buttons.count
+                    : (currentIndex + 1) % buttons.count
+                let nextButton = buttons[nextIndex]
+                window.makeFirstResponder(nextButton)
+                nextButton.needsDisplay = true
+                return nil
+            }
+        }
+        defer {
+            if let tabMonitor {
+                NSEvent.removeMonitor(tabMonitor)
+            }
+        }
+
+        return alert.runModal()
+    }
+
+    private func alertScreen() -> NSScreen? {
+        if let screen = statusItem?.button?.window?.screen {
+            return screen
+        }
+
+        let mouseLocation = NSEvent.mouseLocation
+        return NSScreen.screens.first { $0.frame.contains(mouseLocation) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+    }
+
     /// 重置卡按钮点击后的二次确认弹框；取消则不发送任何请求。
-    /// "取消"放第一个成为默认按钮，回车即取消，避免误触直接消耗重置卡。
+    /// "确认重置"为默认焦点和回车操作，取消仍可通过 Esc 或 Tab 选择。
     private func confirmResetCardUse(informativeText: String) -> Bool {
         let alert = NSAlert()
         alert.alertStyle = .warning
         alert.messageText = "确认使用重置卡？"
         alert.informativeText = informativeText
         alert.addButton(withTitle: "取消")
-        alert.addButton(withTitle: "确认重置")
-        return alert.runModal() == .alertSecondButtonReturn
+        let confirmButton = alert.addButton(withTitle: "确认重置")
+        confirmButton.keyEquivalent = "\r"
+        confirmButton.keyEquivalentModifierMask = []
+        return runCenteredAlert(alert, initialFirstResponder: confirmButton) == .alertSecondButtonReturn
     }
 
     /// 重置调用结束后弹出结果提示；失败时展示具体原因，仅有"关闭"一个按钮。
@@ -1467,7 +1553,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.informativeText = failureMessage ?? "重置未完成，请重试"
         }
         alert.addButton(withTitle: "关闭")
-        alert.runModal()
+        runCenteredAlert(alert)
     }
 
     private func useCodexResetCredit(_ creditID: String) {
@@ -1686,7 +1772,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
             item.representedObject = entry.option.rawValue
             item.state = entry.checked ? .on : .off
+            // 当前项保持正常颜色；动作入口会忽略对当前套餐的重复点击。
             item.isEnabled = true
+            if entry.checked {
+                item.attributedTitle = NSAttributedString(
+                    string: entry.option.title,
+                    attributes: [
+                        .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                        .foregroundColor: NSColor.labelColor
+                    ]
+                )
+            }
             submenu.addItem(item)
             addedCount += 1
         }
@@ -1702,6 +1798,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let raw = sender.representedObject as? String,
               let option = ZAIPlanViewOverride(rawValue: raw),
               option != ZAIPlanViewSettings.load() else { return }
+
+        let selection = ZAISettings.resolveProviderSelection()
+        let isCurrentSelection: Bool
+        switch option {
+        case .startPlan:
+            isCurrentSelection = selection?.kind == .startPlan
+        case .codingPlan:
+            isCurrentSelection = selection?.kind == .codingPlan && selection?.teamContext == nil
+        case .teamCodingPlan:
+            isCurrentSelection = selection?.kind == .codingPlan && selection?.teamContext != nil
+        }
+        guard !isCurrentSelection else { return }
+
         ZAIPlanViewSettings.save(option, accountID: ZAISettings.currentAccountIdentity())
         // 立即按新视图重查额度（查询中则排队），用量口径同步重算。
         zaiStore.refreshAfterPlanViewChange()
@@ -1821,8 +1930,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let item = NSMenuItem(title: account.label, action: #selector(accountMenuItemSelected(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = account.fileName
-            item.state = account.accountId == selectedAccountId ? .on : .off
-            item.isEnabled = !resetRequestInFlight && !codexRestartInFlight
+            let isCurrentAccount = account.accountId == selectedAccountId
+            item.state = isCurrentAccount ? .on : .off
+            // 当前项保持正常颜色；动作入口会忽略对当前账号的重复点击。
+            item.isEnabled = isCurrentAccount || (!resetRequestInFlight && !codexRestartInFlight)
+            if isCurrentAccount {
+                item.attributedTitle = NSAttributedString(
+                    string: account.label,
+                    attributes: [
+                        .font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize),
+                        .foregroundColor: NSColor.labelColor
+                    ]
+                )
+            }
             submenu.addItem(item)
         }
 
@@ -1832,14 +1952,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func accountMenuItemSelected(_ sender: NSMenuItem) {
         guard !resetRequestInFlight, !codexRestartInFlight,
               let fileName = sender.representedObject as? String else { return }
+        guard accountOptions.first(where: { $0.fileName == fileName })?.accountId != selectedAccountId else {
+            return
+        }
         do {
             try authManager.switchAccount(to: fileName)
             initializeAccountSwitcher()
+
+            // 没有外部 Codex app-server 时不需要询问“立即重启”，直接提示用户启动 Codex。
+            // 扫描失败时保守地继续原确认流程，避免把“无法确认”误判成“未启动”。
+            if case .none = CodexAppServerRestartService.currentPresence() {
+                quotaViewController.showAccountSwitchStatus("账号已切换，请启动 Codex")
+                store.refresh(force: true)
+                presentCodexLaunchRequiredAlert(label: currentAccountLabel())
+                return
+            }
+
             guard confirmRestartCodexAfterSwitch(label: currentAccountLabel()) else {
                 // 不重启也刷新：本应用的读取进程每次新拉起，直接读新 auth.json。
                 quotaViewController.showAccountSwitchStatus("已切换账号，重启 Codex 后新账号生效")
                 store.refresh(force: true)
-                // 取消重启必须给出明确反馈，避免误以为新账号已对 Codex 客户端生效。
                 presentSwitchDeferredAlert()
                 return
             }
@@ -1861,6 +1993,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 没有发现运行中的 app-server 时，提示用户启动 Codex 以使新账号生效。
+    private func presentCodexLaunchRequiredAlert(label: String?) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "账号已切换"
+        // 长 informativeText 会使系统切换为左对齐。正文放入居中的附件视图，
+        // 保留 NSAlert 原生居中的图标、标题和按钮，避免重复绘制应用图标。
+        let detailLabel = NSTextField(
+            wrappingLabelWithString: label.map { "账号已切换到 \($0)。" }
+                ?? "账号已切换。"
+        )
+        detailLabel.font = .systemFont(ofSize: NSFont.systemFontSize)
+        detailLabel.alignment = .center
+        detailLabel.maximumNumberOfLines = 0
+        detailLabel.preferredMaxLayoutWidth = 220
+        detailLabel.setFrameSize(NSSize(width: 220, height: ceil(detailLabel.fittingSize.height)))
+        alert.accessoryView = detailLabel
+        alert.addButton(withTitle: "好")
+        runCenteredAlert(alert)
+    }
+
     /// 切换账号成功后的重启确认弹框。
     /// “取消”放第一个成为默认按钮，回车即取消：重启会中断 Codex 正在执行的任务，默认动作必须保守。
     private func confirmRestartCodexAfterSwitch(label: String?) -> Bool {
@@ -1869,21 +2022,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "立即重启 Codex？"
         let switchedTo = label.map { "已切换到 \($0)。" } ?? "已切换账号。"
         alert.informativeText = switchedTo
-            + "将停止当前用户的 Codex app-server 进程（正在执行的任务可能被中断），"
+            + "将停止 Codex 进程（正在执行的任务可能被中断），"
             + "Codex 会自动拉起新进程并使用新账号。"
-        alert.addButton(withTitle: "取消")
+        let cancelButton = alert.addButton(withTitle: "取消")
+        cancelButton.keyEquivalent = "\r"
+        cancelButton.keyEquivalentModifierMask = []
         alert.addButton(withTitle: "立即重启")
-        return alert.runModal() == .alertSecondButtonReturn
+        return runCenteredAlert(alert, initialFirstResponder: cancelButton) == .alertSecondButtonReturn
     }
 
-    /// 取消重启后的结果提示：切换的账号要等 Codex 重启后才对 Codex 客户端生效。
+    /// 取消重启后的结果提示：账号已经切换，但要等 Codex 重启后才对客户端生效。
     private func presentSwitchDeferredAlert() {
         let alert = NSAlert()
         alert.alertStyle = .informational
         alert.messageText = "已切换账号"
         alert.informativeText = "切换的账号将在 Codex 重启后生效。"
         alert.addButton(withTitle: "好")
-        alert.runModal()
+        runCenteredAlert(alert)
     }
 
     private func presentRestartOutcome(_ outcome: CodexAppServerRestartOutcome) {
@@ -1914,7 +2069,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = messageText
         alert.informativeText = informativeText
         alert.addButton(withTitle: "关闭")
-        alert.runModal()
+        runCenteredAlert(alert)
     }
 
     /// 手动测试提醒投递链；无可用通道（无 Touch Bar 且无刘海屏）时给出提示。
@@ -1926,7 +2081,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "无可用提醒通道"
         alert.informativeText = "当前设备没有 Touch Bar，屏幕也没有刘海，无法弹出提醒。"
         alert.addButton(withTitle: "好")
-        alert.runModal()
+        runCenteredAlert(alert)
     }
 
     @objc private func reminderOptionSelected(_ sender: NSMenuItem) {
