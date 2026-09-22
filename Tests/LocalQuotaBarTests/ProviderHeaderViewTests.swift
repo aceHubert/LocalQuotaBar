@@ -31,6 +31,9 @@ final class ProviderHeaderViewTests: XCTestCase {
         let time = try label("15:22", in: header)
         XCTAssertFalse(time.isHiddenOrHasHiddenAncestor)
         XCTAssertEqual(time.toolTip, "15:22")
+        // 状态时间靠右（.p-status margin-left:auto）
+        let timeFrame = header.convert(time.bounds, from: time)
+        XCTAssertGreaterThanOrEqual(timeFrame.maxX, header.bounds.width - 2)
         // 身份信息已上移 Tab 栏：头部不再有 logo、图标或刷新按钮。
         XCTAssertTrue(descendants(of: header).compactMap { $0 as? NSImageView }.isEmpty)
         XCTAssertTrue(descendants(of: header).compactMap { $0 as? PanelIconButton }.isEmpty)
@@ -59,6 +62,11 @@ final class ProviderHeaderViewTests: XCTestCase {
         XCTAssertEqual(errorLabel.maximumNumberOfLines, 1)
         let status = try label("刷新失败", in: header)
         XCTAssertFalse(status.isHiddenOrHasHiddenAncestor)
+        // 错误态下时间仍靠右、错误文案居左
+        let statusFrame = header.convert(status.bounds, from: status)
+        XCTAssertGreaterThanOrEqual(statusFrame.maxX, header.bounds.width - 2)
+        let errorFrame = header.convert(errorLabel.bounds, from: errorLabel)
+        XCTAssertLessThanOrEqual(errorFrame.minX, 2)
 
         // 恢复成功后错误文案清除。
         header.configure(.init(statusText: "15:26", statusKind: .ok))

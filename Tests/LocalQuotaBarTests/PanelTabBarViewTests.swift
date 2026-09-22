@@ -45,8 +45,15 @@ final class PanelTabBarViewTests: XCTestCase {
         XCTAssertTrue(item.toolTip?.contains("Codex · Pro") == true)
         XCTAssertTrue(item.toolTip?.contains("周限额剩余 64%") == true)
 
-        // 失败态：状态点变红、环转为空轨 + "--"
+        // tag 徽章：有 tag 时可见且带胶囊底色；状态点带同色光晕
+        XCTAssertFalse(item.tagBadge.isHidden)
+        XCTAssertEqual(item.tagBadge.layer?.backgroundColor, NSColor(hex: 0x232936).cgColor)
+        XCTAssertEqual(item.statusDot.dotColor, PanelTheme.green)
+
+        // 失败态 + 无 tag：徽章隐藏、光晕变红、环转为空轨 + "--"
         item.configure(PanelTabStatus(ring: .unavailable, tagText: nil, isFailed: true))
+        XCTAssertTrue(item.tagBadge.isHidden)
+        XCTAssertEqual(item.statusDot.dotColor, PanelTheme.red)
         XCTAssertEqual(item.ringFillLayer.strokeEnd, 0, accuracy: 0.001)
         XCTAssertEqual(item.ringFillLayer.strokeColor, PanelTheme.trackColor.cgColor)
     }

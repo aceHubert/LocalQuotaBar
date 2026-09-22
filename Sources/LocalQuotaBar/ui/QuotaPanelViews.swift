@@ -176,7 +176,8 @@ final class ProviderHeaderView: NSView {
         errorLabel.cell?.truncatesLastVisibleLine = true
         errorLabel.cell?.wraps = false
         errorLabel.isHidden = true
-        errorLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        // 主拉伸位：错误文案吃掉富余宽度，把状态时间推到右侧（.p-errmsg flex:1）
+        errorLabel.setContentHuggingPriority(.init(1), for: .horizontal)
         errorLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         statusLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
@@ -197,7 +198,12 @@ final class ProviderHeaderView: NSView {
         statusLine.alignment = .centerY
         statusLine.spacing = 4
 
-        let content = NSStackView(views: [errorLabel, statusLine])
+        // 兜底拉伸位：错误文案隐藏（正常态）时由它吃掉富余宽度，时间保持靠右
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(2), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        let content = NSStackView(views: [errorLabel, spacer, statusLine])
         content.orientation = .horizontal
         content.alignment = .centerY
         content.spacing = 7

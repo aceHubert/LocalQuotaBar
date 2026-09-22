@@ -297,12 +297,14 @@ final class DeepSeekCostChartView: NSView {
     }
 }
 
-/// 柱区：30 根金额柱 + 均值虚线 + 周刻度 + 今日高亮 + 悬浮气泡。
+/// 柱区：30 根金额柱 + 均值虚线 + 日期刻度行 + 今日高亮 + 悬浮气泡。
+/// 视觉与刻度规则对齐 DailyUsageChartView（每 7 列一个 M/d 刻度，今天绿色"今"）。
 private final class DeepSeekCostBarsView: NSView {
     private var days: [DeepSeekDailyUsage] = []
     private var hoveredIndex: Int?
     private var hoverCurrencySymbol = "¥"
     private let tooltip = ChartTooltipWindow()
+    private let ticksHeight: CGFloat = 10
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -325,27 +327,23 @@ private final class DeepSeekCostBarsView: NSView {
         ChartBarLayout(count: days.count, availableWidth: bounds.width, gap: 2)
     }
 
-    private func barRect(index: Int, barsBottom: CGFloat, heightPlaceholder: CGFloat) -> NSRect {
-        NSRect(
-            x: CGFloat(index) * barLayout.pitch,
-            y: barsBottom,
-            width: barLayout.barWidth,
-            height: heightPlaceholder
-        )
-    }
-
     override func draw(_ dirtyRect: NSRect) {
         guard !days.isEmpty else { return }
         let layout = barLayout
         let maxValue = max(days.map(\.amount).max() ?? 0, 0.01)
-        let barsHeight = bounds.height - 12
+        // 顶部留均值数值、底部留日期刻度行
         let barsBottom = bounds.minY + 10
+        let barsHeight = bounds.height - 10 - ticksHeight
 
         for (index, day) in days.enumerated() {
-            let barArea = barRect(index: index, barsBottom: barsBottom, heightPlaceholder: barsHeight)
             let fraction = CGFloat(day.amount / maxValue)
             let barHeight = max(day.amount > 0 ? 2 : 0, fraction * barsHeight)
-            let barRect = NSRect(x: barArea.minX, y: barsBottom, width: barLayout.barWidth, height: barHeight)
+            let barRect = NSRect(
+                x: CGFloat(index) * layout.pitch,
+                y: barsBottom,
+                width: layout.barWidth,
+                height: barHeight
+            )
             let path = NSBezierPath(roundedRect: barRect, xRadius: 2, yRadius: 2)
             let isToday = index == days.count - 1
             (isToday ? NSColor(hex: 0x6CF0AC) : PanelTheme.green).setFill()
@@ -365,7 +363,7 @@ private final class DeepSeekCostBarsView: NSView {
             dashes.lineWidth = 1
             dashes.stroke()
 
-            let text = "\(String(format: "%.2f", average))" as NSString
+            let text = String(format: "%.2f", average) as NSString
             let attributes: [NSAttributedString.Key: Any] = [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .semibold),
                 .foregroundColor: PanelTheme.tertiaryText
@@ -373,6 +371,38 @@ private final class DeepSeekCostBarsView: NSView {
             let textSize = text.size(withAttributes: attributes)
             text.draw(at: NSPoint(x: bounds.width - textSize.width - 2, y: y + 1.5),
                       withAttributes: attributes)
+        }
+
+        drawTicks(barsBottom: barsBottom)
+    }
+
+    /// 日期刻度：每 7 列一个 M/d；今天单独标绿色"今"；倒数第二列刻度与"今"重叠时跳过。
+    private func drawTicks(barsBottom: CGFloat) {
+        let layout = barLayout
+        let today = Calendar.current.startOfDay(for: Date())
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "M/d"
+        let tickY = barsBottom - ticksHeight + 1
+
+        for (index, day) in days.enumerated() {
+            let isToday = Calendar.current.isDate(day.date, inSameDayAs: today)
+            let isTick = index % 7 == 0
+            guard isTick || isToday else { continue }
+            if isTick && !isToday && index >= layout.count - 2 { continue }
+
+            let text = isToday ? "今" : formatter.string(from: day.date)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 7.5, weight: .semibold),
+                .foregroundColor: isToday ? PanelTheme.green : NSColor(hex: 0x56565C)
+            ]
+            let attributed = NSAttributedString(string: text, attributes: attributes)
+            let size = attributed.size()
+            let centerX = CGFloat(index) * layout.pitch + layout.barWidth / 2
+            attributed.draw(at: NSPoint(
+                x: min(max(centerX - size.width / 2, 0), bounds.width - size.width),
+                y: tickY
+            ))
         }
     }
 
@@ -391,12 +421,17 @@ private final class DeepSeekCostBarsView: NSView {
         formatter.locale = Locale(identifier: "zh_CN")
         formatter.dateFormat = "M月d日"
         let isToday = index == days.count - 1
-        let dateText = formatter.string(from: day.date) + (isToday ? " 今天" : "")
-        let amountText = "\(hoverCurrencySymbol)\(String(format: "%.2f", day.amount))"
+        let dateText = formatter.string(from: day.date) + (isToday ? "（今天）" : "")
+        // 锚点 = 悬停柱顶部中心，换算到屏幕坐标（浮层窗口使用屏幕坐标系）
+        let centerX = CGFloat(index) * barLayout.pitch + barLayout.barWidth / 2
+        let pointInWindow = convert(NSPoint(x: centerX, y: bounds.maxY + 3), to: nil)
+        let anchor = window.map {
+            $0.convertToScreen(NSRect(origin: pointInWindow, size: .zero)).origin
+        } ?? pointInWindow
         tooltip.present(
-            lines: [dateText, amountText],
+            lines: [dateText, "\(hoverCurrencySymbol)\(String(format: "%.2f", day.amount))"],
             detail: "Tokens \(PanelTheme.formatTokenCount(day.tokens)) · 请求 \(Int(day.requests)) 次",
-            anchor: NSPoint(x: point.x, y: convert(bounds, to: nil).maxY + 6),
+            anchor: anchor,
             hostWindow: window
         )
     }

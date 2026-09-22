@@ -128,8 +128,11 @@ final class PanelTabItemView: NSButton {
     let ringFillLayer = CAShapeLayer()
     private let logoContainer = NSView()
     private let logoImageView = NSImageView()
+    /// 套餐 tag 胶囊徽章（.tab-tag：蓝字 + 深蓝底 + 描边），internal 供测试。
+    let tagBadge = NSView()
     private let tagLabel = NSTextField(labelWithString: "")
-    private let statusDot = NSView()
+    /// 状态点（绿/红 + 同色光晕），internal 供测试。
+    let statusDot = PanelStatusDotView()
     private let valueLabel = NSTextField(labelWithString: "")
     private var isHovered = false
     private var isActive = false
@@ -197,17 +200,20 @@ final class PanelTabItemView: NSButton {
         logoImageView.translatesAutoresizingMaskIntoConstraints = false
         logoContainer.addSubview(logoImageView)
 
-        // 套餐 tag：叠在 logo 右上角
+        // 套餐 tag：胶囊徽章叠在 logo 右上角（对齐 .tab-tag 底色与描边）
+        tagBadge.wantsLayer = true
+        tagBadge.translatesAutoresizingMaskIntoConstraints = false
+        tagBadge.layer?.cornerRadius = 6
+        tagBadge.layer?.backgroundColor = NSColor(hex: 0x232936).cgColor
+        tagBadge.layer?.borderWidth = 1
+        tagBadge.layer?.borderColor = NSColor(hex: 0x5AA0FF, alpha: 0.32).cgColor
+
         tagLabel.font = .systemFont(ofSize: 7, weight: .bold)
         tagLabel.textColor = NSColor(hex: 0x6DB8FF)
         tagLabel.translatesAutoresizingMaskIntoConstraints = false
+        tagBadge.addSubview(tagLabel)
 
-        // 状态点：logo 右下角，绿=正常 / 红=失败，外圈描面板底色避免与环境混色
-        statusDot.wantsLayer = true
-        statusDot.layer?.backgroundColor = PanelTheme.green.cgColor
-        statusDot.layer?.cornerRadius = 3.25
-        statusDot.layer?.borderWidth = 1.5
-        statusDot.layer?.borderColor = PanelTheme.panelBackground.cgColor
+        // 状态点：logo 右下角，绿=正常 / 红=失败；光晕在 PanelStatusDotView.draw 里自绘
         statusDot.translatesAutoresizingMaskIntoConstraints = false
 
         valueLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .bold)
@@ -217,7 +223,7 @@ final class PanelTabItemView: NSButton {
 
         addSubview(ringView)
         addSubview(logoContainer)
-        addSubview(tagLabel)
+        addSubview(tagBadge)
         addSubview(statusDot)
         addSubview(valueLabel)
 
@@ -243,8 +249,12 @@ final class PanelTabItemView: NSButton {
 
         // tag 与状态点允许越出环的边界（z 轴叠在上面），只锚定 logo 容器。
         NSLayoutConstraint.activate([
-            tagLabel.bottomAnchor.constraint(equalTo: logoContainer.topAnchor, constant: 4),
-            tagLabel.trailingAnchor.constraint(equalTo: logoContainer.trailingAnchor, constant: 7),
+            tagBadge.centerYAnchor.constraint(equalTo: logoContainer.topAnchor),
+            tagBadge.leadingAnchor.constraint(equalTo: logoContainer.trailingAnchor, constant: -3),
+            tagBadge.heightAnchor.constraint(equalTo: tagLabel.heightAnchor, constant: 2),
+            tagLabel.leadingAnchor.constraint(equalTo: tagBadge.leadingAnchor, constant: 3.5),
+            tagLabel.trailingAnchor.constraint(equalTo: tagBadge.trailingAnchor, constant: -3.5),
+            tagLabel.centerYAnchor.constraint(equalTo: tagBadge.centerYAnchor),
             statusDot.widthAnchor.constraint(equalToConstant: 6.5),
             statusDot.heightAnchor.constraint(equalToConstant: 6.5),
             statusDot.trailingAnchor.constraint(equalTo: logoContainer.trailingAnchor, constant: 2.5),
@@ -267,8 +277,8 @@ final class PanelTabItemView: NSButton {
         valueLabel.stringValue = status.valueText
         valueLabel.textColor = status.valueColor
         tagLabel.stringValue = status.tagText ?? ""
-        tagLabel.isHidden = status.tagText?.isEmpty != false
-        statusDot.layer?.backgroundColor = (status.isFailed ? PanelTheme.red : PanelTheme.green).cgColor
+        tagBadge.isHidden = status.tagText?.isEmpty != false
+        statusDot.dotColor = status.isFailed ? PanelTheme.red : PanelTheme.green
         statusDot.isHidden = false
 
         var tooltip = status.titleOverride ?? tab.displayName
@@ -402,5 +412,47 @@ final class PanelTabBarView: NSView {
         if notify {
             onSelectionChange?(tab)
         }
+    }
+}
+
+
+/// 状态点：实心圆 + 同色光晕（对齐设计稿 .status-dot 的 box-shadow: 0 0 5px 70%）。
+/// 不用 CALayer shadow：AppKit NSViewBackingLayer 会重置 shadowOpacity 并以 masksToBounds 裁掉光晕。
+final class PanelStatusDotView: NSView {
+    var dotColor: NSColor = PanelTheme.green {
+        didSet { needsDisplay = true }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let center = NSPoint(x: bounds.midX, y: bounds.midY)
+        // 实心点（含 1.5pt 面板底色描边，留出与 logo 底色的分界）
+        let dotRadius = bounds.width / 2 - 0.75
+        let glow = NSShadow()
+        glow.shadowColor = dotColor.withAlphaComponent(0.7)
+        glow.shadowBlurRadius = 2.5
+        glow.shadowOffset = .zero
+
+        NSGraphicsContext.current?.saveGraphicsState()
+        glow.set()
+        let dotPath = NSBezierPath(ovalIn: NSRect(
+            x: center.x - dotRadius, y: center.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2))
+        dotColor.setFill()
+        dotPath.fill()
+        NSGraphicsContext.current?.restoreGraphicsState()
+
+        PanelTheme.panelBackground.setStroke()
+        let borderPath = NSBezierPath(ovalIn: NSRect(
+            x: center.x - dotRadius, y: center.y - dotRadius, width: dotRadius * 2, height: dotRadius * 2))
+        borderPath.lineWidth = 1.5
+        borderPath.stroke()
     }
 }
