@@ -13,6 +13,14 @@ enum PanelLogos {
     <svg fill="#000000" fill-rule="evenodd" height="24" viewBox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg"><path d="M12.105 2L9.927 4.953H.653L2.83 2h9.276zM23.254 19.048L21.078 22h-9.242l2.174-2.952h9.244zM24 2L9.264 22H0L14.736 2H24z"></path></svg>
     """)
 
+    static let deepSeek: NSImage? = makeLogo("""
+    <svg fill="#000000" height="24" viewBox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg"><path d="M23.748 4.482c-.254-.124-.364.113-.512.234-.051.039-.094.09-.137.136-.372.397-.806.657-1.373.626-.829-.046-1.537.214-2.163.848-.133-.782-.575-1.248-1.247-1.548-.352-.156-.708-.311-.955-.65-.172-.241-.219-.51-.305-.774-.055-.16-.11-.323-.293-.35-.2-.031-.278.136-.356.276-.313.572-.434 1.202-.422 1.84.027 1.436.633 2.58 1.838 3.393.137.093.172.187.129.323-.082.28-.18.552-.266.833-.055.179-.137.217-.329.14a5.526 5.526 0 01-1.736-1.18c-.857-.828-1.631-1.742-2.597-2.458a11.365 11.365 0 00-.689-.471c-.985-.957.13-1.743.388-1.836.27-.098.093-.432-.779-.428-.872.004-1.67.295-2.687.684a3.055 3.055 0 01-.465.137 9.597 9.597 0 00-2.883-.102c-1.885.21-3.39 1.102-4.497 2.623C.082 8.606-.231 10.684.152 12.85c.403 2.284 1.569 4.175 3.36 5.653 1.858 1.533 3.997 2.284 6.438 2.14 1.482-.085 3.133-.284 4.994-1.86.47.234.962.327 1.78.397.63.059 1.236-.03 1.705-.128.735-.156.684-.837.419-.961-2.155-1.004-1.682-.595-2.113-.926 1.096-1.296 2.746-2.642 3.392-7.003.05-.347.007-.565 0-.845-.004-.17.035-.237.23-.256a4.173 4.173 0 001.545-.475c1.396-.763 1.96-2.015 2.093-3.517.02-.23-.004-.467-.247-.588zM11.581 18c-2.089-1.642-3.102-2.183-3.52-2.16-.392.024-.321.471-.235.763.09.288.207.486.371.739.114.167.192.416-.113.603-.673.416-1.842-.14-1.897-.167-1.361-.802-2.5-1.86-3.301-3.307-.774-1.393-1.224-2.887-1.298-4.482-.02-.386.093-.522.477-.592a4.696 4.696 0 011.529-.039c2.132.312 3.946 1.265 5.468 2.774.868.86 1.525 1.887 2.202 2.891.72 1.066 1.494 2.082 2.48 2.914.348.292.625.514.891.677-.802.09-2.14.11-3.054-.614zm1-6.44a.306.306 0 01.415-.287.302.302 0 01.2.288.306.306 0 01-.31.307.303.303 0 01-.304-.308zm3.11 1.596c-.2.081-.399.151-.59.16a1.245 1.245 0 01-.798-.254c-.274-.23-.47-.358-.552-.758a1.73 1.73 0 01.016-.588c.07-.327-.008-.537-.239-.727-.187-.156-.426-.199-.688-.199a.559.559 0 01-.254-.078c-.11-.054-.2-.19-.114-.358.028-.054.16-.186.192-.21.356-.202.767-.136 1.146.016.352.144.618.408 1.001.782.391.451.462.576.685.914.176.265.336.537.445.848.067.195-.019.354-.25.452z"></path></svg>
+    """)
+
+    static let codeBuddy: NSImage? = makeLogo("""
+    <svg fill="#000000" height="24" viewBox="0 0 24 24" width="24" xmlns="http://www.w3.org/2000/svg"><path d="M18.777 1.647c.28-.02.536.114.972.51 1.018.926 2.437 2.828 3.318 4.452l.34.631.482.24.11.06v3.638a5.206 5.206 0 00-5.32-1.23c-.491.166-1.021.471-2.08 1.082l-6.09 3.516c-1.057.61-1.586.916-1.975 1.259a5.208 5.208 0 00-1.493 5.572c.165.49.471 1.02 1.082 2.08l.315.543h-3.26c-.685 0-1.34-.135-1.939-.377-.169-.956-.009-1.789.469-2.335.158-.18.164-.189.13-.493a11.846 11.846 0 01-.057-1.711l.02-.444-.667-1.18C2.1 15.622 1.445 14.078 1.192 12.9c-.133-.647-.125-.934.04-1.146.1-.128.427-.261.822-.334.994-.175 3.162-.017 5.575.41l.25.043.551-.487c.915-.81 1.522-1.264 2.641-1.962 1.167-.73 2.484-1.331 3.967-1.807l.476-.152.261-.688c.937-2.471 1.896-4.293 2.58-4.9.235-.21.25-.22.422-.23z"></path><path d="M12.139 18.2a1.203 1.203 0 011.642.44l1.296 2.243a1.204 1.204 0 01-2.083 1.203l-1.296-2.243a1.203 1.203 0 01.44-1.644zM18.629 14.452a1.203 1.203 0 011.642.44l1.295 2.244a1.204 1.204 0 11-2.083 1.203l-1.295-2.243a1.203 1.203 0 01.44-1.644z"></path></svg>
+    """)
+
     private static func makeLogo(_ svg: String) -> NSImage? {
         guard let image = NSImage(data: Data(svg.utf8)) else { return nil }
         image.isTemplate = true
@@ -134,7 +142,8 @@ final class PlanTagView: NSView {
     }
 }
 
-/// provider 头部：logo 徽标（含状态点）+ 名称 + 副标题 + 套餐 tag + 状态文字 + 刷新按钮。
+/// provider 面板头部（slim 版，tabs.html 定稿）：provider 身份（logo / 名称 / tag / 刷新按钮）
+/// 已上移到 Tab 栏，这里只保留右侧刷新状态与失败时的错误文案；冷却状态也在此承载。
 final class ProviderHeaderView: NSView {
     enum StatusKind {
         case ok
@@ -143,32 +152,16 @@ final class ProviderHeaderView: NSView {
     }
 
     struct State {
-        var title: String
-        var monogram: String
-        var logoImage: NSImage? = nil
-        var subtitle: String?
-        var tagText: String?
-        var tagStyle: PlanTagView.Style
         var statusText: String
         var statusKind: StatusKind
+        /// 失败时的错误文案（单行省略，tooltip 给全文）。
+        var errorText: String? = nil
+        var errorTooltip: String? = nil
     }
 
-    var onRefresh: (() -> Void)?
-
-    private let logoContainer = NSView()
-    private let monogramLabel = NSTextField(labelWithString: "")
-    private let logoImageView = NSImageView()
-    private let statusDot = NSView()
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let subtitleLabel = NSTextField(labelWithString: "")
-    private let planTag = PlanTagView()
+    private let errorLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
     private let statusDotMini = NSView()
-    private let refreshButton = PanelIconButton(
-        symbolName: "arrow.clockwise",
-        toolTipText: "手动刷新",
-        side: 20
-    )
     private let now: () -> Date
 
     init(now: @escaping () -> Date = Date.init) {
@@ -176,58 +169,22 @@ final class ProviderHeaderView: NSView {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        // logo 徽标 24x24
-        logoContainer.wantsLayer = true
-        logoContainer.layer?.cornerRadius = 7
-        logoContainer.layer?.backgroundColor = NSColor(hex: 0x2C2C31).cgColor
-        logoContainer.layer?.borderWidth = 1
-        logoContainer.layer?.borderColor = PanelTheme.hairline.cgColor
-        logoContainer.translatesAutoresizingMaskIntoConstraints = false
-
-        monogramLabel.font = .systemFont(ofSize: 10, weight: .bold)
-        monogramLabel.textColor = .white
-        monogramLabel.alignment = .center
-        monogramLabel.translatesAutoresizingMaskIntoConstraints = false
-        logoContainer.addSubview(monogramLabel)
-
-        logoImageView.imageScaling = .scaleProportionallyUpOrDown
-        logoImageView.contentTintColor = .white
-        logoImageView.translatesAutoresizingMaskIntoConstraints = false
-        logoContainer.addSubview(logoImageView)
-
-        statusDot.wantsLayer = true
-        statusDot.layer?.backgroundColor = PanelTheme.green.cgColor
-        statusDot.layer?.cornerRadius = 3.5
-        statusDot.layer?.borderWidth = 1.5
-        statusDot.layer?.borderColor = PanelTheme.panelBackground.cgColor
-        statusDot.translatesAutoresizingMaskIntoConstraints = false
-
-        NSLayoutConstraint.activate([
-            logoContainer.widthAnchor.constraint(equalToConstant: 24),
-            logoContainer.heightAnchor.constraint(equalToConstant: 24),
-            monogramLabel.centerXAnchor.constraint(equalTo: logoContainer.centerXAnchor),
-            monogramLabel.centerYAnchor.constraint(equalTo: logoContainer.centerYAnchor, constant: 0.5),
-            logoImageView.centerXAnchor.constraint(equalTo: logoContainer.centerXAnchor),
-            logoImageView.centerYAnchor.constraint(equalTo: logoContainer.centerYAnchor),
-            logoImageView.widthAnchor.constraint(equalToConstant: 14),
-            logoImageView.heightAnchor.constraint(equalToConstant: 14)
-        ])
-
-        titleLabel.font = .systemFont(ofSize: 12, weight: .bold)
-        titleLabel.textColor = PanelTheme.primaryText
-
-        subtitleLabel.font = .systemFont(ofSize: 9, weight: .regular)
-        subtitleLabel.textColor = PanelTheme.tertiaryText
-        subtitleLabel.lineBreakMode = .byTruncatingMiddle
-        subtitleLabel.maximumNumberOfLines = 1
-        subtitleLabel.cell?.truncatesLastVisibleLine = true
-        subtitleLabel.cell?.wraps = false
-        subtitleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        errorLabel.font = .systemFont(ofSize: 9, weight: .regular)
+        errorLabel.textColor = PanelTheme.tertiaryText
+        errorLabel.lineBreakMode = .byTruncatingTail
+        errorLabel.maximumNumberOfLines = 1
+        errorLabel.cell?.truncatesLastVisibleLine = true
+        errorLabel.cell?.wraps = false
+        errorLabel.isHidden = true
+        errorLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        errorLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         statusLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
         statusLabel.textColor = PanelTheme.tertiaryText
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.maximumNumberOfLines = 1
+        statusLabel.cell?.wraps = false
+        statusLabel.setContentHuggingPriority(.init(751), for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.init(751), for: .horizontal)
 
         statusDotMini.wantsLayer = true
@@ -235,44 +192,26 @@ final class ProviderHeaderView: NSView {
         statusDotMini.layer?.cornerRadius = 2.5
         statusDotMini.translatesAutoresizingMaskIntoConstraints = false
 
-        refreshButton.onTap = { [weak self] in self?.onRefresh?() }
-
-        let titleLine = NSStackView(views: [titleLabel, subtitleLabel, planTag])
-        titleLine.orientation = .horizontal
-        titleLine.alignment = .lastBaseline
-        titleLine.spacing = 6
-        titleLine.translatesAutoresizingMaskIntoConstraints = false
-
         let statusLine = NSStackView(views: [statusDotMini, statusLabel])
         statusLine.orientation = .horizontal
         statusLine.alignment = .centerY
         statusLine.spacing = 4
 
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-
-        let content = NSStackView(views: [logoContainer, titleLine, spacer, statusLine, refreshButton])
+        let content = NSStackView(views: [errorLabel, statusLine])
         content.orientation = .horizontal
         content.alignment = .centerY
         content.spacing = 7
         content.translatesAutoresizingMaskIntoConstraints = false
         addSubview(content)
-        // 状态点独立叠在徽标右下方，避免被徽标边界裁成一小段圆弧。
-        addSubview(statusDot)
 
         NSLayoutConstraint.activate([
             content.leadingAnchor.constraint(equalTo: leadingAnchor),
             content.trailingAnchor.constraint(equalTo: trailingAnchor),
             content.topAnchor.constraint(equalTo: topAnchor, constant: 3),
             content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
-            statusDot.widthAnchor.constraint(equalToConstant: 7),
-            statusDot.heightAnchor.constraint(equalToConstant: 7),
-            statusDot.trailingAnchor.constraint(equalTo: logoContainer.trailingAnchor, constant: 2.5),
-            statusDot.bottomAnchor.constraint(equalTo: logoContainer.bottomAnchor, constant: 2.5),
             statusDotMini.widthAnchor.constraint(equalToConstant: 5),
             statusDotMini.heightAnchor.constraint(equalToConstant: 5),
-            subtitleLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 88),
-            statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 80)
+            statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 120)
         ])
     }
 
@@ -281,20 +220,10 @@ final class ProviderHeaderView: NSView {
     }
 
     func configure(_ state: State) {
-        monogramLabel.stringValue = state.monogram
-        if let logoImage = state.logoImage {
-            logoImageView.image = logoImage
-            logoImageView.isHidden = false
-            monogramLabel.isHidden = true
-        } else {
-            logoImageView.isHidden = true
-            monogramLabel.isHidden = false
-        }
-        titleLabel.stringValue = state.title
-        subtitleLabel.stringValue = Self.compactAccountLabel(state.subtitle ?? "")
-        subtitleLabel.isHidden = state.subtitle?.isEmpty != false
-        subtitleLabel.toolTip = state.subtitle ?? ""
-        planTag.configure(text: state.tagText, style: state.tagStyle)
+        let hasError = !(state.errorText ?? "").isEmpty
+        errorLabel.stringValue = state.errorText ?? ""
+        errorLabel.isHidden = !hasError
+        errorLabel.toolTip = state.errorTooltip ?? state.errorText
 
         statusLabel.stringValue = state.statusText
         statusLabel.toolTip = state.statusText
@@ -303,15 +232,12 @@ final class ProviderHeaderView: NSView {
         case .ok:
             statusLabel.textColor = PanelTheme.tertiaryText
             statusDotMini.layer?.backgroundColor = PanelTheme.green.cgColor
-            statusDot.layer?.backgroundColor = PanelTheme.green.cgColor
         case .bad:
             statusLabel.textColor = NSColor(hex: 0xFF8D84)
             statusDotMini.layer?.backgroundColor = PanelTheme.red.cgColor
-            statusDot.layer?.backgroundColor = PanelTheme.red.cgColor
         case .idle:
             statusLabel.textColor = PanelTheme.tertiaryText
             statusDotMini.layer?.backgroundColor = PanelTheme.tertiaryText.cgColor
-            statusDot.layer?.backgroundColor = PanelTheme.tertiaryText.cgColor
         }
     }
 
@@ -330,35 +256,24 @@ final class ProviderHeaderView: NSView {
 
     var canRequestRefresh: Bool { !isRefreshing && !isInRefreshCooldown }
 
-    /// 错误横幅重试入口：失败后立即重试是明确意图，只做并发防重，不看冷却。
-    var canRetryRefresh: Bool { refreshAvailable && !isRefreshing }
+    /// 余额刷新是否可用（API Key 模式为 false；测试与外部状态读取用）。
+    var isRefreshAvailable: Bool { refreshAvailable }
 
     func setRefreshAvailable(_ available: Bool) {
         refreshAvailable = available
-        updateRefreshButton()
+        notifyAvailabilityChange()
     }
 
     func setRefreshing(_ refreshing: Bool) {
         isRefreshing = refreshing
-        updateRefreshButton()
+        notifyAvailabilityChange()
     }
 
     private var isInRefreshCooldown: Bool {
         refreshAllowedAt.map { now() < $0 } ?? false
     }
 
-    private func updateRefreshButton() {
-        refreshButton.isEnabled = refreshAvailable && canRequestRefresh
-        refreshButton.alphaValue = refreshButton.isEnabled ? 1 : 0.35
-        if !refreshAvailable {
-            refreshButton.toolTip = "API Key 模式不支持余额刷新"
-        } else if isRefreshing {
-            refreshButton.toolTip = "刷新中，请稍候"
-        } else if isInRefreshCooldown {
-            refreshButton.toolTip = "刷新冷却中，请稍后重试"
-        } else {
-            refreshButton.toolTip = "手动刷新"
-        }
+    private func notifyAvailabilityChange() {
         onRefreshAvailabilityChange?()
     }
 
@@ -367,13 +282,13 @@ final class ProviderHeaderView: NSView {
     func beginRefreshCooldown(allowUsageOnly: Bool = false) -> Bool {
         guard refreshAvailable || allowUsageOnly, !isRefreshing, !isInRefreshCooldown else { return false }
         refreshAllowedAt = now().addingTimeInterval(60)
-        updateRefreshButton()
+        notifyAvailabilityChange()
         cooldownTimer?.invalidate()
         cooldownTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 self.cooldownTimer = nil
-                self.updateRefreshButton()
+                self.notifyAvailabilityChange()
             }
         }
         return true
@@ -1082,104 +997,7 @@ final class PanelBadgeLabel: NSView {
     }
 }
 
-/// 刷新失败横幅：图标 + 标题 + 详情（2 行截断）+ 重试按钮。
-final class ErrorBannerView: NSView {
-    var onRetry: (() -> Void)?
 
-    private let titleLabel = NSTextField(labelWithString: "")
-    private let detailLabel = NSTextField(wrappingLabelWithString: "")
-    private let retryButton = PillButton(title: "重试", target: nil, action: nil)
-
-    init() {
-        super.init(frame: .zero)
-        translatesAutoresizingMaskIntoConstraints = false
-        wantsLayer = true
-        layer?.cornerRadius = 9
-        layer?.backgroundColor = PanelTheme.red.withAlphaComponent(0.07).cgColor
-        layer?.borderWidth = 1
-        layer?.borderColor = PanelTheme.red.withAlphaComponent(0.22).cgColor
-        isHidden = true
-
-        let icon = NSImageView()
-        icon.image = NSImage(systemSymbolName: "exclamationmark.triangle.fill", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
-        icon.contentTintColor = PanelTheme.red
-        icon.translatesAutoresizingMaskIntoConstraints = false
-
-        titleLabel.font = .systemFont(ofSize: 10, weight: .bold)
-        titleLabel.textColor = NSColor(hex: 0xFF8D84)
-        titleLabel.lineBreakMode = .byTruncatingTail
-
-        detailLabel.font = .systemFont(ofSize: 9, weight: .regular)
-        detailLabel.textColor = PanelTheme.tertiaryText
-        detailLabel.maximumNumberOfLines = 2
-
-        retryButton.font = .systemFont(ofSize: 9.5, weight: .bold)
-        retryButton.bezelStyle = .regularSquare
-        retryButton.isBordered = false
-        retryButton.horizontalPadding = 18
-        retryButton.applyStyle(
-            foreground: NSColor(hex: 0xFF8D84),
-            background: PanelTheme.red.withAlphaComponent(0.12),
-            border: PanelTheme.red.withAlphaComponent(0.3),
-            cornerRadius: 6
-        )
-        retryButton.target = self
-        retryButton.action = #selector(retryTapped)
-
-        // 面板定宽，预先确定换行上限，避免在 layout 中用标签自身宽度反复反馈。
-        detailLabel.preferredMaxLayoutWidth = max(1, PanelTheme.contentWidth - 18 - 12 - 14
-            - ceil(retryButton.intrinsicContentSize.width))
-
-        let textStack = NSStackView(views: [titleLabel, detailLabel])
-        textStack.orientation = .vertical
-        textStack.alignment = .leading
-        textStack.spacing = 2
-        textStack.translatesAutoresizingMaskIntoConstraints = false
-        retryButton.translatesAutoresizingMaskIntoConstraints = false
-
-        addSubview(icon)
-        addSubview(textStack)
-        addSubview(retryButton)
-
-        // 手动横排：文本区吃掉富余宽度，重试按钮按内容宽度钉在右缘，避免被拉伸。
-        let retryWidth = ceil(retryButton.intrinsicContentSize.width)
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
-            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 12),
-            textStack.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 7),
-            textStack.topAnchor.constraint(equalTo: topAnchor, constant: 6),
-            textStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -6),
-            textStack.trailingAnchor.constraint(lessThanOrEqualTo: retryButton.leadingAnchor, constant: -7),
-            retryButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
-            retryButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            retryButton.widthAnchor.constraint(equalToConstant: retryWidth),
-            retryButton.heightAnchor.constraint(equalToConstant: 18),
-            titleLabel.widthAnchor.constraint(equalTo: textStack.widthAnchor),
-            detailLabel.widthAnchor.constraint(equalTo: textStack.widthAnchor)
-        ])
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func configure(title: String, detail: String) {
-        titleLabel.stringValue = title
-        detailLabel.stringValue = detail
-        detailLabel.toolTip = detail
-        isHidden = false
-    }
-
-    func hide() {
-        isHidden = true
-    }
-
-    @objc private func retryTapped() {
-        onRetry?()
-    }
-}
 
 /// 底部：阈值图例行 + 低量提醒开关（+ 恢复提醒按钮）。
 final class PanelFooterView: NSView {

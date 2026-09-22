@@ -3,7 +3,7 @@ import Foundation
 
 // MARK: - Provider 区块（Codex / Z.AI）
 
-/// 单个 provider 的完整区块：头部 + 额度胶囊网格 + 重置卡 + 用量图 + 错误横幅。
+/// 单个 provider 的完整区块：slim 头部 + 额度胶囊网格 + 重置卡 + 用量图。
 /// 各 section 只做展示，数据填充语义与旧版 apply/applyZAI 保持一致。
 final class ProviderPanelSection: NSView {
     var onRefresh: (() -> Void)?
@@ -17,24 +17,12 @@ final class ProviderPanelSection: NSView {
     let resetCards = ResetCardsRow()
     let paceChart = WeeklyPaceChartView()
     let usageChart = DailyUsageChartView()
-    let errorBanner = ErrorBannerView()
 
     init(monogram: String, name: String) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
 
-        header.configure(.init(
-            title: name,
-            monogram: monogram,
-            subtitle: nil,
-            tagText: nil,
-            tagStyle: .plan,
-            statusText: "等待刷新",
-            statusKind: .idle
-        ))
-        header.onRefresh = { [weak self] in
-            self?.requestRefresh()
-        }
+        header.configure(.init(statusText: "等待刷新", statusKind: .idle))
 
         grid.orientation = .horizontal
         grid.alignment = .top
@@ -45,9 +33,6 @@ final class ProviderPanelSection: NSView {
         resetCards.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
         // 图例显隐 / 配速图显隐都会改变区块高度
         usageChart.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
-        errorBanner.onRetry = { [weak self] in
-            self?.retryFromError()
-        }
 
         modeHintLabel.font = .systemFont(ofSize: 10, weight: .medium)
         modeHintLabel.textColor = PanelTheme.tertiaryText
@@ -57,7 +42,7 @@ final class ProviderPanelSection: NSView {
         paceChart.isHidden = true
 
         startPlanList.isHidden = true
-        let stack = NSStackView(views: [header, modeHintLabel, grid, startPlanList, resetCards, paceChart, usageChart, errorBanner])
+        let stack = NSStackView(views: [header, modeHintLabel, grid, startPlanList, resetCards, paceChart, usageChart])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
@@ -73,7 +58,6 @@ final class ProviderPanelSection: NSView {
             startPlanList.widthAnchor.constraint(equalTo: stack.widthAnchor),
             paceChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             usageChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            errorBanner.widthAnchor.constraint(equalTo: stack.widthAnchor),
             // 宽度钉常量：面板固定 322、内容 322-24。若只靠子视图互约束，
             // 宽度链自引用会产出歧义解（Codex 全宽 / ZAI 塌成 228pt 的随机表现）。
             stack.widthAnchor.constraint(equalToConstant: PanelTheme.contentWidth)
@@ -84,17 +68,16 @@ final class ProviderPanelSection: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// 单独刷新与全局刷新共用 60 秒冷却防重。
+    /// 顶栏刷新（当前 active tab）与本区块刷新共用 60 秒冷却防重。
     func requestRefresh(allowUsageOnly: Bool = false) {
         guard let onRefresh, header.beginRefreshCooldown(allowUsageOnly: allowUsageOnly) else { return }
         onRefresh()
     }
 
-    /// 错误横幅重试：就是再触发一次刷新，不受冷却限制；刷新开始后横幅清空、
-    /// 头部进入"刷新中…"（store 同步回调），按钮随之隐藏不可连点。
-    func retryFromError() {
-        guard let onRefresh, header.canRetryRefresh else { return }
-        onRefresh()
+    /// 头部错误文案的 tooltip：附上仍在展示的缓存数据时间。
+    static func errorTooltip(error: String, fetchedAt: Date?) -> String {
+        guard let fetchedAt else { return error }
+        return "刷新失败，显示 \(PanelTheme.formatFetchedAt(fetchedAt)) 数据 · \(error)"
     }
 
     func setCells(_ cells: [NSView]) {
@@ -241,17 +224,8 @@ final class CodexPanelSection: NSView {
             ])
         }
 
-        // 头部状态
-        var state = ProviderHeaderView.State(
-            title: "Codex",
-            monogram: "Cx",
-            logoImage: PanelLogos.codex,
-            subtitle: accountLabel,
-            tagText: snapshot?.planType?.isEmpty == false ? snapshot?.planType : nil,
-            tagStyle: .plan,
-            statusText: "",
-            statusKind: .idle
-        )
+        // 头部状态（slim：状态文字 + 失败时左侧错误文案）
+        var state = ProviderHeaderView.State(statusText: "", statusKind: .idle)
         if let transientStatus {
             state.statusText = transientStatus
             state.statusKind = .idle
@@ -268,21 +242,11 @@ final class CodexPanelSection: NSView {
             state.statusText = "暂无数据"
             state.statusKind = .idle
         }
-        section.header.configure(state)
-
-        // 错误横幅
         if let error, !isRefreshing {
-            if let fetchedAt = snapshot?.fetchedAt {
-                section.errorBanner.configure(
-                    title: "刷新失败，显示 \(PanelTheme.formatFetchedAt(fetchedAt)) 数据",
-                    detail: error
-                )
-            } else {
-                section.errorBanner.configure(title: "刷新失败", detail: error)
-            }
-        } else {
-            section.errorBanner.hide()
+            state.errorText = error
+            state.errorTooltip = ProviderPanelSection.errorTooltip(error: error, fetchedAt: snapshot?.fetchedAt)
         }
+        section.header.configure(state)
     }
 
     func applyUsage(days: [DayUsage]?) {
@@ -374,22 +338,15 @@ final class ZAIPanelSection: NSView {
         let selection = resolveSelection()
         let kind = selection?.kind ?? snapshot?.kind ?? .codingPlan
 
-        var tagStyle = PlanTagView.Style.plan
-        var tagText: String?
         var cells: [QuotaCellView] = []
         var showsResetCards = false
         var showsStartPlanList = false
 
         switch kind {
         case .apiKey:
-            let suffix = snapshot?.apiKeySuffix.map { " ····\($0)" } ?? ""
-            tagText = "API Key\(suffix)"
-            tagStyle = .neutral
             showsResetCards = false
 
         case .startPlan:
-            let planName = snapshot?.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
-            tagText = planName
             let planItems = snapshot?.planItems ?? []
             if planItems.count > 1 {
                 showsStartPlanList = true
@@ -429,13 +386,6 @@ final class ZAIPanelSection: NSView {
             showsResetCards = false
 
         case .codingPlan:
-            let mcpTag: String? = if selection?.teamContext != nil, let mcpUsage = snapshot?.mcpUsage {
-                "MCP 剩余 \(Int(mcpUsage.remainingPercent.rounded()))%"
-            } else {
-                nil
-            }
-            tagText = [snapshot?.level, mcpTag].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
-            if tagText?.isEmpty == true { tagText = nil }
             let limits = snapshot?.limits ?? []
             let units: [ZAILimit.WindowUnit] = [.hourly, .weekly]
             for (unit, cell) in zip(units, [firstCell, secondCell]) {
@@ -492,8 +442,7 @@ final class ZAIPanelSection: NSView {
         section.setModeHint(modeHint)
         section.header.setRefreshAvailable(kind != .apiKey)
 
-        // 头部状态
-        let email = account?.email ?? snapshot?.email ?? ""
+        // 头部状态（slim：状态文字 + 失败时左侧错误文案）
         var statusText = ""
         var statusKind = ProviderHeaderView.StatusKind.idle
 
@@ -514,29 +463,13 @@ final class ZAIPanelSection: NSView {
         }
 
         section.header.configure(.init(
-            title: titleOverride ?? "Z.AI",
-            monogram: "Z",
-            logoImage: PanelLogos.zai,
-            subtitle: email.isEmpty ? nil : email,
-            tagText: tagText,
-            tagStyle: tagStyle,
             statusText: statusText,
-            statusKind: statusKind
+            statusKind: statusKind,
+            errorText: (error != nil && !isRefreshing && kind != .apiKey) ? error : nil,
+            errorTooltip: (error != nil && kind != .apiKey)
+                ? ProviderPanelSection.errorTooltip(error: error ?? "", fetchedAt: snapshot?.fetchedAt)
+                : nil
         ))
-
-        // 错误横幅
-        if let error, !isRefreshing, kind != .apiKey {
-            if let fetchedAt = snapshot?.fetchedAt {
-                section.errorBanner.configure(
-                    title: "刷新失败，显示 \(PanelTheme.formatFetchedAt(fetchedAt)) 数据",
-                    detail: error
-                )
-            } else {
-                section.errorBanner.configure(title: "刷新失败", detail: error)
-            }
-        } else {
-            section.errorBanner.hide()
-        }
     }
 
     func applyUsage(days: [DayUsage]?, channelDays: [DayUsage]? = nil) {

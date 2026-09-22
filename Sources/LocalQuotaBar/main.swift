@@ -2039,15 +2039,17 @@ final class QuotaViewController: NSViewController {
     // 顶部栏
     private let updatedLabel = NSTextField(labelWithString: "")
     private var updatedLabelTimer: Timer?
-    private let refreshAllButton = PanelIconButton(symbolName: "arrow.clockwise", toolTipText: "全部刷新", side: 22)
+    private let refreshTabButton = PanelIconButton(symbolName: "arrow.clockwise", toolTipText: "刷新", side: 22)
     private let settingsButton = PanelIconButton(symbolName: "gearshape", toolTipText: "设置", side: 22)
 
-    // provider 区块与页脚
+    // Tab 栏 + provider 面板：同一时刻只显示 active tab 的区块（Codex / Z.AI 内容区不变）
+    private let tabBar = PanelTabBarView()
     private let codexSection = CodexPanelSection()
     private let zaiSection = ZAIPanelSection()
-    private var zaiBlock: NSView?
+    private var panelBlocks: [QuotaTabID: NSView] = [:]
     private let footer = PanelFooterView()
-    private var shouldShowZAISection = false
+    private var activeTab: QuotaTabID = .codex
+    private var isZAITabVisible = false
 
     /// 最近一次 Codex 状态；账号标签等外部更新后重放（与旧版行为一致）。
     private var lastCodexSnapshot: QuotaSnapshot?
@@ -2055,9 +2057,14 @@ final class QuotaViewController: NSViewController {
     private var lastCodexError: String?
     private var accountLabelText: String?
 
-    /// 顶部更新时间：任一渠道最近一次成功刷新的时刻。快照只在成功时生成，
-    /// 刷新中的重放会带旧 fetchedAt，取 max 防止乱序回放把时间回退。
-    private var lastRefreshedAt: Date?
+    /// 最近一次 Z.AI 状态，供 tab 摘要与切换重放使用。
+    private var lastZAISnapshot: ZAIQuotaSnapshot?
+    private var lastZAIError: String?
+    private var lastZAITitleOverride: String?
+
+    /// 顶部更新时间：跟随 active tab 各自最近一次成功刷新的时刻。快照只在成功时生成，
+    /// 刷新中的重放会带旧 fetchedAt，每个 tab 取 max 防止乱序回放把时间回退。
+    private var refreshedAtByTab: [QuotaTabID: Date] = [:]
 
     /// 当前生效的提醒配置；面板/设置页改动后走 onReminderConfigurationChange 与右键菜单共用一条链。
     private var reminderConfiguration = ReminderConfiguration.default
@@ -2091,8 +2098,9 @@ final class QuotaViewController: NSViewController {
 
     override func viewDidAppear() {
         super.viewDidAppear()
-        // popover 每次重新打开都回到额度页
+        // popover 每次重新打开都回到额度页与默认 Codex tab（选择不持久化）
         setShowsSettings(false)
+        setActiveTab(.codex)
         focusTouchBarHost()
         updateLastUpdatedLabel()
         updatedLabelTimer?.invalidate()
@@ -2124,19 +2132,26 @@ final class QuotaViewController: NSViewController {
     }
 
     func setZAISectionVisible(_ visible: Bool) {
-        shouldShowZAISection = visible
+        isZAITabVisible = visible
         if isViewLoaded {
-            zaiBlock?.isHidden = !visible
+            if !visible, activeTab == .zai {
+                setActiveTab(.codex)
+            }
+            syncTabBar()
         }
-        updateRefreshAllButton()
+        updateRefreshButton()
         updatePreferredContentSize()
     }
 
     func applyZAI(snapshot: ZAIQuotaSnapshot?, account: ZAIAccount?, isRefreshing: Bool, error: String?) {
         let selection = ZAISettings.resolveProviderSelection()
         let title = selection?.domain == "bigmodel" ? "BigModel" : "Z.AI"
+        lastZAISnapshot = snapshot
+        lastZAIError = error
+        lastZAITitleOverride = title
         zaiSection.apply(snapshot: snapshot, account: account, isRefreshing: isRefreshing, error: error, titleOverride: title)
-        recordRefreshedAt(snapshot?.fetchedAt)
+        recordRefreshedAt(.zai, snapshot?.fetchedAt)
+        syncTabBar()
         updateLastUpdatedLabel()
         updatePreferredContentSize()
     }
@@ -2167,32 +2182,34 @@ final class QuotaViewController: NSViewController {
         lastCodexSnapshot = snapshot
         lastCodexIsRefreshing = isRefreshing
         lastCodexError = error
-        recordRefreshedAt(snapshot?.fetchedAt)
+        recordRefreshedAt(.codex, snapshot?.fetchedAt)
 
         codexSection.apply(snapshot: snapshot, isRefreshing: isRefreshing, error: error, accountLabel: accountLabelText)
+        syncTabBar()
         updateLastUpdatedLabel()
         if let snapshot {
             rootView.touchBarQuotaView.update(snapshot: snapshot, reminder: reminder)
         }
     }
 
-    /// 任一渠道成功返回快照后推进顶部时间；旧快照重放不会回退。
-    private func recordRefreshedAt(_ fetchedAt: Date?) {
+    /// 任一渠道成功返回快照后推进该 tab 的顶部时间；旧快照重放不会回退。
+    private func recordRefreshedAt(_ tab: QuotaTabID, _ fetchedAt: Date?) {
         guard let fetchedAt else { return }
-        lastRefreshedAt = max(lastRefreshedAt ?? .distantPast, fetchedAt)
+        let current = refreshedAtByTab[tab] ?? .distantPast
+        refreshedAtByTab[tab] = max(current, fetchedAt)
     }
 
     /// 顶部更新时间文案（测试读取用）。
     var lastUpdatedDisplayText: String { updatedLabel.stringValue }
 
     private func updateLastUpdatedLabel() {
-        guard let lastRefreshedAt else {
+        guard let refreshedAt = refreshedAtByTab[activeTab] else {
             updatedLabel.stringValue = ""
             updatedLabel.toolTip = nil
             return
         }
-        updatedLabel.stringValue = PanelTheme.relativeTime(from: lastRefreshedAt)
-        updatedLabel.toolTip = "上次成功刷新：\(PanelTheme.formatFetchedAt(lastRefreshedAt))"
+        updatedLabel.stringValue = PanelTheme.relativeTime(from: refreshedAt)
+        updatedLabel.toolTip = "\(activeTabDisplayName) 上次成功刷新：\(PanelTheme.formatFetchedAt(refreshedAt))"
     }
 
     func applyReminderConfiguration(_ configuration: ReminderConfiguration) {
@@ -2232,6 +2249,7 @@ final class QuotaViewController: NSViewController {
 
     private func configureSubviews() {
         buildTopBar()
+        buildTabBar()
         buildSections()
         buildFooter()
         buildSettingsPage()
@@ -2270,13 +2288,9 @@ final class QuotaViewController: NSViewController {
         updatedLabel.font = .systemFont(ofSize: 10, weight: .regular)
         updatedLabel.textColor = PanelTheme.tertiaryText
 
-        refreshAllButton.identifier = NSUserInterfaceItemIdentifier("global-refresh")
-        refreshAllButton.onTap = { [weak self] in
-            guard let self, self.canRefreshAll else { return }
-            self.codexSection.requestRefresh()
-            if self.shouldShowZAISection {
-                self.zaiSection.requestRefresh()
-            }
+        refreshTabButton.identifier = NSUserInterfaceItemIdentifier("refresh-active")
+        refreshTabButton.onTap = { [weak self] in
+            self?.requestActiveTabRefresh()
         }
         settingsButton.onTap = { [weak self] in
             self?.setShowsSettings(true)
@@ -2285,7 +2299,7 @@ final class QuotaViewController: NSViewController {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
-        let topBar = NSStackView(views: [titleLabel, spacer, updatedLabel, refreshAllButton, settingsButton])
+        let topBar = NSStackView(views: [titleLabel, spacer, updatedLabel, refreshTabButton, settingsButton])
         topBar.orientation = .horizontal
         topBar.alignment = .centerY
         topBar.spacing = 8
@@ -2295,41 +2309,222 @@ final class QuotaViewController: NSViewController {
         quotaPage.spacing = 0
         quotaPage.translatesAutoresizingMaskIntoConstraints = false
 
-        let block = makeBlock(topBar, top: 10, bottom: 8)
-        quotaPage.addArrangedSubview(block)
-        quotaPage.addArrangedSubview(makeHairline())
+        quotaPage.addArrangedSubview(makeBlock(topBar, top: 10, bottom: 4))
+    }
+
+    /// Tab 栏：通栏容器（自带底部分隔线），点击切换 active 面板。
+    private func buildTabBar() {
+        tabBar.onSelectionChange = { [weak self] tab in
+            self?.setActiveTab(tab)
+        }
+
+        let container = NSView()
+        container.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.translatesAutoresizingMaskIntoConstraints = false
+        container.addSubview(tabBar)
+        NSLayoutConstraint.activate([
+            tabBar.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            tabBar.topAnchor.constraint(equalTo: container.topAnchor),
+            tabBar.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            container.widthAnchor.constraint(equalToConstant: PanelTheme.panelWidth)
+        ])
+        quotaPage.addArrangedSubview(container)
     }
 
     private func buildSections() {
         codexSection.onRefresh = { [weak self] in self?.onRefresh?() }
         codexSection.onResetCredit = { [weak self] id in self?.onResetCodexCredit?(id) }
-        codexSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshAllButton() }
+        codexSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshButton() }
         codexSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
-        quotaPage.addArrangedSubview(makeBlock(codexSection, top: 8, bottom: 10))
+        panelBlocks[.codex] = makeBlock(codexSection, top: 8, bottom: 10)
 
         zaiSection.onRefresh = { [weak self] in self?.onZAIRefresh?() }
         zaiSection.onUseResetCard = { [weak self] kind in self?.onUseZAIResetCard?(kind) }
-        zaiSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshAllButton() }
+        zaiSection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshButton() }
         zaiSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
+        panelBlocks[.zai] = makeBlock(zaiSection, top: 8, bottom: 10)
 
-        let zaiDivider = makeHairline()
-        let zaiBlock = makeBlock(zaiSection, top: 8, bottom: 10)
-        self.zaiBlock = zaiBlock
-        quotaPage.addArrangedSubview(zaiDivider)
-        quotaPage.addArrangedSubview(zaiBlock)
-        zaiDivider.isHidden = !shouldShowZAISection
-        zaiBlock.isHidden = !shouldShowZAISection
-        updateRefreshAllButton()
+        for id in QuotaTabID.allCases {
+            guard let block = panelBlocks[id] else { continue }
+            quotaPage.addArrangedSubview(block)
+        }
+        syncTabBar()
+        updatePanelVisibility()
+        updateRefreshButton()
     }
 
-    private var canRefreshAll: Bool {
-        codexSection.canRequestRefresh && (!shouldShowZAISection || zaiSection.canRequestRefresh)
+    // MARK: - Tab 切换与刷新语义（顶栏刷新只作用于当前 active tab）
+
+    /// 当前可见 tab：Codex 常驻；Z.AI 由 ZAISettings 决定；DeepSeek / CodeBuddy 在后续阶段接入。
+    private var visibleTabs: Set<QuotaTabID> {
+        var tabs: Set<QuotaTabID> = [.codex]
+        if isZAITabVisible { tabs.insert(.zai) }
+        return tabs
     }
 
-    private func updateRefreshAllButton() {
-        refreshAllButton.isEnabled = canRefreshAll
-        refreshAllButton.alphaValue = canRefreshAll ? 1 : 0.35
-        refreshAllButton.toolTip = canRefreshAll ? "全部刷新" : "有项目正在刷新或冷却，请稍后重试"
+    private var activeTabDisplayName: String {
+        if activeTab == .zai { return lastZAITitleOverride ?? QuotaTabID.zai.displayName }
+        return activeTab.displayName
+    }
+
+    private func setActiveTab(_ tab: QuotaTabID) {
+        guard visibleTabs.contains(tab) else { return }
+        activeTab = tab
+        tabBar.select(tab, notify: false)
+        updatePanelVisibility()
+        updateRefreshButton()
+        updateLastUpdatedLabel()
+        updatePreferredContentSize()
+    }
+
+    /// 各面板常驻视图树、按 active 显隐；隐藏的区块在 stack 中自动塌缩。
+    private func updatePanelVisibility() {
+        guard isViewLoaded else { return }
+        for (id, block) in panelBlocks where id != activeTab {
+            block.isHidden = true
+        }
+        panelBlocks[activeTab]?.isHidden = false
+    }
+
+    /// 汇总各 tab 的环 / tag / 状态点 / tooltip（apply 链路与显隐变化后调用）。
+    private func syncTabBar() {
+        guard isViewLoaded else { return }
+        if !visibleTabs.contains(activeTab) {
+            activeTab = .codex
+            tabBar.select(.codex, notify: false)
+        }
+        tabBar.configure(statuses: tabStatuses(), visible: visibleTabs)
+    }
+
+    private var activeSectionCanRefresh: Bool {
+        switch activeTab {
+        case .codex: return codexSection.canRequestRefresh
+        case .zai: return zaiSection.canRequestRefresh
+        case .deepSeek, .codeBuddy: return false
+        }
+    }
+
+    private func updateRefreshButton() {
+        let canRefresh = activeSectionCanRefresh
+        refreshTabButton.isEnabled = canRefresh
+        refreshTabButton.alphaValue = canRefresh ? 1 : 0.35
+        refreshTabButton.toolTip = canRefresh
+            ? "刷新 \(activeTabDisplayName)"
+            : "当前项目正在刷新或冷却，请稍后重试"
+    }
+
+    /// 顶栏刷新：只刷新当前 active tab（60 秒冷却由各 section 承担）。
+    private func requestActiveTabRefresh() {
+        guard activeSectionCanRefresh else { return }
+        switch activeTab {
+        case .codex: codexSection.requestRefresh()
+        case .zai: zaiSection.requestRefresh()
+        case .deepSeek, .codeBuddy: break
+        }
+    }
+
+    private func tabStatuses() -> [QuotaTabID: PanelTabStatus] {
+        var statuses: [QuotaTabID: PanelTabStatus] = [:]
+
+        var codex = PanelTabStatus()
+        if let weekly = lastCodexSnapshot?.weekly {
+            codex.ring = .percent(remaining: weekly.remainingPercent)
+        } else if let fiveHour = lastCodexSnapshot?.fiveHour {
+            codex.ring = .percent(remaining: fiveHour.remainingPercent)
+        }
+        codex.tagText = lastCodexSnapshot?.planType.flatMap { $0.isEmpty ? nil : $0 }
+        codex.isFailed = lastCodexError != nil
+        codex.summary = codexTabSummary()
+        statuses[.codex] = codex
+
+        var zai = PanelTabStatus()
+        zai.titleOverride = lastZAITitleOverride
+        zai.isFailed = lastZAIError != nil
+        zai.tagText = zaiTabTag()
+        zai.ring = zaiTabRing()
+        zai.summary = zaiTabSummary()
+        statuses[.zai] = zai
+
+        return statuses
+    }
+
+    private func codexTabSummary() -> String? {
+        var parts: [String] = []
+        if let bucket = lastCodexSnapshot?.weekly ?? lastCodexSnapshot?.fiveHour {
+            parts.append("\(bucket.title)剩余 \(bucket.roundedRemainingPercent)%")
+            if let countdown = PanelTheme.formatCountdown(until: bucket.resetsAt) {
+                parts.append("\(countdown)后重置")
+            }
+        }
+        if let balance = lastCodexSnapshot?.creditBalance {
+            parts.append("余额 \(String(format: "$%.2f", balance / 25))")
+        }
+        if let accountLabelText, !accountLabelText.isEmpty {
+            parts.append(ProviderHeaderView.compactAccountLabel(accountLabelText))
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+
+    private func zaiTabRing() -> PanelTabStatus.RingValue {
+        guard let snapshot = lastZAISnapshot else { return .unavailable }
+        switch snapshot.kind {
+        case .apiKey, nil:
+            return .unavailable
+        case .startPlan:
+            guard let balance = snapshot.balances.first else { return .unavailable }
+            return .percent(remaining: balance.remainingFraction * 100)
+        case .codingPlan:
+            let limits = snapshot.limits
+            if let weekly = limits.first(where: { $0.unit == .weekly }) {
+                return .percent(remaining: weekly.remainingPercent)
+            }
+            if let hourly = limits.first(where: { $0.unit == .hourly }) {
+                return .percent(remaining: hourly.remainingPercent)
+            }
+            return .unavailable
+        }
+    }
+
+    private func zaiTabTag() -> String? {
+        guard let snapshot = lastZAISnapshot else { return nil }
+        switch snapshot.kind {
+        case .apiKey:
+            return snapshot.apiKeySuffix.map { "API Key ····\($0)" } ?? "API Key"
+        case .startPlan:
+            return snapshot.planName.flatMap { $0.isEmpty ? nil : $0 } ?? "体验套餐"
+        case .codingPlan:
+            return snapshot.level.flatMap { $0.isEmpty ? nil : $0 }
+        case nil:
+            return nil
+        }
+    }
+
+    private func zaiTabSummary() -> String? {
+        guard let snapshot = lastZAISnapshot else { return nil }
+        var parts: [String] = []
+        switch snapshot.kind {
+        case .apiKey:
+            parts.append("API Key 模式，无余额功能")
+        case nil:
+            break
+        case .startPlan:
+            if let email = snapshot.email, !email.isEmpty {
+                parts.append(ProviderHeaderView.compactAccountLabel(email))
+            }
+        case .codingPlan:
+            let limits = snapshot.limits
+            if let hourly = limits.first(where: { $0.unit == .hourly }) {
+                parts.append("\(hourly.title)剩余 \(hourly.roundedRemainingPercent)%")
+            }
+            if let weekly = limits.first(where: { $0.unit == .weekly }) {
+                parts.append("\(weekly.title)剩余 \(weekly.roundedRemainingPercent)%")
+            }
+            if let email = snapshot.email, !email.isEmpty {
+                parts.append(ProviderHeaderView.compactAccountLabel(email))
+            }
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 
     private func buildFooter() {

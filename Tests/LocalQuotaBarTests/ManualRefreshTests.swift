@@ -2,6 +2,7 @@ import AppKit
 import XCTest
 @testable import LocalQuotaBar
 
+/// 顶栏刷新语义（tabs 版）：只刷新当前 active tab；各 provider 60 秒冷却互相独立。
 final class ManualRefreshTests: XCTestCase {
     @MainActor
     func testCooldownExpiresAtSixtySecondsWithoutExtendingSkippedRequests() async throws {
@@ -41,113 +42,91 @@ final class ManualRefreshTests: XCTestCase {
 
         header.setRefreshing(false)
         XCTAssertTrue(header.canRequestRefresh)
-        XCTAssertTrue(try refreshButton(in: header).isEnabled)
-        XCTAssertTrue(header.beginRefreshCooldown())
     }
 
     @MainActor
-    func testSingleRefreshDisablesGlobalWhileOtherProviderRemainsIndependent() async throws {
+    func testTopRefreshOnlyRefreshesActiveTab() async throws {
         let controller = makeController()
         var codexRequests = 0
         var zaiRequests = 0
         controller.onRefresh = { codexRequests += 1 }
         controller.onZAIRefresh = { zaiRequests += 1 }
-        let codex = try providerSection(CodexPanelSection.self, in: controller)
-        let zai = try providerSection(ZAIPanelSection.self, in: controller)
-        let global = try globalButton(in: controller)
+        let top = try activeRefreshButton(in: controller)
 
-        try refreshButton(in: codex.header).performClick(nil)
-        XCTAssertEqual(codexRequests, 1)
-        XCTAssertFalse(global.isEnabled)
-        global.performClick(nil)
-        // 即使直接触发回调，也不能绕过禁用状态。
-        global.onTap?()
+        // 默认 active = Codex：顶栏刷新只触发 Codex。
+        top.performClick(nil)
         XCTAssertEqual(codexRequests, 1)
         XCTAssertEqual(zaiRequests, 0)
+        // 冷却期按钮禁用，直接触发回调也不能绕过禁用状态。
+        XCTAssertFalse(top.isEnabled)
+        top.onTap?()
+        XCTAssertEqual(codexRequests, 1)
 
-        try refreshButton(in: zai.header).performClick(nil)
+        // 切到 Z.AI tab：Z.AI 可独立刷新，Codex 保持冷却。
+        try tabItem(.zai, in: controller).performClick(nil)
+        XCTAssertTrue(top.isEnabled)
+        top.performClick(nil)
         XCTAssertEqual(zaiRequests, 1)
-        XCTAssertFalse(global.isEnabled)
+        XCTAssertEqual(codexRequests, 1)
+
+        // 再切回 Codex：仍在冷却中。
+        try tabItem(.codex, in: controller).performClick(nil)
+        XCTAssertFalse(top.isEnabled)
     }
 
     @MainActor
-    func testRefreshingDisablesGlobalAndCompletionRestoresIt() async throws {
+    func testRefreshingDisablesTopRefreshAndCompletionRestoresIt() async throws {
         let controller = makeController()
-        let global = try globalButton(in: controller)
-        let zai = try providerSection(ZAIPanelSection.self, in: controller)
-        XCTAssertTrue(global.isEnabled)
+        let top = try activeRefreshButton(in: controller)
+        XCTAssertTrue(top.isEnabled)
 
         controller.apply(snapshot: nil, isRefreshing: true, error: nil, reminder: .inactive)
-        XCTAssertFalse(global.isEnabled)
+        XCTAssertFalse(top.isEnabled)
         controller.apply(snapshot: nil, isRefreshing: false, error: nil, reminder: .inactive)
-        XCTAssertTrue(global.isEnabled)
+        XCTAssertTrue(top.isEnabled)
 
-        zai.header.setRefreshing(true)
-        XCTAssertFalse(global.isEnabled)
-        zai.header.setRefreshing(false)
-        XCTAssertTrue(global.isEnabled)
+        // 另一个 tab 的刷新状态不影响当前 active tab 的按钮。
+        try tabItem(.zai, in: controller).performClick(nil)
+        XCTAssertTrue(top.isEnabled)
     }
 
     @MainActor
-    func testGlobalRefreshStartsBothIdleProvidersOnce() async throws {
+    func testHiddenProviderFallsBackToCodexAndDoesNotReceiveRefresh() async throws {
         let controller = makeController()
         var codexRequests = 0
         var zaiRequests = 0
         controller.onRefresh = { codexRequests += 1 }
         controller.onZAIRefresh = { zaiRequests += 1 }
-        let global = try globalButton(in: controller)
 
-        global.performClick(nil)
+        try tabItem(.zai, in: controller).performClick(nil)
+        controller.setZAISectionVisible(false)
+        // Z.AI 隐藏后当前 tab 应回退到 Codex，且 tab 随之隐藏。
+        XCTAssertTrue(try tabItem(.zai, in: controller).isHidden)
+
+        let top = try activeRefreshButton(in: controller)
+        top.performClick(nil)
         XCTAssertEqual(codexRequests, 1)
-        XCTAssertEqual(zaiRequests, 1)
-        XCTAssertFalse(global.isEnabled)
-        global.performClick(nil)
-        global.onTap?()
-        XCTAssertEqual(codexRequests, 1)
-        XCTAssertEqual(zaiRequests, 1)
+        XCTAssertEqual(zaiRequests, 0)
     }
 
     @MainActor
-    func testFailedRefreshAndErrorRetryPreserveCooldown() async throws {
+    func testFailedRefreshKeepsCooldownForTopRefresh() async throws {
         let controller = makeController()
         var requests = 0
         controller.onRefresh = { requests += 1 }
-        let section = try providerSection(CodexPanelSection.self, in: controller)
-        try refreshButton(in: section.header).performClick(nil)
+
+        let top = try activeRefreshButton(in: controller)
+        top.performClick(nil)
         controller.apply(snapshot: nil, isRefreshing: false, error: "测试失败", reminder: .inactive)
-        XCTAssertFalse(try globalButton(in: controller).isEnabled)
-
-        // 错误横幅重试按设计绕过 60 秒冷却：失败后立即重试是明确意图，
-        // 只做并发防重。因此这里会真实再触发一次刷新。
-        let retry = try XCTUnwrap(descendants(of: section.errorBanner)
-            .compactMap { $0 as? NSButton }.first { $0.title == "重试" })
-        retry.performClick(nil)
-        XCTAssertEqual(requests, 2)
-        // 重试不延长也不清除 header 的冷却，手动入口仍被挡住。
-        XCTAssertFalse(section.header.canRequestRefresh)
+        // tabs 版没有独立错误横幅：失败后的重试入口就是顶栏刷新，遵守同一 60 秒冷却。
+        XCTAssertFalse(top.isEnabled)
+        top.performClick(nil)
+        top.onTap?()
+        XCTAssertEqual(requests, 1)
     }
 
     @MainActor
-    func testHiddenProviderDoesNotBlockGlobalOrReceiveRefresh() async throws {
-        let controller = makeController()
-        var codexRequests = 0
-        var zaiRequests = 0
-        controller.onRefresh = { codexRequests += 1 }
-        controller.onZAIRefresh = { zaiRequests += 1 }
-        let zai = try providerSection(ZAIPanelSection.self, in: controller)
-        zai.header.setRefreshing(true)
-        XCTAssertFalse(try globalButton(in: controller).isEnabled)
-
-        controller.setZAISectionVisible(false)
-        let global = try globalButton(in: controller)
-        XCTAssertTrue(global.isEnabled)
-        global.performClick(nil)
-        XCTAssertEqual(codexRequests, 1)
-        XCTAssertEqual(zaiRequests, 0)
-    }
-
-    @MainActor
-    func testAPIKeyGlobalEntryRefreshesUsageOnceWhileQuotaButtonStaysDisabled() async throws {
+    func testAPIKeyEntryRefreshesUsageOnceWhileQuotaRefreshStaysUnavailable() async throws {
         _ = NSApplication.shared
         let panel = ZAIPanelSection(resolveSelection: {
             .init(domain: "zai", kind: .apiKey, selectedKey: nil)
@@ -158,16 +137,15 @@ final class ManualRefreshTests: XCTestCase {
         var usageRequests = 0
         panel.onRefresh = { usageRequests += 1 }
         XCTAssertTrue(panel.canRequestRefresh)
-        XCTAssertFalse(try refreshButton(in: section.header).isEnabled)
+        XCTAssertFalse(section.header.isRefreshAvailable)
 
         section.requestRefresh()
         XCTAssertEqual(usageRequests, 0)
-        // Z.AI 的全局入口允许只刷新本机日用量，仍须遵守同一冷却。
+        // Z.AI 的顶栏入口允许只刷新本机日用量，仍须遵守同一冷却。
         panel.requestRefresh()
         panel.requestRefresh()
         XCTAssertEqual(usageRequests, 1)
         XCTAssertFalse(panel.canRequestRefresh)
-        XCTAssertFalse(try refreshButton(in: section.header).isEnabled)
     }
 
     @MainActor
@@ -180,20 +158,15 @@ final class ManualRefreshTests: XCTestCase {
     }
 
     @MainActor
-    private func globalButton(in controller: QuotaViewController) throws -> PanelIconButton {
+    private func activeRefreshButton(in controller: QuotaViewController) throws -> PanelIconButton {
         try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? PanelIconButton }
-            .first { $0.identifier?.rawValue == "global-refresh" })
+            .first { $0.identifier?.rawValue == "refresh-active" })
     }
 
     @MainActor
-    private func providerSection<T: NSView>(_ type: T.Type, in controller: QuotaViewController) throws -> ProviderPanelSection {
-        let panel = try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? T }.first)
-        return try XCTUnwrap(panel.subviews.compactMap { $0 as? ProviderPanelSection }.first)
-    }
-
-    @MainActor
-    private func refreshButton(in header: ProviderHeaderView) throws -> PanelIconButton {
-        try XCTUnwrap(descendants(of: header).compactMap { $0 as? PanelIconButton }.first)
+    private func tabItem(_ tab: QuotaTabID, in controller: QuotaViewController) throws -> PanelTabItemView {
+        try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? PanelTabItemView }
+            .first { $0.identifier?.rawValue == "quota-tab.\(tab.rawValue)" })
     }
 
     @MainActor
