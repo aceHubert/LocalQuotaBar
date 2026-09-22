@@ -634,6 +634,8 @@ final class ResetCardsRow: NSView {
         let expiresAt: Date?
         var id: String? = nil
         var resetAction: ResetAction? = nil
+        /// 明细行主文案（CodeBuddy 积分包："100 积分 · 剩 100"）；nil 时沿用到期时间文案。
+        var detailText: String? = nil
     }
 
     struct Chip {
@@ -928,7 +930,7 @@ final class ResetCardsRow: NSView {
         kindLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
         kindLabel.textColor = PanelTheme.tertiaryText
 
-        let timeLabel = NSTextField(labelWithString: PanelTheme.formatCardExpiry(item.expiresAt))
+        let timeLabel = NSTextField(labelWithString: item.detailText ?? PanelTheme.formatCardExpiry(item.expiresAt))
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold)
         timeLabel.textColor = PanelTheme.primaryText
 

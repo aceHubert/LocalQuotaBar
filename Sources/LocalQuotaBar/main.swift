@@ -1119,6 +1119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let zaiStore = ZAIQuotaStore()
     private let zaiResetService = ZAIResetService()
     private let deepSeekStore = DeepSeekStore()
+    private let codeBuddyStore = CodeBuddyStore()
     private var presentedResetScopeID: String?
     private let authManager = CodexAuthManager()
     private let reminderCenter = ReminderCenter()
@@ -1172,6 +1173,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaViewController.onDeepSeekRefresh = { [weak self] in
             self?.deepSeekStore.refresh()
         }
+        quotaViewController.onCodeBuddyRefresh = { [weak self] in
+            // 手动刷新允许 Keychain 授权弹窗；后台周期走禁 UI 路径
+            self?.codeBuddyStore.refreshFromUser()
+        }
         quotaViewController.onResetCodexCredit = { [weak self] creditID in
             self?.useCodexResetCredit(creditID)
         }
@@ -1188,6 +1193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             store.setRefreshInterval(interval)
             zaiStore.setRefreshInterval(interval)
             deepSeekStore.setRefreshInterval(interval)
+            codeBuddyStore.setRefreshInterval(interval)
             quotaViewController.applyRefreshInterval(minutes: minutes)
         }
         reminderCenter.start { [weak self] in
@@ -1208,6 +1214,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         quotaViewController.applyReminderConfiguration(reminderCenter.configuration)
         initializeAccountSwitcher()
 
+        codeBuddyStore.onChange = { [weak self] snapshot, isRefreshing, error in
+            guard let self else { return }
+            quotaViewController.applyCodeBuddy(snapshot: snapshot, isRefreshing: isRefreshing, error: error)
+        }
         deepSeekStore.onChange = { [weak self] snapshot, isRefreshing, error in
             guard let self else { return }
             quotaViewController.applyDeepSeek(
@@ -1287,6 +1297,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.start()
         zaiStore.start()
         deepSeekStore.start()
+        codeBuddyStore.start()
 
         // 日用量图表：先回放缓存，再接变更回调并启动官方用量拉取
         quotaViewController.applyCodexUsage(codexUsageStore.snapshot?.last30Days)
@@ -1602,6 +1613,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.stop()
         zaiStore.stop()
         deepSeekStore.stop()
+        codeBuddyStore.stop()
     }
 
     @objc private func handleStatusItemClick(_ sender: Any?) {
@@ -1980,6 +1992,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.setRefreshInterval(interval)
         zaiStore.setRefreshInterval(interval)
         deepSeekStore.setRefreshInterval(interval)
+        codeBuddyStore.setRefreshInterval(interval)
         quotaViewController.applyRefreshInterval(minutes: minutes)
     }
 
@@ -2035,6 +2048,7 @@ final class QuotaViewController: NSViewController {
     var onRefresh: (() -> Void)?
     var onZAIRefresh: (() -> Void)?
     var onDeepSeekRefresh: (() -> Void)?
+    var onCodeBuddyRefresh: (() -> Void)?
     var onUseZAIResetCard: ((ZAIResetCreditCard.Kind) -> Void)?
     var onResetCodexCredit: ((String) -> Void)?
     var onPreferredContentSizeChange: (() -> Void)?
@@ -2065,6 +2079,7 @@ final class QuotaViewController: NSViewController {
     private let codexSection = CodexPanelSection()
     private let zaiSection = ZAIPanelSection()
     private let deepSeekSection = DeepSeekPanelSection()
+    private let codeBuddySection = CodeBuddyPanelSection()
     private var panelBlocks: [QuotaTabID: NSView] = [:]
     private let footer = PanelFooterView()
     private var activeTab: QuotaTabID = .codex
@@ -2084,6 +2099,10 @@ final class QuotaViewController: NSViewController {
     /// 最近一次 DeepSeek 状态，供 tab 摘要使用。
     private var lastDeepSeekSnapshot: DeepSeekSnapshot?
     private var lastDeepSeekError: String?
+
+    /// 最近一次 CodeBuddy（国际版）状态，供 tab 摘要使用。
+    private var lastCodeBuddySnapshot: CodeBuddySnapshot?
+    private var lastCodeBuddyError: String?
 
     /// 顶部更新时间：跟随 active tab 各自最近一次成功刷新的时刻。快照只在成功时生成，
     /// 刷新中的重放会带旧 fetchedAt，每个 tab 取 max 防止乱序回放把时间回退。
@@ -2184,6 +2203,16 @@ final class QuotaViewController: NSViewController {
         lastDeepSeekSnapshot = snapshot
         lastDeepSeekError = error
         recordRefreshedAt(.deepSeek, snapshot?.fetchedAt)
+        syncTabBar()
+        updateLastUpdatedLabel()
+        updatePreferredContentSize()
+    }
+
+    func applyCodeBuddy(snapshot: CodeBuddySnapshot?, isRefreshing: Bool, error: String?) {
+        codeBuddySection.apply(snapshot: snapshot, isRefreshing: isRefreshing, error: error)
+        lastCodeBuddySnapshot = snapshot
+        lastCodeBuddyError = error
+        recordRefreshedAt(.codeBuddy, snapshot?.fetchedAt)
         syncTabBar()
         updateLastUpdatedLabel()
         updatePreferredContentSize()
@@ -2383,6 +2412,11 @@ final class QuotaViewController: NSViewController {
         deepSeekSection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
         panelBlocks[.deepSeek] = makeBlock(deepSeekSection, top: 8, bottom: 10)
 
+        codeBuddySection.onRefresh = { [weak self] in self?.onCodeBuddyRefresh?() }
+        codeBuddySection.onRefreshAvailabilityChange = { [weak self] in self?.updateRefreshButton() }
+        codeBuddySection.onContentHeightChange = { [weak self] in self?.updatePreferredContentSize() }
+        panelBlocks[.codeBuddy] = makeBlock(codeBuddySection, top: 8, bottom: 10)
+
         for id in QuotaTabID.allCases {
             guard let block = panelBlocks[id] else { continue }
             quotaPage.addArrangedSubview(block)
@@ -2394,9 +2428,9 @@ final class QuotaViewController: NSViewController {
 
     // MARK: - Tab 切换与刷新语义（顶栏刷新只作用于当前 active tab）
 
-    /// 当前可见 tab：Codex / DeepSeek 常驻；Z.AI 由 ZAISettings 决定；CodeBuddy 后续阶段接入。
+    /// 当前可见 tab：Codex / DeepSeek / CodeBuddy 常驻；Z.AI 由 ZAISettings 决定。
     private var visibleTabs: Set<QuotaTabID> {
-        var tabs: Set<QuotaTabID> = [.codex, .deepSeek]
+        var tabs: Set<QuotaTabID> = [.codex, .deepSeek, .codeBuddy]
         if isZAITabVisible { tabs.insert(.zai) }
         return tabs
     }
@@ -2440,7 +2474,7 @@ final class QuotaViewController: NSViewController {
         case .codex: return codexSection.canRequestRefresh
         case .zai: return zaiSection.canRequestRefresh
         case .deepSeek: return deepSeekSection.canRequestRefresh
-        case .codeBuddy: return false
+        case .codeBuddy: return codeBuddySection.canRequestRefresh
         }
     }
 
@@ -2460,7 +2494,7 @@ final class QuotaViewController: NSViewController {
         case .codex: codexSection.requestRefresh()
         case .zai: zaiSection.requestRefresh()
         case .deepSeek: deepSeekSection.requestRefresh()
-        case .codeBuddy: break
+        case .codeBuddy: codeBuddySection.requestRefresh()
         }
     }
 
@@ -2495,7 +2529,31 @@ final class QuotaViewController: NSViewController {
         deepSeek.summary = deepSeekTabSummary()
         statuses[.deepSeek] = deepSeek
 
+        var codeBuddy = PanelTabStatus()
+        codeBuddy.isFailed = lastCodeBuddyError != nil
+        codeBuddy.tagText = lastCodeBuddySnapshot?.planName
+        if let plan = lastCodeBuddySnapshot?.planPackage {
+            codeBuddy.ring = .percent(remaining: plan.remainingPercent)
+        }
+        codeBuddy.summary = codeBuddyTabSummary()
+        statuses[.codeBuddy] = codeBuddy
+
         return statuses
+    }
+
+    private func codeBuddyTabSummary() -> String? {
+        guard let snapshot = lastCodeBuddySnapshot else { return nil }
+        var parts: [String] = ["国际版"]
+        if let plan = snapshot.planPackage {
+            parts.append("套餐基础积分剩 \(CodeBuddyFormat.credits(plan.remainCapacity)) / \(CodeBuddyFormat.credits(plan.totalCapacity))")
+        }
+        let packages = snapshot.paidPackages + snapshot.freePackages
+        if !packages.isEmpty {
+            let remain = packages.reduce(0.0) { $0 + $1.remainCapacity }
+            parts.append("资源包剩 \(CodeBuddyFormat.credits(remain))")
+        }
+        parts.append("Chrome · \(snapshot.profileName)")
+        return parts.joined(separator: " · ")
     }
 
     private func deepSeekTabSummary() -> String? {
