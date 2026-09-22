@@ -227,6 +227,35 @@ final class CodexAppServerRestartServiceTests: XCTestCase {
         XCTAssertTrue(spy.waited.isEmpty)
     }
 
+    func testCurrentPresenceReturnsNoneWhenNoProcessMatches() {
+        let spy = RuntimeSpy()
+        spy.scans = [[]]
+
+        XCTAssertEqual(
+            CodexAppServerRestartService.currentPresence(runtime: spy.runtime),
+            .none
+        )
+    }
+
+    func testCurrentPresenceReturnsRunningWhenProcessMatches() {
+        let spy = RuntimeSpy()
+        spy.scans = [[appServer(pid: 100)]]
+
+        XCTAssertEqual(
+            CodexAppServerRestartService.currentPresence(runtime: spy.runtime),
+            .running
+        )
+    }
+
+    func testCurrentPresenceReturnsUnknownWhenEnumerationFails() {
+        let spy = RuntimeSpy()
+        spy.scanError = TestError.enumerationFailed
+
+        guard case .unknown = CodexAppServerRestartService.currentPresence(runtime: spy.runtime) else {
+            return XCTFail("枚举失败时不能误判为没有运行中的 app-server")
+        }
+    }
+
     func testStopSignalsVerifiedProcessAndReportsStopped() {
         let spy = RuntimeSpy()
         let target = appServer(pid: 100)

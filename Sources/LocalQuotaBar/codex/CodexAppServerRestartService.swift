@@ -27,6 +27,13 @@ enum CodexAppServerRestartOutcome: Equatable {
     case unknownScan(String)
 }
 
+/// 当前用户是否存在可由 Codex 客户端持有的 app-server。
+enum CodexAppServerPresence: Equatable {
+    case running
+    case none
+    case unknown(String)
+}
+
 enum CodexAppServerRestartError: Error, LocalizedError {
     case scanFailed(String)
 
@@ -128,6 +135,16 @@ enum CodexAppServerRestartService {
 
     /// 发信号后等待进程退出的时间，与 codex-cliproxy 一致。
     static let settleInterval: TimeInterval = 2
+
+    /// 只读检查当前用户是否有运行中的 Codex app-server，不会启动或停止任何进程。
+    static func currentPresence(runtime: Runtime = .system) -> CodexAppServerPresence {
+        switch scan(runtime: runtime) {
+        case .ok(let processes):
+            return processes.isEmpty ? .none : .running
+        case .unknown(let message):
+            return .unknown(message)
+        }
+    }
 
     static func stopAppServers(runtime: Runtime = .system) -> CodexAppServerRestartOutcome {
         let initial: [CodexAppServerProcessIdentity]
