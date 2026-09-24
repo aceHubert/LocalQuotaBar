@@ -1,8 +1,8 @@
 # CodeBuddy Chrome Cookie 额度接入
 
-- 状态：进行中
+- 状态：已完成
 - 创建日期：2026-09-20
-- 最后更新：2026-09-22
+- 最后更新：2026-09-24
 
 ## 目标
 
@@ -101,6 +101,7 @@
   - 新 envelope 解析、请求契约单测和真实 live probe 均已通过，当前实现不再使用 `data.Packages` 或三个旧资源端点。
   - 国内版（2026-09-22 复核轮）：新增 `codeBuddyCN` store / tab（`www.codebuddy.cn`），复用国际版数据层与面板。修正两个验收阻断项：① 401 / 403 此前抛 `requestRejected`（文案「请稍后重试」），现归类为 `sessionExpired` 并提示重新登录目标站点；② Cookie 导入与错误文案此前硬编码 `www.codebuddy.ai`，现按目标 host 参数化，国内版不再误导用户去国际站登录。国内版真实登录态端到端验证已由用户确认通过。
   - live 探针参数化（2026-09-22，Codex 审查项）：`CodeBuddyLiveProbeTests` 支持 `LOCALQUOTABAR_CODEBUDDY_LIVE_HOST` 指定目标站点（默认 `www.codebuddy.ai`）。双站实测通过——国际版 8 个有效 Cookie、体验版 100 总量 / 83.05 剩余、3 个奖励包；国内版 9 个有效 Cookie、`CodeBuddy个人体验版` 500 总量 / 162.92 剩余、9 个奖励包；两站 `otherPackages` 均为空，资源分类在真实数据上零残留。同时证实 `.cn` 网关接受统一 `get-user-resource` 接口（Codex 审查曾据「.cn 前端仍调旧三接口」推断需分叉，实测推翻）。
+  - 归档复核（2026-09-24）：用户确认国际版、国内版与权限路径复核完成；当前主工作区 `swift build` 通过，`swift test` 255 项、0 失败（2 项 live 探针按默认配置跳过）。近 7 天 Credits 聚合仍为明确未实施的可选项，不阻塞本计划归档。
 
 ## 进度记录
 
@@ -110,7 +111,7 @@
 - [x] 完成当前接口的真实登录态端到端验证；按目标 host/path 组装并去重完整有效 Cookie 集。
 - [x] 完成单测（Cookie 候选 / 请求契约 / envelope 解析 / 套餐分组 / 401 分类 / 错误文案 host）与权限走查路径。
 - [x] 国际版与国内版均完成真实登录态端到端验证。
-- [ ] 完成归档。
+- [x] 完成归档（2026-09-24，用户确认任务全部完成）。
 
 ## 决策记录
 

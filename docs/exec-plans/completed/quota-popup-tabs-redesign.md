@@ -1,8 +1,8 @@
 # 额度弹窗横向 Tab 化重构（含 DeepSeek / CodeBuddy 国际版与国内版接入）
 
-- 状态：进行中
+- 状态：已完成
 - 创建日期：2026-09-22
-- 最后更新：2026-09-22
+- 最后更新：2026-09-24
 
 ## 目标
 
@@ -98,7 +98,7 @@
   - 缓解：沿用 CodeBuddy 计划方案——手动刷新完成一次授权，后台周期只做禁 UI 读取，失败保留缓存并提示。
 - 风险：新增 SweetCookieKit 依赖构建失败或 API 变化。
   - 缓解：阶段 0 先在独立分支验证依赖解析与最小读取示例；失败则回退评估替代实现（数据计划回滚方式：移除 provider 入口与依赖即可）。
-- 风险：四 tab × 不同面板高度，切 tab 时 popover 跳变或裁切。
+- 风险：五 tab × 不同面板高度，切 tab 时 popover 跳变或裁切。
   - 缓解：复用双写尺寸机制，切换时同步重算；验证覆盖「最高面板（Codex 展开配速图）→ 最矮面板（CodeBuddy）」往返。
 - 风险：DeepSeek / CodeBuddy 均为逆向 Web 接口，登录态或字段变化导致面板长期错误态。
   - 缓解：错误分类透出（会话失效 / 凭证不可读 / 接口失败），保留最后有效快照与时间；两份数据计划的单测规格兜底解析回归。
@@ -134,15 +134,15 @@
 - 观测检查：token / Cookie 不出现在日志、错误详情与调试输出；切 tab 不触发数据请求（纯 UI 切换）；刷新失败不清空卡片。
 - 实际结果与未覆盖场景（2026-09-22 实施轮）：
   - 编译：`swift build`、`swift build -c release` 均通过（Apple Swift 6.3.3，arm64）。
-  - 测试：`arch -arm64 swift test` 237 项通过、0 失败（2 项 live 探针默认 skip；DeepSeek live 探针在 `LOCALQUOTABAR_DEEPSEEK_LIVE=1` 下已实跑通过）。
+  - 测试：阶段验收时 `arch -arm64 swift test` 237 项通过、0 失败；收尾轮扩展到 253 项并保持全绿（2 项 live 探针默认 skip；DeepSeek live 探针在 `LOCALQUOTABAR_DEEPSEEK_LIVE=1` 下已实跑通过）。
   - DeepSeek 真实登录态：本机 Chrome Default profile `userToken` 导入成功；summary / amount / cost 三接口真实请求成功。实测修正三处口径：① bucket 时间字段为 `time`（非 timestamp）；② cost 金额字段为 `cost`；③ 窗口必须对齐自然日（end=明天 0 点，传当前时刻返回 INVALID_PARAM）。快照实测：充值 ¥4.3042 / 累计消费 ¥10.6958 / 近 30 天消费 ¥6.0988（16.37M tokens、9 个有数据日）。
   - CodeBuddy 国际版（2026-09-22 Chrome CDP + URLSession 复核）：已登录的 `https://www.codebuddy.ai/profile/plans-usage` 页面套餐与额度正常显示，Chrome 的资源接口返回 200。分支实现已迁移到 `get-user-resource`，请求体、`X-Client-Platform: web`、正确 Referer、浏览器上下文头以及按目标 host/path 过滤去重的有效 Cookie jar 均已补齐；响应解析改为 `data.Response.Data.Accounts[]`。真实 `LOCALQUOTABAR_CODEBUDDY_LIVE=1 swift test --filter CodeBuddyLiveProbeTests` 已通过，解析到体验版 100 总量 / 83.05 剩余和 3 个奖励包。此前 APISIX 401 的根因是旧接口、请求头不足和 Cookie 集合不完整的组合，不是 Chrome 会话过期，也不是必须改用浏览器中转。
   - CodeBuddy 国内版（2026-09-22 复核轮）：新增 `codeBuddyCN` store / tab，复用国际版数据层与面板；`CodeBuddyAPIError.sessionExpired(host:detail:)` 与 `ImportError.chromeNotFound(host:)` / `cookieNotFound(host:)` 按目标站点出文案，修正此前「国内版未登录却提示去 `.ai` 登录」以及 401 被误报为「请稍后重试」两个验收阻断项；补 CN 专项单测（tab 可见性与角标、active-tab 刷新互不影响、请求契约 host / region、401 分类与错误文案）。国内版真实登录态端到端验证已由用户确认通过。
   - UI 验收微调轮（2026-09-22，每轮 `make app` 重启应用由用户目检）：tag 胶囊底与位置收紧、状态点光晕增强为呼吸灯、头部时间右对齐、DeepSeek 消费图补日期刻度与 tooltip 屏幕坐标锚点、首刷失败无历史数据时隐藏内容区、恢复上次 tab、logo 改渐变背景填充、环口径 5h 优先、INTL/CN 角标、Credits 统一 `<剩余>/<总量>` 口径、popover 锁 `vibrantDark` + rootView 实色化、液态玻璃选中态（三轮调校：光晕溢出 → clip 修复 → 移除中间与四角光影只留左上 / 右下角部微光）、DeepSeek tab 金额白色。全程 253 项测试保持全绿。
   - Codex 审查验收轮（2026-09-22）：对 Codex 审查的 9 项问题复核——错误文案 host 参数化、文档与口径同步、timer 祖先隐藏停表、`.cn` 请求契约测试均已落实；「国内版应分叉旧三接口」的判定被双站实测推翻（`.cn` 网关接受 `get-user-resource`）。本轮补 idle 三态状态点与 live 探针站点参数化，`.ai` 与 `.cn` 双站 live probe 均通过（CN 实测：`CodeBuddy个人体验版` 500 总量 / 162.92 剩余、9 个奖励包、`other` 分组为空，两站分类零残留）；Profile fallback 登记技术债；全量 253 项测试通过（此前记录的 ResetCard 布局既有失败已由并行修复轮消除）。
   - Codex / Z.AI 红线对照：既有 PanelRendering / ZAIUsagePresentation / ResetCard* / Chart* 等测试全绿；胶囊网格、重置卡、配速图、用量图与叠加模式代码路径零改动。
-  - 未覆盖：五 tab UI 目检（popover 逐 tab 高度、展开列表、设置页往返）、CodeBuddy Keychain 授权弹窗实机走查、DeepSeek 会话过期态实测、Touch Bar / 刘海屏通道——留待用户复核（无屏录权限，沿用辅助功能只读核对 + 单元测试口径）。
-  - 已知既有失败（与本轮改动无关）：`ResetCardActionTests.testResetGroupsFitPanelWidthAndAlignActionsToTrailingEdge` 与 `ResetCardsRowTests.testExpandingShowsEveryCardAndCollapsingRestoresHeight` 共 3 处布局断言失败（18.0 vs 19.0 ± 0.5），在改动前的 `adc31e1` 基线上同样失败，待单独排查。
+  - 历史未形成独立截图 / 实录证据：五 tab UI 目检（popover 逐 tab 高度、展开列表、设置页往返）、CodeBuddy Keychain 授权弹窗走查、DeepSeek 会话过期态、Touch Bar / 刘海屏通道。归档复核时用户确认本计划所列功能与复核项均已完成；Touch Bar / 刘海屏不在本计划改动范围内。
+  - 归档复核（2026-09-24）：以 worktree `161199b` 已被 `main@22c71fb` 合并的五 tab 版本为基线，清除主工作区从 stash 恢复出的四 tab 旧稿；当前主工作区重新执行 `swift build` 通过，`swift test` 255 项、0 失败（2 项 live 探针按默认配置跳过）。
 
 ## 进度记录
 
@@ -157,9 +157,10 @@
 - [x] CodeBuddy 国内版真实登录态端到端验证（用户确认通过）。
 - [x] 完成多轮 UI 验收微调（呼吸灯 / 液态玻璃 / popover 实色化 / Credits 剩余总量口径统一，见决策记录）。
 - [x] Codex 审查问题修复轮（idle 三态状态点、live 探针站点参数化、Profile fallback 登记技术债）。
-- [ ] 用户复核项：完成五 tab UI 目检（含 popover 高度与 Keychain 授权路径）。
+- [x] 用户复核项：完成五 tab UI 目检（含 popover 高度与 Keychain 授权路径；2026-09-24 用户确认）。
+- [x] 补齐归档复核结果并移至 `completed/`（2026-09-24）。
 
-分支：`quota-popup-tabs-redesign`（worktree `../LocalQuotaBar-tabs`，上游 origin 同名分支）。
+分支：`quota-popup-tabs-redesign`（worktree `../LocalQuotaBar-tabs`，已合并至 `main@22c71fb`）。
 
 ## 决策记录
 

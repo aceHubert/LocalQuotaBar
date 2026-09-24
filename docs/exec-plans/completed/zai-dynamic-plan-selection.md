@@ -1,8 +1,8 @@
 # Z.AI 套餐动态选择适配（ZCode 3.14.0）
 
-- 状态：进行中
+- 状态：已完成
 - 创建日期：2026-09-19
-- 最后更新：2026-09-19
+- 最后更新：2026-09-24
 
 ## 目标
 
@@ -44,7 +44,7 @@ ZCode 3.14.0 起 Z.AI 套餐不再由 settings 文件静态锁定，而是动态
 
 - 命令：`swift build`、`swift test`。
 - 手工检查：本机 setting.json 形态（zai individual + coding-plan selectedKey、bigmodel team）解析结果不变；面板仍正常展示 coding-plan 额度。
-- 实际结果与未覆盖场景：见进度记录。
+- 实际结果与未覆盖场景：见进度记录；归档复核时当前主工作区 `swift build` 通过，`swift test` 255 项、0 失败（2 项 live 探针按默认配置跳过）。
 
 ## 进度记录
 
@@ -55,6 +55,7 @@ ZCode 3.14.0 起 Z.AI 套餐不再由 settings 文件静态锁定，而是动态
 - [x] 阶段 2：套餐视图手动切换（右键菜单三选项 + 有效 selection 注入 + 5 个新单测，`swift test` 180 全绿）。
 - 2026-09-19 修正：按用户澄清改正全部「切换落盘/全局最近值」表述（代码注释、测试命名、本计划、历史记录、技术债表），判定逻辑本身不变，`swift test` 复跑通过。
 - 未覆盖场景：真机切换视图后的面板表现已具备（`make run` 重启验证由用户执行）；多套餐并存与动态可用性标注未实现（技术债）。
+- [x] 2026-09-24 归档复核：用户确认任务全部完成，保留多套餐并存技术债并移至 `completed/`。
 
 ## 决策记录
 
@@ -68,3 +69,5 @@ ZCode 3.14.0 起 Z.AI 套餐不再由 settings 文件静态锁定，而是动态
 - 2026-09-19（定稿·文件判定法）：按用户指示改用 **codex-cliproxy 的文件判定法**（`src/zcode/config.ts` 的 readZcodePlanSelections 槽位逻辑）——右键菜单可选项由 setting.json 连接形态槽位即时判定：start-plan 永远可选（连接形态无关，资格由 billing/balance 在额度查询时判定、上游最终拒绝）；个人订阅 ⇔ 任意渠道连接形态 individual-coding-plan（legacy 回退看默认选择）；团队 ⇔ 存在 team-coding-plan 连接（含 org/project）。**每次右键现读文件**，不再做网络探测、不进定时刷新周期；上一轮的 subscription/list / querySubscribeDetail / customerInfo / billing/balance 网络探测与可用性缓存全部移除（git 历史与调研文档留档）。语义变化：槽位存在只代表「配置过连接」，切过去后权益无效会在面板报错，不再提前隐藏菜单项。文件监听（换号/改配置触发额度重查）保留。
 - 2026-09-19（团队槽位修正）：用户反馈「没有团队 plan 却显示团队项」。纯文件信号补齐：团队槽位在连接形态外叠加 config.json 的 provider 停用标记（`enabled=false` 或 `systemDisabledReason` 非空，如 `oauth_provider_inactive` = 该渠道未真正登录）——本机 `builtin:bigmodel-coding-plan` 即被 host 标记停用，团队项正确隐藏。start-plan 的 provider 镜像标记不采用（codex-cliproxy 注释明确其可能冻结；本机 Weekend Build active 但标记却是 not_entitled），保持永远可选、查询时上游裁决。个人项同理不叠加（避免镜像冻结误伤有效订阅）。
 - 2026-09-19：不做服务端权益探测驱动的自动回退（资格接口失败 ≠ 无资格，网络抖动会导致面板在套餐间反复横跳），探测仅作为后续多套餐展示的输入。
+- 2026-09-19（视图修正）：用户反馈两点并修复——① `billing/balance` 可同时返回多个 active start-plan，解析改为按 `balances[].entitlement_id` 反查实际有余额的套餐作为标题/有效期来源，避免“未开始的 Global Build + 免费体验额度”混搭；② 团队菜单不再被 `config.json` 滞后的 `oauth_provider_inactive` 标记隐藏，只认 setting.json 的完整 team 连接；③ “个人订阅”视图改为切到真正的 individual 连接，不能只清空 teamContext，否则请求仍按团队形态发送并报缺少 org/project。`swift test` 185 全绿，`swift build -c release` 通过。
+- 2026-09-19（凭证过滤 + 渠道切换刷新）：套餐菜单与有效 selection 叠加 OAuth 凭证存在性检查，残留但无凭证的套餐槽位不显示、不查询，失效 override 自动回退；文件监听从单文件改为 `~/.zcode` 与 `~/.zcode/v2` 目录，避免原子替换后失效；`providerFamilyDomain` 变化时清空旧渠道快照，并按“套餐列表 → active 套餐 → 额度/用量/配速视图”顺序完整刷新；个人/团队连接解析按当前渠道优先。`swift test` 187 全绿，`swift build -c release` 通过。

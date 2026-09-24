@@ -1,8 +1,8 @@
 # DeepSeek Chrome Web 会话用量接入
 
-- 状态：进行中
+- 状态：已完成
 - 创建日期：2026-09-20
-- 最后更新：2026-09-22
+- 最后更新：2026-09-24
 
 ## 目标
 
@@ -90,7 +90,8 @@
   - 今日 token、周期 token、请求次数、模型成本与平台用量页一致。
   - 退出 DeepSeek Web 登录后，应用显示会话过期并保留旧快照。
 - 观测检查：用量图表坐标与日期不因时区偏移；刷新失败不清空卡片；token 与 Cookie 不出现在日志、错误详情或调试输出。
-- 实际结果与未覆盖场景（2026-09-22 实施轮，随 tabs 计划阶段 2 落地）：本机 Chrome `Default` profile `userToken` 导入成功，`get_user_summary` / `usage/by_api_key/amount` / `usage/by_api_key/cost` 三接口真实请求成功。实测修正三处口径：① bucket 时间字段为 `time`（非 `timestamp`）；② cost 金额字段为 `cost`；③ 请求窗口必须对齐自然日（start=今天-29 天 0 点、end=明天 0 点，传当前时刻作 end 返回 INVALID_PARAM）。快照实测：充值 ¥4.3042 / 累计消费 ¥10.6958 / 近 30 天消费 ¥6.0988（16.37M tokens、9 个有数据日）。面板按 tabs.html 定稿实现（两指标卡 + 近 30 天消费图，见 tabs 计划），本计划「UI 方案」章节未逐条落地。未覆盖：会话过期态实测（退出 Web 登录后应显示会话过期并保留快照）、多 profile 显式选择 UI（本机仅 Default 单候选，自动选择 leveldb 最新修改者）。
+- 实际结果与未覆盖场景（2026-09-22 实施轮，随 tabs 计划阶段 2 落地）：本机 Chrome `Default` profile `userToken` 导入成功，`get_user_summary` / `usage/by_api_key/amount` / `usage/by_api_key/cost` 三接口真实请求成功。实测修正三处口径：① bucket 时间字段为 `time`（非 `timestamp`）；② cost 金额字段为 `cost`；③ 请求窗口必须对齐自然日（start=今天-29 天 0 点、end=明天 0 点，传当前时刻作 end 返回 INVALID_PARAM）。快照实测：充值 ¥4.3042 / 累计消费 ¥10.6958 / 近 30 天消费 ¥6.0988（16.37M tokens、9 个有数据日）。面板按 tabs.html 定稿实现（两指标卡 + 近 30 天消费图，见 tabs 计划），本计划「UI 方案」章节未逐条落地。实施轮尚未形成会话过期态的独立实录；归档复核时用户确认该项已经完成。多 profile 显式选择 UI 明确推迟并登记技术债，本机单候选路径不受影响。
+- 归档复核（2026-09-24）：当前主工作区 `swift build` 通过，`swift test` 255 项、0 失败（DeepSeek 与 CodeBuddy 两项 live 探针按默认配置跳过；本计划真实三接口结果沿用 2026-09-22 已记录的 live probe）。
 
 ## 进度记录
 
@@ -98,7 +99,8 @@
 - [x] 完成基础设施与依赖接入（SweetCookieKit 0.5.3，提交 `95178d1`）。
 - [x] 完成平台余额与用量数据链路（token 三形态解析、三层 envelope、自然日窗口与按日聚合，单测见 `DeepSeekParsingTests`）。
 - [x] 完成应用集成与真实登录态验证（随 tabs 计划阶段 2 落地，提交 `3e91c5e`；面板以 tabs.html 定稿为准）。
-- [ ] DeepSeek 会话过期态实测；完成后归档。
+- [x] DeepSeek 会话过期态实测（2026-09-24 用户确认完成）。
+- [x] 多 profile 显式选择 UI 与失败后候选轮换明确推迟并登记技术债，完成归档。
 
 ## 决策记录
 
