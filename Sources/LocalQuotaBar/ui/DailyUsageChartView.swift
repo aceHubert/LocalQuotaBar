@@ -278,8 +278,11 @@ final class DailyUsageChartView: NSView {
             let channelHeight = max(channelTokens > 0 ? 1.5 : 0, rect.height * CGFloat(channelTokens / maxTokens))
             let otherHeight = totalHeight - channelHeight
 
-            let channelColor = segmentColor(base: PanelTheme.green, isToday: isToday, hovered: hovered)
-            let otherColor = segmentColor(base: PanelTheme.orange, isToday: isToday, hovered: hovered)
+            let channelGradient = Self.barGradient(isToday: isToday, hovered: hovered)
+            // 橙段（设计稿 .bar-third：linear-gradient(180deg,#ffb340,#f08c00)）
+            let otherTop = hovered ? NSColor(hex: 0xFFC966) : (isToday ? NSColor(hex: 0xFFD27A) : NSColor(hex: 0xFFB340))
+            let otherBottom = hovered ? NSColor(hex: 0xEFA312) : (isToday ? NSColor(hex: 0xFFA726) : NSColor(hex: 0xF08C00))
+            let otherGradient = NSGradient(starting: otherBottom, ending: otherTop)
 
             // 整柱一个圆角胶囊，按上下区域裁剪出两段配色（原型 bar / bar-third 的观感）
             let fullBar = NSRect(x: x, y: rect.minY, width: layout.barWidth, height: totalHeight)
@@ -289,26 +292,34 @@ final class DailyUsageChartView: NSView {
                 yRadius: min(2, layout.barWidth / 2)
             )
             if otherHeight >= 1 {
-                fillPill(pill, color: otherColor, clip: NSRect(
+                fillPill(pill, gradient: otherGradient, clip: NSRect(
                     x: x - 1, y: fullBar.minY + channelHeight - 0.5,
                     width: layout.barWidth + 2, height: otherHeight + 1
                 ))
-                fillPill(pill, color: channelColor, clip: NSRect(
+                fillPill(pill, gradient: channelGradient, clip: NSRect(
                     x: x - 1, y: fullBar.minY - 1,
                     width: layout.barWidth + 2, height: channelHeight + 0.5 + 1
                 ))
             } else {
-                fillPill(pill, color: channelColor, clip: fullBar.insetBy(dx: -1, dy: -1))
+                fillPill(pill, gradient: channelGradient, clip: fullBar.insetBy(dx: -1, dy: -1))
             }
+            // 顶部 1px 高光
+            NSColor.white.withAlphaComponent(0.22).setFill()
+            NSBezierPath(roundedRect: NSRect(x: x, y: fullBar.maxY - 1, width: layout.barWidth, height: 1),
+                         xRadius: 1, yRadius: 1).fill()
         }
     }
 
     /// 在指定裁剪区域内填充胶囊路径（叠加柱的两段着色）。
-    private func fillPill(_ pill: NSBezierPath, color: NSColor, clip: NSRect) {
+    private func fillPill(_ pill: NSBezierPath, gradient: NSGradient?, clip: NSRect) {
         NSGraphicsContext.current?.saveGraphicsState()
         NSBezierPath(rect: clip).addClip()
-        color.setFill()
-        pill.fill()
+        if let gradient {
+            gradient.draw(in: pill, angle: -90)
+        } else {
+            PanelTheme.green.setFill()
+            pill.fill()
+        }
         NSGraphicsContext.current?.restoreGraphicsState()
     }
 
@@ -323,25 +334,37 @@ final class DailyUsageChartView: NSView {
             yRadius: min(2, layout.barWidth / 2)
         )
 
-        if hovered {
-            // 悬停的柱子更亮，与即时浮层提示对应
-            (PanelTheme.green.highlight(withLevel: 0.4) ?? PanelTheme.green).setFill()
-        } else if isToday {
-            // 今日高亮（更亮 + 轻微光晕感）
-            (PanelTheme.green.highlight(withLevel: 0.25) ?? PanelTheme.green).setFill()
-        } else if day.tokens > 0 {
-            // 有数据的天数用不透明绿，深底上保证清晰可读
-            PanelTheme.green.setFill()
+        if day.tokens > 0 {
+            // 有数据的天数：设计稿同款垂直渐变 + 顶部高光（平涂亮绿深底上显灰薄）
+            Self.fillBarPath(path, barRect: barRect, isToday: isToday, hovered: hovered)
         } else {
             NSColor.white.withAlphaComponent(0.06).setFill()
+            path.fill()
         }
-        path.fill()
     }
 
-    private func segmentColor(base: NSColor, isToday: Bool, hovered: Bool) -> NSColor {
-        if hovered { return base.highlight(withLevel: 0.4) ?? base }
-        if isToday { return base.highlight(withLevel: 0.25) ?? base }
-        return base
+    // MARK: 柱色（设计稿 .bar：linear-gradient(180deg,#3fd98d,#1d9a5f) + 顶部 1px 提亮；
+    // 平涂亮绿在深底上会显灰薄，必须带底部深绿压色）
+
+    static let barTop = NSColor(hex: 0x3FD98D)
+    static let barBottom = NSColor(hex: 0x1D9A5F)
+    static let barTodayTop = NSColor(hex: 0x6CF0AC)
+    static let barTodayBottom = NSColor(hex: 0x2BCF7D)
+    static let barHoverTop = NSColor(hex: 0x5CE9A4)
+    static let barHoverBottom = NSColor(hex: 0x23C173)
+
+    static func barGradient(isToday: Bool, hovered: Bool) -> NSGradient? {
+        let top = hovered ? barHoverTop : (isToday ? barTodayTop : barTop)
+        let bottom = hovered ? barHoverBottom : (isToday ? barTodayBottom : barBottom)
+        return NSGradient(starting: bottom, ending: top) // angle -90：顶部起 start 色
+    }
+
+    /// 渐变填充 + 顶部 1px 高光（inset 0 1px 0 rgba(255,255,255,0.22)）。
+    static func fillBarPath(_ path: NSBezierPath, barRect: NSRect, isToday: Bool, hovered: Bool) {
+        barGradient(isToday: isToday, hovered: hovered)?.draw(in: path, angle: -90)
+        NSColor.white.withAlphaComponent(0.22).setFill()
+        NSBezierPath(roundedRect: NSRect(x: barRect.minX, y: barRect.maxY - 1, width: barRect.width, height: 1),
+                     xRadius: 1, yRadius: 1).fill()
     }
 
     /// 叠加模式图例行："■ 套餐 / ■ 第三方（本机）"；总量模式隐藏。

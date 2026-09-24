@@ -114,9 +114,12 @@ final class ResetCardActionTests: XCTestCase {
     func testCodexChipsKeepHorizontalLayoutWithoutResetButtons() async throws {
         let (window, row) = makeHostedRow()
         defer { window.close() }
+        // 空 cards 的 chip 不渲染展开按钮（CodeBuddy 空态），横向布局用非空明细验证
         row.configure(chips: [
-            .init(id: "codex-a", title: "重置卡 ×1", soon: false, cards: []),
-            .init(id: "codex-b", title: "重置卡 ×2", soon: false, cards: [])
+            .init(id: "codex-a", title: "重置卡 ×1", soon: false,
+                  cards: [.init(kindTitle: "重置卡", expiresAt: nil)]),
+            .init(id: "codex-b", title: "重置卡 ×2", soon: false,
+                  cards: [.init(kindTitle: "重置卡", expiresAt: nil)])
         ])
         window.contentView?.layoutSubtreeIfNeeded()
         let controls = descendants(of: row).compactMap { $0 as? NSButton }

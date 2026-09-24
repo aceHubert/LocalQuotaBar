@@ -6,7 +6,7 @@ final class PanelRenderingTests: XCTestCase {
     @MainActor
     func testQuotaPopoverRendersAcrossRepeatedOpenings() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         controller.applyReminderConfiguration(.default)
         let snapshot = QuotaSnapshot(
             fiveHour: .init(kind: .fiveHour, usedPercent: 25, windowDurationMins: 300, resetsAt: nil),
@@ -66,9 +66,11 @@ final class PanelRenderingTests: XCTestCase {
     }
 
     @MainActor
-    func testTopUpdatedLabelFollowsLatestSuccessfulRefreshAcrossProviders() async throws {
+    func testTopUpdatedLabelFollowsActiveTabRefreshTime() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
+        _ = controller.view
+        controller.setZAISectionVisible(true)
         let now = Date()
         let codexSnapshot = QuotaSnapshot(
             fiveHour: nil, weekly: nil, resetCreditCount: nil,
@@ -82,16 +84,27 @@ final class PanelRenderingTests: XCTestCase {
         controller.apply(snapshot: codexSnapshot, isRefreshing: true, error: nil, reminder: .inactive)
         XCTAssertEqual(controller.lastUpdatedDisplayText, "2 分钟前")
 
-        // 单独刷新 Z.AI 成功后，顶部时间跟随最新的渠道。
+        // Z.AI 刷新成功不影响 Codex tab 的顶部时间（时间跟随 active tab）。
         controller.applyZAI(
             snapshot: ZAIQuotaSnapshot(fetchedAt: now),
             account: nil, isRefreshing: false, error: nil
         )
-        XCTAssertEqual(controller.lastUpdatedDisplayText, "刚刚")
+        XCTAssertEqual(controller.lastUpdatedDisplayText, "2 分钟前")
 
-        // Codex 之后即使再回放旧快照，也仍以 Z.AI 的刷新时间为准。
-        controller.apply(snapshot: codexSnapshot, isRefreshing: false, error: nil, reminder: .inactive)
+        // 切到 Z.AI tab 后显示其刷新时间；切回 Codex 恢复。
+        try tabItem(.zai, in: controller).performClick(nil)
         XCTAssertEqual(controller.lastUpdatedDisplayText, "刚刚")
+        try tabItem(.codex, in: controller).performClick(nil)
+        XCTAssertEqual(controller.lastUpdatedDisplayText, "2 分钟前")
+    }
+
+    @MainActor
+    private func tabItem(_ tab: QuotaTabID, in controller: QuotaViewController) throws -> PanelTabItemView {
+        func descendants(of view: NSView) -> [NSView] {
+            view.subviews.flatMap { [$0] + descendants(of: $0) }
+        }
+        return try XCTUnwrap(descendants(of: controller.view).compactMap { $0 as? PanelTabItemView }
+            .first { $0.identifier?.rawValue == "quota-tab.\(tab.rawValue)" })
     }
 
     @MainActor

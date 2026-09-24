@@ -88,7 +88,7 @@ final class SettingsPageViewTests: XCTestCase {
     @MainActor
     func testReminderChangeSurvivesStateRefreshAndNextSetting() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         var initial = ReminderConfiguration.default
         initial.warningRemainingPercent = 30
         controller.applyReminderConfiguration(initial)
@@ -111,7 +111,7 @@ final class SettingsPageViewTests: XCTestCase {
     @MainActor
     func testReminderSwitchesUseSameAppearanceAndConfiguration() async {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         _ = controller.view
         var configuration = ReminderConfiguration.default
         configuration.isEnabled = false
@@ -127,7 +127,7 @@ final class SettingsPageViewTests: XCTestCase {
     @MainActor
     func testReminderClicksSynchronizeFooterAndSettingsExactlyOnce() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         controller.applyReminderConfiguration(.default)
         _ = controller.view
         var changes: [Bool] = []

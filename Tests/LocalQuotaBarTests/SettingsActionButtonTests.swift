@@ -56,7 +56,7 @@ final class SettingsActionButtonTests: XCTestCase {
     @MainActor
     func testResetAppliesDefaultsOnceAndImmediatelyDisablesItself() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         var configuration = ReminderConfiguration.default
         configuration.isEnabled = false
         configuration.warningRemainingPercent = 40
@@ -109,7 +109,7 @@ final class SettingsActionButtonTests: XCTestCase {
     @MainActor
     func testControllerRestoreCallbackSynchronizesAndPreventsSecondAction() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         _ = controller.view
         controller.setUnmuteButtonVisible(true)
         var restored = 0
