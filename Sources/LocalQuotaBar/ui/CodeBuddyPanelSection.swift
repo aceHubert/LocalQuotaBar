@@ -3,7 +3,7 @@ import Foundation
 
 // MARK: - CodeBuddy 面板（tabs.html 定稿：Credits 口径，无 Tokens / 无用量图）
 
-/// CodeBuddy 区块（国际版）：slim 头部 + 套餐基础积分细进度条 + 购买积分 / 奖励包 chips。
+/// CodeBuddy 区块（国际版 / 国内版共用）：slim 头部 + 套餐基础积分细进度条 + 购买积分 / 奖励包 chips。
 final class CodeBuddyPanelSection: NSView {
     var onRefresh: (() -> Void)?
     var onRefreshAvailabilityChange: (() -> Void)?
@@ -16,11 +16,10 @@ final class CodeBuddyPanelSection: NSView {
     }
 
     let header = ProviderHeaderView()
-    private let planRow = NSStackView()
-    private let planUsageLabel = NSTextField(labelWithString: "")
-    private let planRemainLabel = NSTextField(labelWithString: "")
-    private let planBar = CodeBuddySlimBarView()
-    private let resetCards = ResetCardsRow()
+    let planUsageLabel = NSTextField(labelWithString: "")
+    let planRemainLabel = NSTextField(labelWithString: "")
+    let planBar = CodeBuddySlimBarView()
+    let resetCards = ResetCardsRow()
 
     init() {
         super.init(frame: .zero)
@@ -89,22 +88,28 @@ final class CodeBuddyPanelSection: NSView {
         }
         header.configure(state)
 
+        // 首次成功前（含首刷中 / 首刷失败）没有任何历史数据：只显示头部状态，不渲染内容区占位
         guard let snapshot else {
-            planUsageLabel.stringValue = "--"
-            planRemainLabel.stringValue = ""
-            planBar.configure(percent: nil)
-            resetCards.configure(chips: [])
+            planUsageLabel.isHidden = true
+            planRemainLabel.isHidden = true
+            planBar.isHidden = true
+            resetCards.isHidden = true
             return
         }
+        planUsageLabel.isHidden = false
+        planRemainLabel.isHidden = false
+        planBar.isHidden = false
+        resetCards.isHidden = false
 
         // 套餐基础积分：细进度条，不显示百分比文字（设计稿 .capsule.slim）
         if let plan = snapshot.planPackage {
-            planUsageLabel.stringValue = "已用 \(CodeBuddyFormat.credits(plan.usedCapacity)) / \(CodeBuddyFormat.credits(plan.totalCapacity))"
-                + "（套餐基础积分 · \(snapshot.region == "international" ? "国际版" : "国内版")）"
-            planRemainLabel.stringValue = "剩 \(CodeBuddyFormat.credits(plan.remainCapacity))"
-                + (plan.cycleEndTime.map { " · \(Self.formatUpdateDate($0)) 更新" } ?? "")
+            // 套餐名来自 SubscriptionPackageCode 映射（体验版/Pro/Max）；
+            // 统一 <剩余>/<总量> 积分 口径，不做已用/剩余的文字区分（窄面板放不下）
+            planUsageLabel.stringValue = "\(CodeBuddyFormat.credits(plan.remainCapacity))/\(CodeBuddyFormat.credits(plan.totalCapacity)) 积分"
+                + "（\(snapshot.planName ?? "未知套餐")）"
+            planRemainLabel.stringValue = plan.cycleEndTime.map { "\(Self.formatUpdateDate($0)) 更新" } ?? ""
             planBar.configure(percent: plan.remainingPercent)
-            planBar.toolTip = "剩余 \(CodeBuddyFormat.credits(plan.remainCapacity)) / \(CodeBuddyFormat.credits(plan.totalCapacity)) 积分"
+            planBar.toolTip = "\(CodeBuddyFormat.credits(plan.remainCapacity))/\(CodeBuddyFormat.credits(plan.totalCapacity)) 积分"
         } else {
             planUsageLabel.stringValue = "套餐基础积分数据不完整"
             planRemainLabel.stringValue = ""
@@ -136,29 +141,39 @@ final class CodeBuddyPanelSection: NSView {
 
     private static func packageChip(id: String, label: String, packages: [CodeBuddyPackage]) -> ResetCardsRow.Chip {
         let total = packages.reduce(0.0) { $0 + $1.totalCapacity }
+        let remain = packages.reduce(0.0) { $0 + $1.remainCapacity }
         let earliest = packages.compactMap { $0.expiredTime ?? $0.cycleEndTime }.min()
         let soon = earliest.map { Date().distance(to: $0) < PanelTheme.cardExpiryWarningInterval } ?? false
-        var title = "\(label) ×\(packages.count) · 共 \(CodeBuddyFormat.credits(total))"
-        if let earliest {
-            let formatter = DateFormatter()
-            formatter.locale = Locale(identifier: "zh_CN")
-            formatter.dateFormat = "MM-dd"
-            title += " · \(formatter.string(from: earliest)) 到期"
-        }
+        // 到期时间不进总标题，逐项展示在明细行上
         return ResetCardsRow.Chip(
             id: id,
-            title: title,
+            title: "\(label) ×\(packages.count) · \(CodeBuddyFormat.credits(remain))/\(CodeBuddyFormat.credits(total))",
             soon: soon,
             cards: packages.enumerated().map { index, package in
-                ResetCardsRow.CardItem(
-                    kindTitle: label,
+                // 单项不重复分组名：<剩余>/<总量> 积分 · MM-dd HH:mm（对齐 Z.AI 重置单项样式）
+                var detail = "\(CodeBuddyFormat.credits(package.remainCapacity))/\(CodeBuddyFormat.credits(package.totalCapacity)) 积分"
+                if let expiry = package.expiredTime ?? package.cycleEndTime {
+                    detail += " · \(formatExpiry(expiry))"
+                }
+                if package.inUsage {
+                    detail += " · 使用中"
+                }
+                return ResetCardsRow.CardItem(
+                    kindTitle: "",
                     expiresAt: package.expiredTime ?? package.cycleEndTime,
                     id: "\(id).\(index)",
-                    detailText: "\(CodeBuddyFormat.credits(package.totalCapacity)) 积分 · 剩 \(CodeBuddyFormat.credits(package.remainCapacity))"
-                        + (package.inUsage ? " · 使用中" : "")
+                    detailText: detail
                 )
             }
         )
+    }
+
+    /// 到期时间：MM-dd HH:mm。
+    private static func formatExpiry(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "MM-dd HH:mm"
+        return formatter.string(from: date)
     }
 
     private static func formatUpdateDate(_ date: Date) -> String {

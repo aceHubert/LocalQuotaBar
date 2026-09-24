@@ -126,6 +126,88 @@ final class ManualRefreshTests: XCTestCase {
     }
 
     @MainActor
+    func testTabRingPrefersFiveHourOverWeeklyWindow() async throws {
+        let controller = makeController()
+        let now = Date()
+        let fiveHourRemaining = 70.0
+        let weeklyRemaining = 30.0
+        controller.apply(
+            snapshot: QuotaSnapshot(
+                fiveHour: .init(kind: .fiveHour, usedPercent: 100 - fiveHourRemaining,
+                                windowDurationMins: 300, resetsAt: now.addingTimeInterval(3600)),
+                weekly: .init(kind: .weekly, usedPercent: 100 - weeklyRemaining,
+                              windowDurationMins: 7 * 24 * 60, resetsAt: now.addingTimeInterval(86400)),
+                resetCreditCount: nil, resetCreditCards: [], creditBalance: nil,
+                planType: nil, fetchedAt: now
+            ),
+            isRefreshing: false, error: nil, reminder: .inactive
+        )
+        let codexTab = try tabItem(.codex, in: controller)
+        XCTAssertEqual(codexTab.ringFillLayer.strokeEnd, fiveHourRemaining / 100, accuracy: 0.001)
+    }
+
+    /// CodeBuddy 国内外是两个独立 tab：顶栏刷新只作用于当前 active 的那一个。
+    @MainActor
+    func testCodeBuddyDomesticTabRefreshesIndependentlyFromInternational() async throws {
+        let controller = makeController()
+        var intlRequests = 0
+        var cnRequests = 0
+        controller.onCodeBuddyRefresh = { intlRequests += 1 }
+        controller.onCodeBuddyCNRefresh = { cnRequests += 1 }
+
+        // 默认 active 仍是 Codex，两个 CodeBuddy tab 均不应被触发。
+        let top = try activeRefreshButton(in: controller)
+        top.performClick(nil)
+        XCTAssertEqual(intlRequests, 0)
+        XCTAssertEqual(cnRequests, 0)
+
+        try tabItem(.codeBuddy, in: controller).performClick(nil)
+        top.performClick(nil)
+        XCTAssertEqual(intlRequests, 1)
+        XCTAssertEqual(cnRequests, 0)
+
+        // 切到国内版：国际版仍在冷却，国内版可独立刷新。
+        try tabItem(.codeBuddyCN, in: controller).performClick(nil)
+        XCTAssertTrue(top.isEnabled)
+        top.performClick(nil)
+        XCTAssertEqual(intlRequests, 1)
+        XCTAssertEqual(cnRequests, 1)
+    }
+
+    /// 上次选择的 tab 会被持久化，弹窗重开恢复；不可见时回退 Codex。
+    @MainActor
+    func testActiveTabSelectionIsRestoredAndFallsBackWhenHidden() async throws {
+        let controller = QuotaViewController.makeForTesting()
+        _ = controller.view
+        controller.setZAISectionVisible(true)
+        try tabItem(.codeBuddyCN, in: controller).performClick(nil)
+        XCTAssertEqual(
+            controller.tabStorage.string(forKey: QuotaViewController.activeTabStorageKey),
+            QuotaTabID.codeBuddyCN.rawValue
+        )
+
+        // 重新打开弹窗（viewDidAppear 读取持久化选择）：恢复上次 tab 而不是回到 Codex。
+        let restored = QuotaViewController.makeForTesting(clearStoredTab: false)
+        _ = restored.view
+        restored.setZAISectionVisible(true)
+        restored.viewDidAppear()
+        // 收尾关闭：停掉 viewDidAppear 注册的相对时间定时器，避免影响其他用例。
+        defer { restored.viewWillDisappear() }
+        // INTL / CN 都是常驻 tab，恢复选择不改变彼此显隐；active 应回到 CN。
+        XCTAssertFalse(try tabItem(.codeBuddyCN, in: restored).isHidden)
+        XCTAssertFalse(try tabItem(.codeBuddy, in: restored).isHidden)
+        let restoredBar = try XCTUnwrap(descendants(of: restored.view)
+            .compactMap { $0 as? PanelTabBarView }.first)
+        XCTAssertEqual(restoredBar.active, .codeBuddyCN)
+
+        // Z.AI 隐藏时若正停留在该 tab，回退 Codex（既有语义不变）。
+        try tabItem(.zai, in: restored).performClick(nil)
+        restored.setZAISectionVisible(false)
+        XCTAssertTrue(try tabItem(.zai, in: restored).isHidden)
+        XCTAssertFalse(try tabItem(.codex, in: restored).isHidden)
+    }
+
+    @MainActor
     func testAPIKeyEntryRefreshesUsageOnceWhileQuotaRefreshStaysUnavailable() async throws {
         _ = NSApplication.shared
         let panel = ZAIPanelSection(resolveSelection: {
@@ -151,7 +233,7 @@ final class ManualRefreshTests: XCTestCase {
     @MainActor
     private func makeController() -> QuotaViewController {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         _ = controller.view
         controller.setZAISectionVisible(true)
         return controller

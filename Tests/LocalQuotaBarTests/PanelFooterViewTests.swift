@@ -63,7 +63,7 @@ final class PanelFooterViewTests: XCTestCase {
     @MainActor
     func testQuotaControllerLoadsAndAcceptsReminderUpdates() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
 
         // 模拟菜单栏首次打开前的状态同步，以及加载面板后的后续更新。
         controller.setUnmuteButtonVisible(false)

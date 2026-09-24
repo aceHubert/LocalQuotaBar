@@ -161,7 +161,8 @@ final class ProviderHeaderView: NSView {
 
     private let errorLabel = NSTextField(labelWithString: "")
     private let statusLabel = NSTextField(labelWithString: "")
-    private let statusDotMini = NSView()
+    /// 状态点：与 Tab 栏同款光晕视图（点 5pt）
+    private let statusDotMini = PanelStatusDotView(dotDiameter: 5, glowRadius: 4.5)
     private let now: () -> Date
 
     init(now: @escaping () -> Date = Date.init) {
@@ -188,9 +189,6 @@ final class ProviderHeaderView: NSView {
         statusLabel.setContentHuggingPriority(.init(751), for: .horizontal)
         statusLabel.setContentCompressionResistancePriority(.init(751), for: .horizontal)
 
-        statusDotMini.wantsLayer = true
-        statusDotMini.layer?.backgroundColor = PanelTheme.green.cgColor
-        statusDotMini.layer?.cornerRadius = 2.5
         statusDotMini.translatesAutoresizingMaskIntoConstraints = false
 
         let statusLine = NSStackView(views: [statusDotMini, statusLabel])
@@ -215,8 +213,9 @@ final class ProviderHeaderView: NSView {
             content.trailingAnchor.constraint(equalTo: trailingAnchor),
             content.topAnchor.constraint(equalTo: topAnchor, constant: 3),
             content.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -3),
-            statusDotMini.widthAnchor.constraint(equalToConstant: 5),
-            statusDotMini.heightAnchor.constraint(equalToConstant: 5),
+            // 12pt 画布承载 5pt 点 + 光晕
+            statusDotMini.widthAnchor.constraint(equalToConstant: 12),
+            statusDotMini.heightAnchor.constraint(equalToConstant: 12),
             statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 120)
         ])
     }
@@ -237,13 +236,13 @@ final class ProviderHeaderView: NSView {
         switch state.statusKind {
         case .ok:
             statusLabel.textColor = PanelTheme.tertiaryText
-            statusDotMini.layer?.backgroundColor = PanelTheme.green.cgColor
+            statusDotMini.dotColor = PanelTheme.green
         case .bad:
             statusLabel.textColor = NSColor(hex: 0xFF8D84)
-            statusDotMini.layer?.backgroundColor = PanelTheme.red.cgColor
+            statusDotMini.dotColor = PanelTheme.red
         case .idle:
             statusLabel.textColor = PanelTheme.tertiaryText
-            statusDotMini.layer?.backgroundColor = PanelTheme.tertiaryText.cgColor
+            statusDotMini.dotColor = PanelTheme.tertiaryText
         }
     }
 
@@ -766,11 +765,16 @@ final class ResetCardsRow: NSView {
                 }
                 chipStack.addArrangedSubview(group)
                 group.widthAnchor.constraint(equalTo: chipStack.widthAnchor).isActive = true
+            } else if chip.cards.isEmpty {
+                // 空态 chip（如"购买积分 · 无资源包"）没有可展开的明细，不渲染展开按钮
+                chipStack.addArrangedSubview(chipButton)
             } else {
                 chipStack.addArrangedSubview(chipButton)
                 chipStack.addArrangedSubview(expandButton)
             }
-            expandButtons[chip.id] = expandButton
+            if !chip.cards.isEmpty {
+                expandButtons[chip.id] = expandButton
+            }
 
             let card = makeCardList(chip)
             listStack.addArrangedSubview(card)
@@ -932,11 +936,15 @@ final class ResetCardsRow: NSView {
         indexLabel.font = .systemFont(ofSize: 9.5, weight: .bold)
         indexLabel.textColor = PanelTheme.tertiaryText
 
-        let kindLabel = NSTextField(labelWithString: item.kindTitle)
-        kindLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
-        kindLabel.textColor = PanelTheme.tertiaryText
-
         let timeLabel = NSTextField(labelWithString: item.detailText ?? PanelTheme.formatCardExpiry(item.expiresAt))
+        // kindTitle 为空时不渲染类型标签（CodeBuddy 单项不重复分组名）
+        let kindLabel = item.kindTitle.isEmpty
+            ? nil
+            : NSTextField(labelWithString: item.kindTitle)
+        if let kindLabel {
+            kindLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
+            kindLabel.textColor = PanelTheme.tertiaryText
+        }
         timeLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold)
         timeLabel.textColor = PanelTheme.primaryText
 
@@ -949,9 +957,12 @@ final class ResetCardsRow: NSView {
         spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
 
         // 明细新增操作后省去重复的卡类型，给完整到期时间和按钮留足空间。
-        let rowViews: [NSView] = item.resetAction == nil
-            ? [indexLabel, kindLabel, timeLabel, spacer, badge]
+        var rowViews: [NSView] = item.resetAction == nil
+            ? [indexLabel, timeLabel, spacer, badge]
             : [indexLabel, timeLabel, spacer, badge]
+        if let kindLabel {
+            rowViews.insert(kindLabel, at: 1)
+        }
         let row = NSStackView(views: rowViews)
         if let id = item.id, let action = item.resetAction {
             let button = makeResetButton("card.\(id)", action: action)

@@ -6,7 +6,7 @@ final class PanelRenderingTests: XCTestCase {
     @MainActor
     func testQuotaPopoverRendersAcrossRepeatedOpenings() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         controller.applyReminderConfiguration(.default)
         let snapshot = QuotaSnapshot(
             fiveHour: .init(kind: .fiveHour, usedPercent: 25, windowDurationMins: 300, resetsAt: nil),
@@ -68,7 +68,7 @@ final class PanelRenderingTests: XCTestCase {
     @MainActor
     func testTopUpdatedLabelFollowsActiveTabRefreshTime() async throws {
         _ = NSApplication.shared
-        let controller = QuotaViewController()
+        let controller = QuotaViewController.makeForTesting()
         _ = controller.view
         controller.setZAISectionVisible(true)
         let now = Date()

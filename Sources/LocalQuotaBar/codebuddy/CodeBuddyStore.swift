@@ -14,8 +14,13 @@ final class CodeBuddyStore {
 
     var onChange: ((CodeBuddySnapshot?, Bool, String?) -> Void)?
 
-    init(client: CodeBuddyClient = CodeBuddyClient(),
+    /// Cookie 候选域名（国际版 codebuddy.ai / 国内版 codebuddy.cn）。
+    let domain: String
+
+    init(domain: String = CodeBuddyCookieImporter.internationalDomain,
+         client: CodeBuddyClient = CodeBuddyClient(),
          refreshInterval: TimeInterval = RefreshSettings.load()) {
+        self.domain = domain
         self.client = client
         self.refreshInterval = refreshInterval
     }
@@ -59,7 +64,7 @@ final class CodeBuddyStore {
         Task { @MainActor in
             // Cookie 导入涉及 SQLite 拷贝与 Keychain，放协作线程池
             let imported = await Task.detached(priority: .utility) {
-                CodeBuddyCookieImporter.importCandidates(allowKeychainUI: allowKeychainUI)
+                CodeBuddyCookieImporter.importCandidates(domain: self.domain, allowKeychainUI: allowKeychainUI)
             }.value
 
             switch imported {
@@ -67,7 +72,8 @@ final class CodeBuddyStore {
                 finishRefresh(error: error.localizedDescription)
             case .success(let candidates):
                 guard let candidate = CodeBuddyCookieImporter.selectProfile(candidates: candidates) else {
-                    finishRefresh(error: CodeBuddyCookieImporter.ImportError.cookieNotFound.localizedDescription)
+                    finishRefresh(error: CodeBuddyCookieImporter.ImportError
+                        .cookieNotFound(host: self.requestHost).localizedDescription)
                     return
                 }
                 do {
@@ -90,5 +96,10 @@ final class CodeBuddyStore {
         isRefreshing = false
         lastError = error
         onChange?(snapshot, false, error)
+    }
+
+    /// 目标请求域名（含 www. 前缀）：Cookie 导入与错误文案共用。
+    private var requestHost: String {
+        domain.hasPrefix("www.") ? domain : "www.\(domain)"
     }
 }

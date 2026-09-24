@@ -17,11 +17,11 @@ final class DeepSeekPanelSection: NSView {
     }
 
     let header = ProviderHeaderView()
-    private let profileHint = NSTextField(labelWithString: "")
-    private let metricsRow = NSStackView()
-    private let rechargeCard = MetricCardView()
-    private let totalCostCard = MetricCardView()
-    private let costChart = DeepSeekCostChartView()
+    let profileHint = NSTextField(labelWithString: "")
+    let metricsRow = NSStackView()
+    let rechargeCard = MetricCardView()
+    let totalCostCard = MetricCardView()
+    let costChart = DeepSeekCostChartView()
 
     init() {
         super.init(frame: .zero)
@@ -89,19 +89,21 @@ final class DeepSeekPanelSection: NSView {
         }
         header.configure(state)
 
-        if let snapshot {
-            configureCards(snapshot)
-            costChart.configure(days: snapshot.usage.days, currency: snapshot.usage.currency)
-            if profileCount > 1 {
-                profileHint.stringValue = "已使用 Chrome Profile「\(snapshot.profileName)」（检测到 \(profileCount) 个登录态）"
-                profileHint.isHidden = false
-            } else {
-                profileHint.isHidden = true
-            }
+        // 首次成功前（含首刷中 / 首刷失败）没有任何历史数据：只显示头部状态，不渲染内容区占位
+        guard let snapshot else {
+            metricsRow.isHidden = true
+            costChart.isHidden = true
+            profileHint.isHidden = true
+            return
+        }
+        metricsRow.isHidden = false
+        costChart.isHidden = false
+        configureCards(snapshot)
+        costChart.configure(days: snapshot.usage.days, currency: snapshot.usage.currency)
+        if profileCount > 1 {
+            profileHint.stringValue = "已使用 Chrome Profile「\(snapshot.profileName)」（检测到 \(profileCount) 个登录态）"
+            profileHint.isHidden = false
         } else {
-            rechargeCard.configure(label: "充值金额", valueText: nil, tooltip: nil)
-            totalCostCard.configure(label: "累计消费金额", valueText: nil, tooltip: nil)
-            costChart.configure(days: nil, currency: nil)
             profileHint.isHidden = true
         }
     }
@@ -157,7 +159,7 @@ final class DeepSeekPanelSection: NSView {
 
 // MARK: - 指标卡（大数值 + 小标签 + 币种单位）
 
-private final class MetricCardView: NSView {
+final class MetricCardView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let valueLabel = NSTextField(labelWithString: "")
     private let unitLabel = NSTextField(labelWithString: "")
@@ -336,8 +338,9 @@ private final class DeepSeekCostBarsView: NSView {
         let barsHeight = bounds.height - 10 - ticksHeight
 
         for (index, day) in days.enumerated() {
+            guard day.amount > 0 else { continue }
             let fraction = CGFloat(day.amount / maxValue)
-            let barHeight = max(day.amount > 0 ? 2 : 0, fraction * barsHeight)
+            let barHeight = max(2, fraction * barsHeight)
             let barRect = NSRect(
                 x: CGFloat(index) * layout.pitch,
                 y: barsBottom,
@@ -346,8 +349,9 @@ private final class DeepSeekCostBarsView: NSView {
             )
             let path = NSBezierPath(roundedRect: barRect, xRadius: 2, yRadius: 2)
             let isToday = index == days.count - 1
-            (isToday ? NSColor(hex: 0x6CF0AC) : PanelTheme.green).setFill()
-            path.fill()
+            let hovered = index == hoveredIndex
+            // 设计稿同款垂直渐变 + 顶部高光（平涂亮绿深底上显灰薄）
+            DailyUsageChartView.fillBarPath(path, barRect: barRect, isToday: isToday, hovered: hovered)
         }
 
         // 均值虚线 + 数值
