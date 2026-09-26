@@ -9,7 +9,7 @@ final class CodexUsageClient {
     private let requestTimeout: TimeInterval
 
     init(
-        appServerExecutablePath: String = "/Applications/ChatGPT.app/Contents/Resources/codex",
+        appServerExecutablePath: String = CodexAppServerLocator.defaultExecutablePath(),
         requestTimeout: TimeInterval = 30
     ) {
         self.appServerExecutablePath = appServerExecutablePath
@@ -45,9 +45,11 @@ final class CodexUsageClient {
         process.standardError = stderrPipe
 
         let queue = DispatchQueue(label: "local.codex.touchbar.quota.usage")
-        let semaphore = DispatchSemaphore(value: 0)
+        let initializationSemaphore = DispatchSemaphore(value: 0)
+        let usageSemaphore = DispatchSemaphore(value: 0)
         var buffer = Data()
-        var response: [String: Any]?
+        var initializationResponse: [String: Any]?
+        var usageResponse: [String: Any]?
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
@@ -59,11 +61,18 @@ final class CodexUsageClient {
                     buffer.removeSubrange(buffer.startIndex..<newline.upperBound)
                     guard !line.isEmpty,
                           let object = try? JSONSerialization.jsonObject(with: line, options: []),
-                          let message = object as? [String: Any],
-                          (message["id"] as? NSNumber)?.intValue == 2
+                          let message = object as? [String: Any]
                     else { continue }
-                    response = message
-                    semaphore.signal()
+                    switch (message["id"] as? NSNumber)?.intValue {
+                    case 1:
+                        initializationResponse = message
+                        initializationSemaphore.signal()
+                    case 2:
+                        usageResponse = message
+                        usageSemaphore.signal()
+                    default:
+                        break
+                    }
                 }
             }
         }
@@ -78,27 +87,6 @@ final class CodexUsageClient {
             throw CodexRateLimitError.processLaunchFailed(error.localizedDescription)
         }
 
-        let messages: [[String: Any]] = [
-            [
-                "id": 1,
-                "method": "initialize",
-                "params": [
-                    "clientInfo": [
-                        "name": "codex_touchbar_quota",
-                        "title": "Codex Touch Bar Quota",
-                        "version": "1.0.0"
-                    ]
-                ]
-            ],
-            ["method": "initialized", "params": [:]],
-            ["id": 2, "method": "account/usage/read", "params": [:]],
-        ]
-        for message in messages {
-            let json = try JSONSerialization.data(withJSONObject: message, options: [])
-            stdinPipe.fileHandleForWriting.write(json)
-            stdinPipe.fileHandleForWriting.write(Data("\n".utf8))
-        }
-
         defer {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
@@ -108,11 +96,57 @@ final class CodexUsageClient {
             }
         }
 
-        guard semaphore.wait(timeout: .now() + requestTimeout) == .success else {
+        let initializeMessage: [String: Any] = [
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "clientInfo": [
+                    "name": "codex_touchbar_quota",
+                    "title": "Codex Touch Bar Quota",
+                    "version": "1.0.0"
+                ]
+            ]
+        ]
+
+        // 与额度客户端保持同一协议顺序：先等 initialize 响应，再发送业务请求。
+        // 否则 app-server 启动稍慢时会把 account/usage/read 误判为未初始化请求。
+        let initializeJSON = try JSONSerialization.data(withJSONObject: initializeMessage, options: [])
+        stdinPipe.fileHandleForWriting.write(initializeJSON)
+        stdinPipe.fileHandleForWriting.write(Data("\n".utf8))
+        guard initializationSemaphore.wait(timeout: .now() + requestTimeout) == .success else {
+            throw CodexRateLimitError.timeout
+        }
+        let initialized: [String: Any] = queue.sync {
+            initializationResponse
+        } ?? [:]
+        if let error = initialized["error"] as? [String: Any] {
+            let message = (error["message"] as? String) ?? "unknown error"
+            throw CodexRateLimitError.serverError(message)
+        }
+        guard initialized["result"] is [String: Any] else {
+            throw CodexRateLimitError.malformedResponse
+        }
+
+        let usageMessage: [String: Any] = [
+            "method": "initialized",
+            "params": [:]
+        ]
+        let requestMessage: [String: Any] = [
+            "id": 2,
+            "method": "account/usage/read",
+            "params": [:]
+        ]
+        for message in [usageMessage, requestMessage] {
+            let json = try JSONSerialization.data(withJSONObject: message, options: [])
+            stdinPipe.fileHandleForWriting.write(json)
+            stdinPipe.fileHandleForWriting.write(Data("\n".utf8))
+        }
+
+        guard usageSemaphore.wait(timeout: .now() + requestTimeout) == .success else {
             throw CodexRateLimitError.timeout
         }
         // 响应写入发生在收集队列上，读取也走同一队列保证可见性
-        let collected: [String: Any]? = queue.sync { response }
+        let collected: [String: Any]? = queue.sync { usageResponse }
         guard let response = collected else {
             throw CodexRateLimitError.malformedResponse
         }

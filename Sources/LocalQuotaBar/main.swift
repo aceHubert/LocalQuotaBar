@@ -408,7 +408,7 @@ final class CodexRateLimitClient {
     let requestTimeout: TimeInterval
 
     init(
-        appServerExecutablePath: String = "/Applications/ChatGPT.app/Contents/Resources/codex",
+        appServerExecutablePath: String = CodexAppServerLocator.defaultExecutablePath(),
         // rateLimits/read 背后有网络请求，延迟波动大（实测 2s ~ 15s+），超时不能太紧。
         requestTimeout: TimeInterval = 30
     ) {
@@ -529,22 +529,34 @@ final class CodexRateLimitClient {
             throw CodexRateLimitError.processLaunchFailed(error.localizedDescription)
         }
 
-        var messages: [[String: Any]] = [
-            [
-                "id": 1,
-                "method": "initialize",
-                "params": [
-                    "clientInfo": [
-                        "name": "codex_touchbar_quota",
-                        "title": "Codex Touch Bar Quota",
-                        "version": "1.0.0"
-                    ]
+        let initializeMessage: [String: Any] = [
+            "id": 1,
+            "method": "initialize",
+            "params": [
+                "clientInfo": [
+                    "name": "codex_touchbar_quota",
+                    "title": "Codex Touch Bar Quota",
+                    "version": "1.0.0"
                 ]
-            ],
+            ]
+        ]
+        // app-server 要求客户端先收到 initialize 响应，再发送 initialized 和业务请求。
+        // 旧实现一次性写入所有消息；网络稍慢时业务请求会被服务端拒绝，表现为
+        // “刷新失败”，即使 Codex 客户端自身已经成功更新了余额。
+        try writeJSONLines([initializeMessage], to: stdinPipe.fileHandleForWriting)
+        guard initializationCollector.wait(timeout: requestTimeout) else {
+            throw CodexRateLimitError.timeout
+        }
+        guard let initialized = initializationCollector.response(for: 1) else {
+            throw CodexRateLimitError.malformedResponse
+        }
+        _ = try result(from: initialized)
+
+        var messages: [[String: Any]] = [
             [
                 "method": "initialized",
                 "params": [:]
-            ],
+            ]
         ]
         if shouldReadAccount {
             messages.append([
@@ -560,22 +572,12 @@ final class CodexRateLimitClient {
                 "params": NSNull()
             ])
         }
-
         if let resetCreditParams {
-            // 有副作用的方法必须等初始化成功后再发送，不因超时自行重试。
-            try writeJSONLines([messages[0]], to: stdinPipe.fileHandleForWriting)
-            guard initializationCollector.wait(timeout: requestTimeout) else {
-                throw CodexRateLimitError.timeout
-            }
-            guard let initialized = initializationCollector.response(for: 1) else {
-                throw CodexRateLimitError.malformedResponse
-            }
-            _ = try result(from: initialized)
-            messages = [messages[1], [
+            messages.append([
                 "id": 4,
                 "method": "account/rateLimitResetCredit/consume",
                 "params": resetCreditParams
-            ]]
+            ])
         }
 
         do {
