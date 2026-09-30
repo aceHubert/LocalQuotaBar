@@ -72,6 +72,18 @@ struct DeepSeekSnapshot: Equatable {
         }
     }
 
+    /// 指定币种下按钱包类型汇总：充值（normal）与赠送（bonus）分开，对齐平台页两张余额卡。
+    func balance(kind: DeepSeekWallet.Kind, currency: String) -> Double {
+        wallets
+            .filter { $0.kind == kind && $0.currency == currency }
+            .reduce(0.0) { $0 + $1.balance }
+    }
+
+    /// 指定币种的可用余额（充值 + 赠送）。
+    func availableBalance(currency: String) -> Double {
+        balance(kind: .normal, currency: currency) + balance(kind: .bonus, currency: currency)
+    }
+
     /// 币种选择规则：优先有余额的 USD，其次任意有余额币种，兜底 CNY。
     static func pickCurrency(_ balances: [String: Double]) -> String? {
         if let usd = balances["USD"], usd > 0 { return "USD" }

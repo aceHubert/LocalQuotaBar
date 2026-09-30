@@ -1,9 +1,9 @@
 import AppKit
 import Foundation
 
-// MARK: - DeepSeek 面板（tabs.html 定稿：两指标卡 + 近 30 天消费图）
+// MARK: - DeepSeek 面板（tabs.html 定稿 + 平台页三卡口径：充值余额 / 累计消费金额 / 赠送余额）
 
-/// DeepSeek 区块：slim 头部 + 指标卡（充值 / 累计消费）+ 每日消费柱状图。
+/// DeepSeek 区块：slim 头部 + 指标卡（充值余额 / 累计消费金额 / 赠送余额）+ 每日消费柱状图。
 /// 余额无「剩余/总量」口径，不显示百分比，tab 进度环为空环 + 金额文字。
 final class DeepSeekPanelSection: NSView {
     var onRefresh: (() -> Void)?
@@ -21,6 +21,7 @@ final class DeepSeekPanelSection: NSView {
     let metricsRow = NSStackView()
     let rechargeCard = MetricCardView()
     let totalCostCard = MetricCardView()
+    let bonusCard = MetricCardView()
     let costChart = DeepSeekCostChartView()
 
     init() {
@@ -39,8 +40,10 @@ final class DeepSeekPanelSection: NSView {
         metricsRow.spacing = 7
         metricsRow.distribution = .fillEqually
         metricsRow.translatesAutoresizingMaskIntoConstraints = false
+        // 顺序对齐平台页：充值余额 | 累计消费金额 | 赠送余额
         metricsRow.addArrangedSubview(rechargeCard)
         metricsRow.addArrangedSubview(totalCostCard)
+        metricsRow.addArrangedSubview(bonusCard)
 
         costChart.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
 
@@ -109,29 +112,39 @@ final class DeepSeekPanelSection: NSView {
     }
 
     private func configureCards(_ snapshot: DeepSeekSnapshot) {
+        // 充值 / 赠送分开成两张卡（对齐平台页）：合计只在 tooltip 里给，不再顶替充值余额
         if let balance = snapshot.primaryBalance {
-            let balanceSymbol = DeepSeekSnapshot.currencySymbol(balance.currency)
-            let normal = snapshot.wallets.filter { $0.kind == .normal && $0.currency == balance.currency }
-                .reduce(0.0) { $0 + $1.balance }
-            let bonus = snapshot.wallets.filter { $0.kind == .bonus && $0.currency == balance.currency }
-                .reduce(0.0) { $0 + $1.balance }
+            let currency = balance.currency
+            let symbol = DeepSeekSnapshot.currencySymbol(currency)
+            let normal = snapshot.balance(kind: .normal, currency: currency)
+            let bonus = snapshot.balance(kind: .bonus, currency: currency)
             let estimation = snapshot.wallets
-                .filter { $0.currency == balance.currency }
+                .filter { $0.currency == currency }
                 .compactMap(\.tokenEstimation)
                 .reduce(0.0, +)
-            var tooltip = "可用余额（充值 + 赠送）：\(balanceSymbol)\(String(format: "%.2f", balance.amount))"
-            tooltip += "\n充值 \(balanceSymbol)\(String(format: "%.2f", normal)) · 赠送 \(balanceSymbol)\(String(format: "%.2f", bonus))"
+
+            var rechargeTooltip = "充值余额（\(currency)）：\(symbol)\(Self.amountText(normal))"
+            rechargeTooltip += otherCurrenciesText(snapshot, kind: .normal, primary: currency)
+            rechargeTooltip += "\n可用余额（充值 + 赠送）：\(symbol)\(Self.amountText(balance.amount))"
             if estimation > 0 {
-                tooltip += "\n平台估算可用 \(PanelTheme.formatTokenCount(estimation)) tokens"
+                rechargeTooltip += "\n平台估算可用 \(PanelTheme.formatTokenCount(estimation)) tokens"
             }
             rechargeCard.configure(
-                label: "充值金额",
-                valueText: "\(balanceSymbol)\(String(format: "%.2f", balance.amount))",
-                unit: balance.currency,
-                tooltip: tooltip
+                label: "充值余额",
+                valueText: "\(symbol)\(Self.amountText(normal))",
+                tooltip: rechargeTooltip
+            )
+
+            var bonusTooltip = "赠送余额（\(currency)）：\(symbol)\(Self.amountText(bonus))"
+            bonusTooltip += otherCurrenciesText(snapshot, kind: .bonus, primary: currency)
+            bonusCard.configure(
+                label: "赠送余额",
+                valueText: "\(symbol)\(Self.amountText(bonus))",
+                tooltip: bonusTooltip
             )
         } else {
-            rechargeCard.configure(label: "充值金额", valueText: nil, tooltip: nil)
+            rechargeCard.configure(label: "充值余额", valueText: nil, tooltip: nil)
+            bonusCard.configure(label: "赠送余额", valueText: nil, tooltip: nil)
         }
 
         let costsByCurrency = Dictionary(uniqueKeysWithValues: snapshot.totalCosts.map { ($0.currency, $0.amount) })
@@ -140,29 +153,50 @@ final class DeepSeekPanelSection: NSView {
             : (DeepSeekSnapshot.pickCurrency(costsByCurrency.filter { $0.value > 0 }) ?? snapshot.usage.currency)
         if let amount = costsByCurrency[costCurrency] {
             let costSymbol = DeepSeekSnapshot.currencySymbol(costCurrency)
-            var tooltip = "累计消费（\(costCurrency)）：\(costSymbol)\(String(format: "%.2f", amount))"
+            var tooltip = "累计消费（\(costCurrency)）：\(costSymbol)\(Self.amountText(amount))"
             for cost in snapshot.totalCosts.sorted(by: { $0.currency < $1.currency })
             where cost.currency != costCurrency {
-                tooltip += "\n\(cost.currency)：\(DeepSeekSnapshot.currencySymbol(cost.currency))\(String(format: "%.2f", cost.amount))"
+                tooltip += "\n\(cost.currency)：\(DeepSeekSnapshot.currencySymbol(cost.currency))\(Self.amountText(cost.amount))"
             }
             totalCostCard.configure(
                 label: "累计消费金额",
-                valueText: "\(costSymbol)\(String(format: "%.2f", amount))",
-                unit: costCurrency,
+                valueText: "\(costSymbol)\(Self.amountText(amount))",
                 tooltip: tooltip
             )
         } else {
             totalCostCard.configure(label: "累计消费金额", valueText: nil, tooltip: nil)
         }
     }
+
+    /// 非主币种的同类钱包余额（逐条列出，避免主币种口径把其他币种的钱藏起来）。
+    private func otherCurrenciesText(
+        _ snapshot: DeepSeekSnapshot,
+        kind: DeepSeekWallet.Kind,
+        primary: String
+    ) -> String {
+        var text = ""
+        let others = snapshot.wallets
+            .filter { $0.kind == kind && $0.currency != primary && $0.balance > 0 }
+            .sorted { $0.currency < $1.currency }
+        for wallet in others {
+            text += "\n\(wallet.currency)：\(DeepSeekSnapshot.currencySymbol(wallet.currency))\(Self.amountText(wallet.balance))"
+        }
+        return text
+    }
+
+    /// 金额文案统一两位小数。
+    private static func amountText(_ amount: Double) -> String {
+        String(format: "%.2f", amount)
+    }
 }
 
-// MARK: - 指标卡（大数值 + 小标签 + 币种单位）
+// MARK: - 指标卡（大数值 + 小标签）
 
+/// 三格等分时单格内容区仅约 70pt：数值只带币种符号（与 Codex 余额格同款），
+/// 币种代码放 tooltip，字号 13pt 保证「¥1234.56」这类长金额不溢出。
 final class MetricCardView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let valueLabel = NSTextField(labelWithString: "")
-    private let unitLabel = NSTextField(labelWithString: "")
 
     init() {
         super.init(frame: .zero)
@@ -176,20 +210,12 @@ final class MetricCardView: NSView {
         titleLabel.font = .systemFont(ofSize: 9.5, weight: .semibold)
         titleLabel.textColor = PanelTheme.secondaryText
 
-        valueLabel.font = .monospacedDigitSystemFont(ofSize: 14, weight: .bold)
+        valueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .bold)
         valueLabel.textColor = PanelTheme.primaryText
         valueLabel.lineBreakMode = .byTruncatingTail
         valueLabel.maximumNumberOfLines = 1
 
-        unitLabel.font = .systemFont(ofSize: 9, weight: .semibold)
-        unitLabel.textColor = PanelTheme.tertiaryText
-
-        let valueLine = NSStackView(views: [valueLabel, unitLabel])
-        valueLine.orientation = .horizontal
-        valueLine.alignment = .lastBaseline
-        valueLine.spacing = 3
-
-        let stack = NSStackView(views: [titleLabel, valueLine])
+        let stack = NSStackView(views: [titleLabel, valueLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 4
@@ -208,12 +234,10 @@ final class MetricCardView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(label: String, valueText: String?, unit: String? = nil, tooltip: String?) {
+    func configure(label: String, valueText: String?, tooltip: String?) {
         titleLabel.stringValue = label
         valueLabel.stringValue = valueText ?? "--"
         valueLabel.textColor = valueText == nil ? PanelTheme.tertiaryText : PanelTheme.primaryText
-        unitLabel.stringValue = unit ?? ""
-        unitLabel.isHidden = unit == nil || valueText == nil
         toolTip = tooltip
     }
 }

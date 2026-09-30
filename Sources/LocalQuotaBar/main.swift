@@ -2780,7 +2780,13 @@ final class QuotaViewController: NSViewController {
         var parts: [String] = []
         if let balance = snapshot.primaryBalance {
             let symbol = DeepSeekSnapshot.currencySymbol(balance.currency)
-            parts.append("充值 \(symbol)\(String(format: "%.2f", balance.amount))")
+            let normal = snapshot.balance(kind: .normal, currency: balance.currency)
+            let bonus = snapshot.balance(kind: .bonus, currency: balance.currency)
+            // 摘要里的「余额」是环上的合计可用余额，后面再把充值 / 赠送拆开
+            let normalText = "\(symbol)\(String(format: "%.2f", normal))"
+            let bonusText = "\(symbol)\(String(format: "%.2f", bonus))"
+            parts.append("余额 \(symbol)\(String(format: "%.2f", balance.amount))"
+                + "（充值 \(normalText) + 赠送 \(bonusText)）")
         }
         if snapshot.usage.totalAmount > 0 {
             let symbol = DeepSeekSnapshot.currencySymbol(snapshot.usage.currency)

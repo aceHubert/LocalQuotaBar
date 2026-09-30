@@ -241,4 +241,49 @@ final class DeepSeekParsingTests: XCTestCase {
         )
         XCTAssertEqual(snapshot.primaryBalance?.currency, "USD")
     }
+
+    // MARK: - 充值 / 赠送分开口径（面板两卡）
+
+    func testBalanceSeparatesNormalAndBonusWallets() {
+        let snapshot = DeepSeekSnapshot(
+            fetchedAt: Date(), profileID: "Default", profileName: "Default",
+            wallets: [
+                .init(kind: .normal, currency: "CNY", balance: 4.30, tokenEstimation: nil),
+                .init(kind: .bonus, currency: "CNY", balance: 5.81, tokenEstimation: nil),
+                .init(kind: .normal, currency: "CNY", balance: 0.20, tokenEstimation: nil)
+            ],
+            totalCosts: [], usage: .init(currency: "CNY", days: [])
+        )
+        // 同类型多钱包按币种求和，赠送不并入充值
+        XCTAssertEqual(snapshot.balance(kind: .normal, currency: "CNY"), 4.50, accuracy: 0.001)
+        XCTAssertEqual(snapshot.balance(kind: .bonus, currency: "CNY"), 5.81, accuracy: 0.001)
+        XCTAssertEqual(snapshot.availableBalance(currency: "CNY"), 10.31, accuracy: 0.001)
+    }
+
+    func testBalanceKeepsCurrenciesSeparate() {
+        let snapshot = DeepSeekSnapshot(
+            fetchedAt: Date(), profileID: "Default", profileName: "Default",
+            wallets: [
+                .init(kind: .normal, currency: "CNY", balance: 4.30, tokenEstimation: nil),
+                .init(kind: .normal, currency: "USD", balance: 1.25, tokenEstimation: nil),
+                .init(kind: .bonus, currency: "CNY", balance: 5.81, tokenEstimation: nil)
+            ],
+            totalCosts: [], usage: .init(currency: "CNY", days: [])
+        )
+        XCTAssertEqual(snapshot.balance(kind: .normal, currency: "USD"), 1.25, accuracy: 0.001)
+        XCTAssertEqual(snapshot.balance(kind: .bonus, currency: "USD"), 0, accuracy: 0.001)
+        XCTAssertEqual(snapshot.availableBalance(currency: "USD"), 1.25, accuracy: 0.001)
+        XCTAssertEqual(snapshot.availableBalance(currency: "CNY"), 10.11, accuracy: 0.001)
+    }
+
+    /// 赠送钱包缺失（数组为空）时按 0 显示，而不是让面板三卡缺一格。
+    func testBalanceWithoutBonusWalletsIsZero() {
+        let snapshot = DeepSeekSnapshot(
+            fetchedAt: Date(), profileID: "Default", profileName: "Default",
+            wallets: [.init(kind: .normal, currency: "CNY", balance: 4.30, tokenEstimation: nil)],
+            totalCosts: [], usage: .init(currency: "CNY", days: [])
+        )
+        XCTAssertEqual(snapshot.balance(kind: .bonus, currency: "CNY"), 0, accuracy: 0.001)
+        XCTAssertEqual(snapshot.availableBalance(currency: "CNY"), 4.30, accuracy: 0.001)
+    }
 }
