@@ -43,6 +43,8 @@ final class CodeBuddyPanelSection: NSView {
         usageLine.insertArrangedSubview(spacer, at: 1)
 
         resetCards.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
+        // 奖励包可能堆积几十个历史包：明细卡封顶后卡内滚动，避免展开撑出屏幕
+        resetCards.maxCardListHeight = Self.maxCardListHeight
 
         let stack = NSStackView(views: [header, usageLine, planBar, resetCards])
         stack.orientation = .vertical
@@ -66,6 +68,9 @@ final class CodeBuddyPanelSection: NSView {
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
+
+    /// 奖励包明细卡的最大高度；超过后在卡内滚动。
+    private static let maxCardListHeight: CGFloat = 220
 
     func apply(snapshot: CodeBuddySnapshot?, isRefreshing: Bool, error: String?) {
         header.setRefreshing(isRefreshing)
@@ -116,7 +121,9 @@ final class CodeBuddyPanelSection: NSView {
             planBar.configure(percent: nil)
         }
 
-        resetCards.configure(chips: Self.chips(paid: snapshot.paidPackages, free: snapshot.freePackages))
+        // 奖励包到期即失效：过期条目不再进面板，避免历史包挤占列表
+        let activeFreePackages = snapshot.freePackages.filter { !$0.isExpired() }
+        resetCards.configure(chips: Self.chips(paid: snapshot.paidPackages, free: activeFreePackages))
     }
 
     /// 购买积分与奖励包 chips：空态显示“无资源包”；有包时计数 + 展开明细。

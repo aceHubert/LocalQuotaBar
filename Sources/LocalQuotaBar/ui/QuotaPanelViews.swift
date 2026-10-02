@@ -654,6 +654,8 @@ final class ResetCardsRow: NSView {
     /// 展开状态变化会引起高度变化，宿主据此刷新 popover contentSize。
     var onContentHeightChange: (() -> Void)?
     var onReset: ((String) -> Void)?
+    /// 明细卡内容最大高度；内容超出后在卡内滚动，nil 不限制（内容不足时仍按实际高度自适应）。
+    var maxCardListHeight: CGFloat?
 
     private var chips: [Chip] = []
     private var expandedIDs: Set<String> = []
@@ -905,14 +907,42 @@ final class ResetCardsRow: NSView {
         stack.alignment = .leading
         stack.spacing = 0
         stack.translatesAutoresizingMaskIntoConstraints = false
-        card.addSubview(stack)
 
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 9),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -9),
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 4),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -4)
-        ])
+        if let maxHeight = maxCardListHeight {
+            // 长明细封顶在固定高度内滚动；底部约束用可让优先级：
+            // 内容矮于上限时把 scroll view 撑到内容高度，超出上限时让位给 maxHeight 进入滚动。
+            let scroll = NSScrollView()
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            scroll.borderType = .noBorder
+            scroll.drawsBackground = false
+            scroll.hasVerticalScroller = true
+            scroll.autohidesScrollers = true
+            scroll.verticalScrollElasticity = .allowed
+            scroll.documentView = stack
+            card.addSubview(scroll)
+
+            NSLayoutConstraint.activate([
+                scroll.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 9),
+                scroll.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -9),
+                scroll.topAnchor.constraint(equalTo: card.topAnchor, constant: 4),
+                scroll.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -4),
+                scroll.heightAnchor.constraint(lessThanOrEqualToConstant: maxHeight),
+                stack.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+                stack.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+                stack.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
+            ])
+            let fillHeight = stack.bottomAnchor.constraint(lessThanOrEqualTo: scroll.contentView.bottomAnchor)
+            fillHeight.priority = .init(999)
+            fillHeight.isActive = true
+        } else {
+            card.addSubview(stack)
+            NSLayoutConstraint.activate([
+                stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 9),
+                stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -9),
+                stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 4),
+                stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -4)
+            ])
+        }
 
         for (index, item) in chip.cards.enumerated() {
             if index > 0 {

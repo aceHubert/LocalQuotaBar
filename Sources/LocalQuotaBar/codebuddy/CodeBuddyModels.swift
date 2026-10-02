@@ -35,6 +35,11 @@ struct CodeBuddyPackage: Equatable {
     var remainingPercent: Double {
         totalCapacity > 0 ? max(0, min(100, remainCapacity / totalCapacity * 100)) : 0
     }
+    /// 到期时间已过（expiredTime 优先，回退 cycleEndTime）即失效；无到期时间的条目不参与该判断。
+    func isExpired(now: Date = Date()) -> Bool {
+        guard let expiry = expiredTime ?? cycleEndTime else { return false }
+        return expiry <= now
+    }
 }
 
 struct CodeBuddySnapshot: Equatable {

@@ -113,6 +113,39 @@ final class ResetCardsRowTests: XCTestCase {
     }
 
     @MainActor
+    func testMaxCardListHeightCapsExpandedListWithScrollableContent() throws {
+        let (window, row) = makeHostedRow()
+        defer { window.close() }
+        row.maxCardListHeight = 60
+        row.configure(chips: [makeChip(
+            id: "free",
+            expiries: [Date(), Date(), Date(), Date(), Date(), Date()]
+        )])
+        try clickChip("free", in: row)
+        layout(window)
+
+        // 明细卡被 220pt 类上限封顶：card 高度 = 上限 + 上下 4pt 内边距
+        let cap: CGFloat = 60
+        let card = try XCTUnwrap(descendants(of: row).compactMap { $0 as? PanelCardView }.first)
+        XCTAssertLessThanOrEqual(card.frame.height, cap + 8.5, "card.frame=\(card.frame)")
+        // documentView 高于视口 → 内容进入滚动而不是裁切
+        let scroll = try XCTUnwrap(descendants(of: row).compactMap { $0 as? NSScrollView }.first)
+        let documentHeight = scroll.documentView?.frame.height ?? 0
+        XCTAssertGreaterThan(documentHeight, scroll.contentView.frame.height + 20,
+                             "document=\(documentHeight) viewport=\(scroll.contentView.frame.height)")
+        // 六行明细全部仍在视图层级中（滚动可见而非丢弃）
+        XCTAssertEqual(visibleCardNumbers(in: row).count, 6)
+
+        // 不设上限的实例保持旧行为：无滚动容器，按内容自然撑高
+        let (uncappedWindow, uncappedRow) = makeHostedRow()
+        defer { uncappedWindow.close() }
+        uncappedRow.configure(chips: [makeChip(id: "free", expiries: Array(repeating: Date(), count: 6))])
+        try clickChip("free", in: uncappedRow)
+        layout(uncappedWindow)
+        XCTAssertTrue(descendants(of: uncappedRow).compactMap { $0 as? NSScrollView }.isEmpty)
+    }
+
+    @MainActor
     private func makeHostedRow() -> (NSWindow, ResetCardsRow) {
         _ = NSApplication.shared
         // 使用与实际面板一致的内容宽度，确保跨视图约束和真实布局均被执行。

@@ -128,6 +128,56 @@ final class CodeBuddyParsingTests: XCTestCase {
 
     // MARK: - 面板口径
 
+    func testIsExpiredUsesExpiredTimeAndFallsBackToCycleEndTime() {
+        let now = Date()
+        func package(expiredTime: Date?, cycleEndTime: Date?) -> CodeBuddyPackage {
+            CodeBuddyPackage(
+                group: .free, packageCode: "REWARD", resourceID: nil,
+                totalCapacity: 100, remainCapacity: 100, inUsage: false,
+                cycleEndTime: cycleEndTime, expiredTime: expiredTime
+            )
+        }
+        // 无任何到期时间的条目不参与过期判断
+        XCTAssertFalse(package(expiredTime: nil, cycleEndTime: nil).isExpired(now: now))
+        XCTAssertTrue(package(expiredTime: now.addingTimeInterval(-60), cycleEndTime: nil).isExpired(now: now))
+        XCTAssertFalse(package(expiredTime: now.addingTimeInterval(60), cycleEndTime: nil).isExpired(now: now))
+        // 无 expiredTime 时回退 cycleEndTime
+        XCTAssertTrue(package(expiredTime: nil, cycleEndTime: now.addingTimeInterval(-60)).isExpired(now: now))
+        XCTAssertFalse(package(expiredTime: nil, cycleEndTime: now.addingTimeInterval(60)).isExpired(now: now))
+        // expiredTime 优先于 cycleEndTime
+        XCTAssertFalse(package(
+            expiredTime: now.addingTimeInterval(60),
+            cycleEndTime: now.addingTimeInterval(-60)
+        ).isExpired(now: now))
+    }
+
+    @MainActor
+    func testPanelFiltersExpiredFreePackages() async throws {
+        _ = NSApplication.shared
+        let section = CodeBuddyPanelSection()
+        let expired = CodeBuddyPackage(
+            group: .free, packageCode: "REWARD", resourceID: "r-1",
+            totalCapacity: 300, remainCapacity: 100, inUsage: false,
+            cycleEndTime: nil, expiredTime: Date().addingTimeInterval(-86_400)
+        )
+        let active = CodeBuddyPackage(
+            group: .free, packageCode: "REWARD", resourceID: "r-2",
+            totalCapacity: 200, remainCapacity: 150, inUsage: false,
+            cycleEndTime: nil, expiredTime: Date().addingTimeInterval(3 * 86_400)
+        )
+        let snapshot = CodeBuddySnapshot(
+            fetchedAt: Date(), region: "international",
+            profileID: "Default", profileName: "Default",
+            planName: "体验版", planPackage: nil,
+            paidPackages: [], freePackages: [expired, active]
+        )
+        section.apply(snapshot: snapshot, isRefreshing: false, error: nil)
+
+        let titles = descendants(of: section).compactMap { $0 as? NSButton }.map(\.title)
+        XCTAssertTrue(titles.contains { $0.hasPrefix("奖励包 ×1 · 150/200") }, "titles=\(titles)")
+        XCTAssertFalse(titles.contains { $0.contains("100/300") }, "过期奖励包不进面板 titles=\(titles)")
+    }
+
     @MainActor
     func testPanelRendersPlanBarAndPackageChips() async throws {
         _ = NSApplication.shared

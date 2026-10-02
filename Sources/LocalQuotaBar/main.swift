@@ -2764,7 +2764,8 @@ final class QuotaViewController: NSViewController {
             if let planName = snapshot.planName {
                 parts.append(planName)
             }
-            let packages = snapshot.paidPackages + snapshot.freePackages
+            // 资源包合计与面板同口径：过期奖励包不再计入
+            let packages = snapshot.paidPackages + snapshot.freePackages.filter { !$0.isExpired() }
             if !packages.isEmpty {
                 let remain = packages.reduce(0.0) { $0 + $1.remainCapacity }
                 let total = packages.reduce(0.0) { $0 + $1.totalCapacity }

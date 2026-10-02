@@ -2,6 +2,30 @@ import Foundation
 
 // MARK: - CodeBuddy 个人中心资源接口（国际版 www.codebuddy.ai / 国内版 www.codebuddy.cn）
 
+/// 本机 Chrome 版本检测：会话 Cookie 绑定登录浏览器的 UA 版本，
+/// 网关按 UA 版本校验会话（Chrome 升级后旧版本号会被判 401），因此 UA 不能写死版本。
+enum CodeBuddyChromeVersion {
+    /// Chrome 稳定版常见安装位置（系统与用户 Applications）。
+    static var appBundlePaths: [String] {
+        [
+            "/Applications/Google Chrome.app",
+            NSHomeDirectory() + "/Applications/Google Chrome.app"
+        ]
+    }
+
+    /// 读取本机 Chrome 主版本号（如 "154.0.8037.58" → "154"）；未安装或读取失败返回 nil。
+    static func majorVersion(bundlePaths: [String] = appBundlePaths) -> String? {
+        for path in bundlePaths {
+            guard let bundle = Bundle(url: URL(fileURLWithPath: path)),
+                  let shortVersion = bundle.infoDictionary?["CFBundleShortVersionString"] as? String,
+                  let major = shortVersion.split(separator: ".").first,
+                  !major.isEmpty else { continue }
+            return String(major)
+        }
+        return nil
+    }
+}
+
 /// 统一资源接口请求（主套餐 + 购买积分 + 奖励包一次返回）。Cookie 只在当次请求内存中使用。
 final class CodeBuddyClient {
     struct Endpoints {
@@ -40,11 +64,22 @@ final class CodeBuddyClient {
     private let endpoints: Endpoints
     private let session: URLSession
     private let now: () -> Date
+    private let chromeMajorVersion: () -> String?
 
-    init(endpoints: Endpoints = Endpoints(), session: URLSession = .shared, now: @escaping () -> Date = Date.init) {
+    /// 检测失败（Chrome 不在标准路径）时的兜底版本号，仅保证请求可发出；
+    /// 与本机 Chrome 实际版本不一致仍会被网关判 401。
+    static let fallbackChromeMajorVersion = "154"
+
+    init(
+        endpoints: Endpoints = Endpoints(),
+        session: URLSession = .shared,
+        now: @escaping () -> Date = Date.init,
+        chromeMajorVersion: @escaping () -> String? = { CodeBuddyChromeVersion.majorVersion() }
+    ) {
         self.endpoints = endpoints
         self.session = session
         self.now = now
+        self.chromeMajorVersion = chromeMajorVersion
     }
 
     /// 一次完整刷新：统一资源接口返回主套餐、购买积分和奖励包。
@@ -92,7 +127,18 @@ final class CodeBuddyClient {
         ]
     }
 
+    /// UA 与 sec-ch-ua 的版本号必须与本机 Chrome 一致（会话绑定登录浏览器的 UA 版本）。
+    static func userAgentString(chromeMajor: String) -> String {
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/\(chromeMajor).0.0.0 Safari/537.36"
+    }
+
+    /// sec-ch-ua 结构对齐 Chrome 实际发送（Chromium / Google Chrome 同版本 + GREASE 品牌）。
+    static func secCHUAString(chromeMajor: String) -> String {
+        "\"Chromium\";v=\"\(chromeMajor)\", \"Google Chrome\";v=\"\(chromeMajor)\", \"Not A(Brand\";v=\"99\""
+    }
+
     private func post(_ url: URL, cookieHeader: String, body: [String: Any]) async throws -> [String: Any] {
+        let chromeMajor = chromeMajorVersion() ?? Self.fallbackChromeMajorVersion
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -100,15 +146,12 @@ final class CodeBuddyClient {
         request.setValue("web", forHTTPHeaderField: "X-Client-Platform")
         request.setValue(endpoints.referer, forHTTPHeaderField: "Referer")
         // APISIX 对 Web 请求会检查一组浏览器上下文头；这些值不包含凭证。
-        request.setValue(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
-            forHTTPHeaderField: "User-Agent"
-        )
+        request.setValue(Self.userAgentString(chromeMajor: chromeMajor), forHTTPHeaderField: "User-Agent")
         request.setValue("en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7", forHTTPHeaderField: "Accept-Language")
         request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
         request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
         request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
-        request.setValue("\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"", forHTTPHeaderField: "sec-ch-ua")
+        request.setValue(Self.secCHUAString(chromeMajor: chromeMajor), forHTTPHeaderField: "sec-ch-ua")
         request.setValue("?0", forHTTPHeaderField: "sec-ch-ua-mobile")
         request.setValue("\"macOS\"", forHTTPHeaderField: "sec-ch-ua-platform")
         request.setValue(cookieHeader, forHTTPHeaderField: "Cookie")
