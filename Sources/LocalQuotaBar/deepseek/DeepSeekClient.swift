@@ -7,11 +7,13 @@ import Foundation
 final class DeepSeekClient {
     struct Endpoints {
         let summary: URL
+        let invoices: URL
         let usageAmount: URL
         let usageCost: URL
 
         init(base: URL = URL(string: "https://platform.deepseek.com")!) {
             summary = base.appendingPathComponent("api/v0/users/get_user_summary")
+            invoices = base.appendingPathComponent("auth-api/v0/users/get_all_invoice")
             usageAmount = base.appendingPathComponent("api/v0/usage/by_api_key/amount")
             usageCost = base.appendingPathComponent("api/v0/usage/by_api_key/cost")
         }
@@ -46,6 +48,10 @@ final class DeepSeekClient {
         let summaryBody = try await get(endpoints.summary, token: token, query: nil)
         let (wallets, totalCosts) = try DeepSeekSummaryParser.parse(json: summaryBody)
 
+        // 赠送发放明细是补充信息：失败返回空列表，不阻断余额 / 用量快照。
+        let invoicesBody = try? await get(endpoints.invoices, token: token, query: nil)
+        let bonusGrants = invoicesBody.map(DeepSeekInvoiceParser.parse) ?? []
+
         // 主币种：优先有余额的 USD，其次任意有余额币种（与面板余额卡口径一致）
         var balances: [String: Double] = [:]
         for wallet in wallets where wallet.balance > 0 {
@@ -76,7 +82,8 @@ final class DeepSeekClient {
             profileName: profileName,
             wallets: wallets,
             totalCosts: totalCosts,
-            usage: usage
+            usage: usage,
+            bonusGrants: bonusGrants
         )
     }
 

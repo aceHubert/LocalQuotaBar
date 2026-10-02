@@ -211,6 +211,96 @@ final class DeepSeekParsingTests: XCTestCase {
         XCTAssertEqual(calendar.startOfDay(for: window.first!), first)
     }
 
+    // MARK: - 赠送发放明细（get_all_invoice / 有效期）
+
+    /// 实测响应：auth-api 无 biz_code 层，bonus_orders 时间带毫秒与时区偏移。
+    func testInvoiceParserParsesBonusOrdersWithExpiry() throws {
+        let json: [String: Any] = [
+            "code": 0,
+            "data": ["biz_data": ["invoices": ["bonus_orders": [
+                [
+                    "id": "d4621533-55f9", "amount": 6.0, "currency": "CNY",
+                    "bonus_order_status": "ACTIVE",
+                    "inserted_at": "2026-09-30T14:17:18.212000+08:00",
+                    "expires_at": "2026-10-07T14:17:18.176000+08:00"
+                ],
+                [
+                    "id": "expired-1", "amount": "5.00", "currency": "CNY",
+                    "bonus_order_status": "EXPIRED",
+                    "inserted_at": "2026-08-01T09:00:00+00:00",
+                    "expires_at": "2026-08-31T09:00:00+00:00"
+                ],
+                // 无毫秒时间形态 + EXHAUSTED 状态
+                [
+                    "id": "used-1", "amount": 2.5, "currency": "USD",
+                    "bonus_order_status": "EXHAUSTED",
+                    "inserted_at": "2026-09-01T09:00:00+00:00",
+                    "expires_at": "2026-12-31T09:00:00+00:00"
+                ]
+            ]]]]
+        ]
+        let grants = DeepSeekInvoiceParser.parse(json: json)
+        XCTAssertEqual(grants.count, 3)
+        XCTAssertEqual(grants[0].status, .active)
+        XCTAssertEqual(grants[0].amount, 6.0, accuracy: 0.001)
+        XCTAssertEqual(grants[0].currency, "CNY")
+        XCTAssertEqual(
+            grants[0].expiresAt?.timeIntervalSince1970 ?? 0,
+            date("2026-10-07 14:17:18").addingTimeInterval(0.176).timeIntervalSince1970,
+            accuracy: 1
+        )
+        XCTAssertEqual(grants[1].status, .expired)
+        XCTAssertEqual(grants[2].status, .exhausted)
+    }
+
+    /// 缺 invoices 节点 / 缺字段不致命：返回空或跳过该条。
+    func testInvoiceParserToleratesMissingNodesAndFields() {
+        XCTAssertTrue(DeepSeekInvoiceParser.parse(json: [:]).isEmpty)
+        XCTAssertTrue(DeepSeekInvoiceParser.parse(json: ["code": 1, "msg": "fail"]).isEmpty)
+        let json: [String: Any] = [
+            "data": ["biz_data": ["invoices": ["bonus_orders": [
+                ["amount": 6.0, "currency": "CNY"],  // 缺 expires_at：保留，时间为 nil
+                ["currency": "CNY"]                  // 缺 amount：跳过
+            ]]]]
+        ]
+        let grants = DeepSeekInvoiceParser.parse(json: json)
+        XCTAssertEqual(grants.count, 1)
+        XCTAssertNil(grants[0].expiresAt)
+        XCTAssertNil(grants[0].effectiveAt)
+    }
+
+    /// 未知状态按已失效处理，不会被当成可用余额展示。
+    func testInvoiceParserMapsUnknownStatusToExpired() {
+        let json: [String: Any] = [
+            "data": ["biz_data": ["invoices": ["bonus_orders": [
+                ["id": "x", "amount": 1, "currency": "CNY", "bonus_order_status": "FROZEN"]
+            ]]]]
+        ]
+        XCTAssertEqual(DeepSeekInvoiceParser.parse(json: json).first?.status, .expired)
+    }
+
+    /// 过期 / 耗尽过滤 + 按到期时间升序（最先到期的排最前）。
+    func testActiveBonusGrantsFiltersAndSortsByExpiry() {
+        let snapshot = DeepSeekSnapshot(
+            fetchedAt: Date(), profileID: "Default", profileName: "Default",
+            wallets: [], totalCosts: [], usage: .init(currency: "CNY", days: []),
+            bonusGrants: [
+                .init(id: "late", currency: "CNY", amount: 6, status: .active,
+                      effectiveAt: nil, expiresAt: date("2026-12-31 00:00:00")),
+                .init(id: "early", currency: "CNY", amount: 3, status: .active,
+                      effectiveAt: nil, expiresAt: date("2026-10-07 00:00:00")),
+                .init(id: "gone", currency: "CNY", amount: 9, status: .expired,
+                      effectiveAt: nil, expiresAt: date("2026-08-31 00:00:00")),
+                .init(id: "spent", currency: "CNY", amount: 4, status: .exhausted,
+                      effectiveAt: nil, expiresAt: date("2026-11-30 00:00:00"))
+            ]
+        )
+        let active = snapshot.activeBonusGrants
+        XCTAssertEqual(active.map(\.id), ["early", "late"])
+        // 已过期 / 已耗尽不进明细，金额也不参与任何合计
+        XCTAssertFalse(active.contains { $0.id == "gone" || $0.id == "spent" })
+    }
+
     // MARK: - 快照口径
 
     func testSnapshotPicksPrimaryCurrencyAndSumsBalances() {

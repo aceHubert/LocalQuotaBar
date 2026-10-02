@@ -29,6 +29,35 @@ struct DeepSeekCost: Equatable {
     let amount: Double
 }
 
+/// 赠送发放明细（get_all_invoice 的 bonus_orders，对齐平台「赠送账单」口径）。
+/// amount 是发放金额而非剩余金额：剩余以赠送余额卡为准（平台会随消耗扣减）。
+struct DeepSeekBonusGrant: Equatable {
+    /// 平台 bonus_order_status 枚举；未知值按已失效处理（宁可不展示，不误标可用）。
+    enum Status: Equatable {
+        case active
+        case expired
+        case exhausted
+
+        init(_ rawValue: String?) {
+            switch rawValue {
+            case "ACTIVE": self = .active
+            case "EXPIRED": self = .expired
+            case "EXHAUSTED": self = .exhausted
+            default: self = .expired
+            }
+        }
+    }
+
+    let id: String
+    let currency: String
+    let amount: Double
+    let status: Status
+    /// 发放 / 生效时间（inserted_at）。
+    let effectiveAt: Date?
+    /// 有效期至（expires_at）。
+    let expiresAt: Date?
+}
+
 /// 单日用量聚合（本地自然日；tokens = HIT + MISS + RESPONSE，requests = REQUEST 计数）。
 struct DeepSeekDailyUsage: Equatable {
     let date: Date
@@ -55,6 +84,15 @@ struct DeepSeekSnapshot: Equatable {
     let wallets: [DeepSeekWallet]
     let totalCosts: [DeepSeekCost]
     let usage: DeepSeekUsageSummary
+    /// 赠送发放明细原始列表（含已过期 / 已耗尽）；展示口径见 activeBonusGrants。
+    var bonusGrants: [DeepSeekBonusGrant] = []
+
+    /// 生效中的赠送发放明细（已过期 / 已耗尽过滤，按到期时间升序——最先到期的排最前）。
+    var activeBonusGrants: [DeepSeekBonusGrant] {
+        bonusGrants
+            .filter { $0.status == .active }
+            .sorted { ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture) }
+    }
 
     /// 可用余额（充值 + 赠送）按币种求和。
     var balancesByCurrency: [String: Double] {
@@ -210,6 +248,43 @@ enum DeepSeekSummaryParser {
         return (wallets, costs.map { DeepSeekCost(currency: $0.key, amount: $0.value) }
             .sorted { $0.currency < $1.currency })
     }
+}
+
+enum DeepSeekInvoiceParser {
+    /// 解析 get_all_invoice（auth-api 信封无 biz_code 层）：只取 bonus_orders 发放明细。
+    /// 解析失败或缺节点返回空数组——账单是补充信息，不构成快照失败。
+    static func parse(json: [String: Any]) -> [DeepSeekBonusGrant] {
+        let data = DeepSeekJSON.object(json["data"])
+        let bizData = DeepSeekJSON.object(data?["biz_data"])
+        let invoices = DeepSeekJSON.object(bizData?["invoices"])
+        return (DeepSeekJSON.array(invoices?["bonus_orders"]) ?? []).compactMap { entry in
+            guard let currency = DeepSeekJSON.string(entry["currency"])?.uppercased(),
+                  let amount = DeepSeekJSON.number(entry["amount"]) else { return nil }
+            return DeepSeekBonusGrant(
+                id: DeepSeekJSON.string(entry["id"]) ?? "",
+                currency: currency,
+                amount: amount,
+                status: DeepSeekBonusGrant.Status(DeepSeekJSON.string(entry["bonus_order_status"])),
+                effectiveAt: parseDate(DeepSeekJSON.string(entry["inserted_at"])),
+                expiresAt: parseDate(DeepSeekJSON.string(entry["expires_at"]))
+            )
+        }
+    }
+
+    /// ISO8601 时间：实测带毫秒与时区偏移（2026-09-30T14:17:18.212000+08:00），兼容无毫秒形态。
+    static func parseDate(_ value: String?) -> Date? {
+        guard let value else { return nil }
+        if let date = fractionalFormatter.date(from: value) { return date }
+        return plainFormatter.date(from: value)
+    }
+
+    private static let fractionalFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+
+    private static let plainFormatter = ISO8601DateFormatter()
 }
 
 enum DeepSeekUsageParser {

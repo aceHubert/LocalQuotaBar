@@ -22,7 +22,10 @@ final class DeepSeekPanelSection: NSView {
     let rechargeCard = MetricCardView()
     let totalCostCard = MetricCardView()
     let bonusCard = MetricCardView()
+    let bonusDetailCard = BonusGrantDetailView()
     let costChart = DeepSeekCostChartView()
+    /// 赠送有效期明细展开状态；刷新后无生效明细时自动收起。
+    private var isBonusDetailExpanded = false
 
     init() {
         super.init(frame: .zero)
@@ -47,7 +50,7 @@ final class DeepSeekPanelSection: NSView {
 
         costChart.onContentHeightChange = { [weak self] in self?.onContentHeightChange?() }
 
-        let stack = NSStackView(views: [header, profileHint, metricsRow, costChart])
+        let stack = NSStackView(views: [header, profileHint, metricsRow, bonusDetailCard, costChart])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 7
@@ -60,6 +63,7 @@ final class DeepSeekPanelSection: NSView {
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
             metricsRow.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            bonusDetailCard.widthAnchor.constraint(equalTo: stack.widthAnchor),
             costChart.widthAnchor.constraint(equalTo: stack.widthAnchor),
             // 宽度钉常量与 Codex/ZAI 区块同款，避免宽度链自引用产生歧义解。
             stack.widthAnchor.constraint(equalToConstant: PanelTheme.contentWidth)
@@ -95,6 +99,8 @@ final class DeepSeekPanelSection: NSView {
         // 首次成功前（含首刷中 / 首刷失败）没有任何历史数据：只显示头部状态，不渲染内容区占位
         guard let snapshot else {
             metricsRow.isHidden = true
+            bonusDetailCard.isHidden = true
+            isBonusDetailExpanded = false
             costChart.isHidden = true
             profileHint.isHidden = true
             return
@@ -137,14 +143,28 @@ final class DeepSeekPanelSection: NSView {
 
             var bonusTooltip = "赠送余额（\(currency)）：\(symbol)\(Self.amountText(bonus))"
             bonusTooltip += otherCurrenciesText(snapshot, kind: .bonus, primary: currency)
+
+            // 有效期明细对齐官方「查看有效期」：ⓘ 点击在下方展开，过期 / 耗尽条目不展示
+            let grants = snapshot.activeBonusGrants
+            if grants.isEmpty {
+                isBonusDetailExpanded = false
+                bonusDetailCard.isHidden = true
+            } else {
+                bonusTooltip += "\n点击 ⓘ 查看有效期明细"
+                bonusCard.onInfoTap = { [weak self] in self?.toggleBonusDetail() }
+            }
+            bonusDetailCard.configure(grants: grants)
             bonusCard.configure(
                 label: "赠送余额",
                 valueText: "\(symbol)\(Self.amountText(bonus))",
-                tooltip: bonusTooltip
+                tooltip: bonusTooltip,
+                showsInfoButton: !grants.isEmpty
             )
         } else {
             rechargeCard.configure(label: "充值余额", valueText: nil, tooltip: nil)
             bonusCard.configure(label: "赠送余额", valueText: nil, tooltip: nil)
+            isBonusDetailExpanded = false
+            bonusDetailCard.isHidden = true
         }
 
         let costsByCurrency = Dictionary(uniqueKeysWithValues: snapshot.totalCosts.map { ($0.currency, $0.amount) })
@@ -166,6 +186,13 @@ final class DeepSeekPanelSection: NSView {
         } else {
             totalCostCard.configure(label: "累计消费金额", valueText: nil, tooltip: nil)
         }
+    }
+
+    /// 展开 / 收起赠送有效期明细；高度变化上报宿主刷新 popover contentSize。
+    private func toggleBonusDetail() {
+        isBonusDetailExpanded.toggle()
+        bonusDetailCard.isHidden = !isBonusDetailExpanded
+        onContentHeightChange?()
     }
 
     /// 非主币种的同类钱包余额（逐条列出，避免主币种口径把其他币种的钱藏起来）。
@@ -197,8 +224,12 @@ final class DeepSeekPanelSection: NSView {
 final class MetricCardView: NSView {
     private let titleLabel = NSTextField(labelWithString: "")
     private let valueLabel = NSTextField(labelWithString: "")
+    /// 标题行尾部的 ⓘ 按钮（赠送余额「查看有效期」入口），默认隐藏。
+    private let infoButton: NSButton
+    var onInfoTap: (() -> Void)?
 
     init() {
+        infoButton = NSButton(image: NSImage(), target: nil, action: nil)
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
@@ -215,7 +246,23 @@ final class MetricCardView: NSView {
         valueLabel.lineBreakMode = .byTruncatingTail
         valueLabel.maximumNumberOfLines = 1
 
-        let stack = NSStackView(views: [titleLabel, valueLabel])
+        infoButton.isBordered = false
+        infoButton.bezelStyle = .regularSquare
+        let config = NSImage.SymbolConfiguration(pointSize: 10, weight: .regular)
+        infoButton.image = NSImage(systemSymbolName: "info.circle", accessibilityDescription: "查看有效期")?
+            .withSymbolConfiguration(config)
+        infoButton.contentTintColor = PanelTheme.tertiaryText
+        infoButton.toolTip = "查看有效期"
+        infoButton.target = self
+        infoButton.action = #selector(infoTapped)
+        infoButton.isHidden = true
+
+        let titleRow = NSStackView(views: [titleLabel, infoButton])
+        titleRow.orientation = .horizontal
+        titleRow.alignment = .centerY
+        titleRow.spacing = 3
+
+        let stack = NSStackView(views: [titleRow, valueLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 4
@@ -234,11 +281,121 @@ final class MetricCardView: NSView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func configure(label: String, valueText: String?, tooltip: String?) {
+    @objc private func infoTapped() {
+        onInfoTap?()
+    }
+
+    func configure(label: String, valueText: String?, tooltip: String?, showsInfoButton: Bool = false) {
         titleLabel.stringValue = label
         valueLabel.stringValue = valueText ?? "--"
         valueLabel.textColor = valueText == nil ? PanelTheme.tertiaryText : PanelTheme.primaryText
         toolTip = tooltip
+        infoButton.isHidden = !showsInfoButton
+    }
+}
+
+// MARK: - 赠送有效期明细卡（ⓘ 展开，视觉对齐重置卡明细列表）
+
+/// 生效中的赠送发放明细；已过期 / 已耗尽条目在快照层已过滤，不进入此视图。
+final class BonusGrantDetailView: NSView {
+    private(set) var isEmpty = true
+    private let stack = NSStackView()
+
+    init() {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.backgroundColor = PanelTheme.cardBackground.cgColor
+        layer?.borderWidth = 1
+        layer?.borderColor = PanelTheme.hairlineSubtle.cgColor
+        isHidden = true
+
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 0
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 4),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4)
+        ])
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func configure(grants: [DeepSeekBonusGrant]) {
+        stack.arrangedSubviews.forEach { stack.removeView($0) }
+        isEmpty = grants.isEmpty
+        // 最先到期的排最前（快照已排序），行样式与重置卡明细同语言
+        for (index, grant) in grants.enumerated() {
+            if index > 0 {
+                let divider = NSBox()
+                divider.boxType = .separator
+                divider.alphaValue = 0.3
+                divider.translatesAutoresizingMaskIntoConstraints = false
+                stack.addArrangedSubview(divider)
+                divider.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+            }
+            let row = makeRow(index: index, grant: grant)
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
+    }
+
+    private func makeRow(index: Int, grant: DeepSeekBonusGrant) -> NSView {
+        let indexLabel = NSTextField(labelWithString: "#\(index + 1)")
+        indexLabel.font = .systemFont(ofSize: 9.5, weight: .bold)
+        indexLabel.textColor = PanelTheme.tertiaryText
+
+        let symbol = DeepSeekSnapshot.currencySymbol(grant.currency)
+        let amountLabel = NSTextField(labelWithString: "\(symbol)\(Self.amountText(grant.amount))")
+        amountLabel.font = .monospacedDigitSystemFont(ofSize: 9.5, weight: .semibold)
+        amountLabel.textColor = PanelTheme.primaryText
+
+        // 发放日期取自然日；精确时刻放行 tooltip
+        var effectiveText = ""
+        if let effectiveAt = grant.effectiveAt {
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "zh_CN")
+            formatter.dateFormat = "M/d 发放"
+            effectiveText = formatter.string(from: effectiveAt)
+        }
+        let effectiveLabel = NSTextField(labelWithString: effectiveText)
+        effectiveLabel.font = .systemFont(ofSize: 9.5, weight: .regular)
+        effectiveLabel.textColor = PanelTheme.tertiaryText
+        effectiveLabel.isHidden = effectiveText.isEmpty
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        let badge = PanelBadgeLabel()
+        let (text, soon) = PanelTheme.cardExpiryBadge(grant.expiresAt)
+        badge.configure(text: text, soon: soon)
+
+        let row = NSStackView(views: [indexLabel, amountLabel, effectiveLabel, spacer, badge])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.heightAnchor.constraint(equalToConstant: 20).isActive = true
+
+        var tooltip = "\(grant.currency) \(Self.amountText(grant.amount))"
+        if let expiresAt = grant.expiresAt {
+            tooltip += " · 有效期至 \(PanelTheme.formatCardExpiry(expiresAt))"
+        }
+        row.toolTip = tooltip
+        return row
+    }
+
+    private static func amountText(_ amount: Double) -> String {
+        String(format: "%.2f", amount)
     }
 }
 
