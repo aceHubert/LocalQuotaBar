@@ -2,7 +2,14 @@ name: Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号，如 0.2.0；留空则按提交类型自动递增"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -12,18 +19,81 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    runs-on: macos-latest
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      skip: ${{ steps.version.outputs.skip }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 计算版本号
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # 手动推送 tag：版本号取自 tag 名
+            VERSION="${GITHUB_REF_NAME#v}"
+            SKIP=false
+          elif [[ -n "$INPUT_VERSION" ]]; then
+            # 手动触发：使用输入版本号
+            VERSION="${INPUT_VERSION#v}"
+            SKIP=false
+          else
+            LAST=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+            if [[ -z "$LAST" ]]; then
+              VERSION="0.1.0"
+              SKIP=false
+            else
+              RANGE="$LAST..HEAD"
+              # 只改 docs 或 markdown 的提交不发布
+              CODE_FILES=$(git diff --name-only "$RANGE" | grep -vE "^docs/|\.md$" || true)
+              if [[ -z "$CODE_FILES" ]]; then
+                VERSION=""
+                SKIP=true
+              else
+                if git log --format="%s" "$RANGE" | grep -qE "^[a-zA-Z]+(\([^)]*\))?!:"; then
+                  BUMP=major
+                elif git log --format="%s" "$RANGE" | grep -qE "^feat(\([^)]*\))?:"; then
+                  BUMP=minor
+                else
+                  BUMP=patch
+                fi
+                IFS="." read -r MA MI PA <<< "${LAST#v}"
+                case "$BUMP" in
+                  major) VERSION="$((MA+1)).0.0" ;;
+                  minor) VERSION="$MA.$((MI+1)).0" ;;
+                  *) VERSION="$MA.$MI.$((PA+1))" ;;
+                esac
+                SKIP=false
+              fi
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: prepare
+    if: needs.prepare.outputs.skip != "true"
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Build app
         run: make app
 
       - name: Inject version, sign and package
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
           APP=".build/release/LocalQuotaBar.app"
           plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
           plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$APP/Contents/Info.plist"
@@ -33,6 +103,8 @@ jobs:
       - name: Create release and upload artifact
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
           files: LocalQuotaBar-*.zip
           generate_release_notes: true
           fail_on_unmatched_files: true
