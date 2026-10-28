@@ -1,0 +1,14 @@
+.github/workflows/release.yml
+  h_8158b585b672a3 5,7-12,22-79,81-82,84-85,89-90,106-107
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6166f879da58fc4981b43e7bcf2a2ada64262a7b",
+  "prompts": {},
+  "humans": {
+    "h_8158b585b672a3": {
+      "author": "hubert <hubert@lejian.com>"
+    }
+  }
+}
