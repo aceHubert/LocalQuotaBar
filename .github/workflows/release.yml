@@ -79,7 +79,7 @@ jobs:
 
   release:
     needs: prepare
-    if: needs.prepare.outputs.skip != "true"
+    if: needs.prepare.outputs.skip != 'true'
     runs-on: macos-latest
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
