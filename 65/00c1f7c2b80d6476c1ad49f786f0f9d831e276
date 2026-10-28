@@ -1,0 +1,16 @@
+.github/workflows/auto-tag.yml
+  h_8158b585b672a3 1-74
+.github/workflows/release.yml
+  h_8158b585b672a3 8-11,16,18-19,25-26,31-32,39,49
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6500c1f7c2b80d6476c1ad49f786f0f9d831e276",
+  "prompts": {},
+  "humans": {
+    "h_8158b585b672a3": {
+      "author": "hubert <hubert@lejian.com>"
+    }
+  }
+}
