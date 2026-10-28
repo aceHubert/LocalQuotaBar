@@ -1,0 +1,14 @@
+docs/histories/2026-10/20261028-1144-release-auto-version.md
+  h_8158b585b672a3 1-48
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "7b5fd2c8f511e08ea6cd9906a33a376278cb49f7",
+  "prompts": {},
+  "humans": {
+    "h_8158b585b672a3": {
+      "author": "hubert <hubert@lejian.com>"
+    }
+  }
+}
