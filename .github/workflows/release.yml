@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build app
+        run: make app
+
+      - name: Inject version, sign and package
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          APP=".build/release/LocalQuotaBar.app"
+          plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP/Contents/Info.plist"
+          plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$APP/Contents/Info.plist"
+          codesign --force --sign - "$APP"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "LocalQuotaBar-$VERSION.zip"
+
+      - name: Create release and upload artifact
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LocalQuotaBar-*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
