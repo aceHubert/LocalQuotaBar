@@ -1,0 +1,14 @@
+docs/histories/2026-10/20261028-1032-github-release-workflow.md
+  h_8158b585b672a3 1-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2257e5e38c2d25ff95d0a1a918d06bc9794e7fdc",
+  "prompts": {},
+  "humans": {
+    "h_8158b585b672a3": {
+      "author": "hubert <hubert@lejian.com>"
+    }
+  }
+}
