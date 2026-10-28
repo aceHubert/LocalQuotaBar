@@ -1,0 +1,74 @@
+name: Auto Tag
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    env:
+      # secrets 不能直接进 job 级 if，先在 env 固化判断
+      HAS_RELEASE_PAT: ${{ secrets.RELEASE_PAT != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 有 PAT 时用 PAT 推 tag，tag 事件可直接触发 Release 工作流；
+          # secret 缺失时回退 GITHUB_TOKEN 推送（事件不会触发），随后用 gh 主动 dispatch Release。
+          token: ${{ secrets.RELEASE_PAT || github.token }}
+
+      - name: 计算版本并打 tag
+        id: version
+        run: |
+          set -euo pipefail
+          LAST=$(git tag -l "v*" --sort=-v:refname | head -n 1)
+          if [[ -z "$LAST" ]]; then
+            echo "没有可用的 v* tag，跳过。"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          RANGE="$LAST..HEAD"
+          # 只改 docs 或 markdown 的提交不打 tag
+          CODE_FILES=$(git diff --name-only "$RANGE" | grep -vE "^docs/|\.md$" || true)
+          if [[ -z "$CODE_FILES" ]]; then
+            echo "仅 docs/markdown 改动，跳过。"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git log --format="%s" "$RANGE" | grep -qE "^[a-zA-Z]+(\([^)]*\))?!:"; then
+            BUMP=major
+          elif git log --format="%s" "$RANGE" | grep -qE "^feat(\([^)]*\))?:"; then
+            BUMP=minor
+          else
+            BUMP=patch
+          fi
+          IFS="." read -r MA MI PA <<< "${LAST#v}"
+          case "$BUMP" in
+            major) VERSION="$((MA+1)).0.0" ;;
+            minor) VERSION="$MA.$((MI+1)).0" ;;
+            *) VERSION="$MA.$MI.$((PA+1))" ;;
+          esac
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: 无 PAT 时主动触发 Release
+        # GITHUB_TOKEN 推的 tag 不会触发工作流；workflow_dispatch 是防递归的官方例外，GITHUB_TOKEN 也能发起。
+        if: env.HAS_RELEASE_PAT == 'false' && steps.version.outputs.tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run release.yml --ref main -f tag="$RELEASE_TAG"
