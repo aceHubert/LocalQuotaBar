@@ -1081,12 +1081,30 @@ final class ZAIQuotaStore {
         scheduleTimer()
     }
 
+    /// 错峰相位（基准 5 分钟档位下的秒偏移）：ZAI 在 Codex 后 45s。
+    private static let refreshPhaseOffset: TimeInterval = 45
+    /// 相位锚点（store 创建时刻）；改档位重建定时器后相位关系保持不变。
+    private let refreshAnchor = Date()
+
     private func scheduleTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let interval = refreshInterval
+        let fireDelay = RefreshPhasePlanner.nextDelay(
+            offset: Self.refreshPhaseOffset,
+            interval: interval,
+            anchor: refreshAnchor
+        )
+        let timer = Timer(
+            fire: Date(timeIntervalSinceNow: fireDelay),
+            interval: interval,
+            repeats: true
+        ) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh()
             }
         }
+        timer.tolerance = RefreshPhasePlanner.tolerance(for: interval)
+        RunLoop.main.add(timer, forMode: .default)
+        self.timer = timer
     }
 
     // MARK: - zcode 换号 / 配置变化感知

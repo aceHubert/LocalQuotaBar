@@ -17,12 +17,20 @@ final class CodeBuddyStore {
     /// Cookie 候选域名（国际版 codebuddy.ai / 国内版 codebuddy.cn）。
     let domain: String
 
+    /// 错峰相位（基准 5 分钟档位下的秒偏移）：国际版 135s / 国内版 180s，
+    /// 由 AppDelegate 按实例注入。
+    private let phaseOffset: TimeInterval
+    /// 相位锚点（store 创建时刻）；改档位重建定时器后相位关系保持不变。
+    private let refreshAnchor = Date()
+
     init(domain: String = CodeBuddyCookieImporter.internationalDomain,
          client: CodeBuddyClient = CodeBuddyClient(),
-         refreshInterval: TimeInterval = RefreshSettings.load()) {
+         refreshInterval: TimeInterval = RefreshSettings.load(),
+         phaseOffset: TimeInterval = 135) {
         self.domain = domain
         self.client = client
         self.refreshInterval = refreshInterval
+        self.phaseOffset = phaseOffset
     }
 
     func start() {
@@ -43,12 +51,25 @@ final class CodeBuddyStore {
     }
 
     private func scheduleTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let interval = refreshInterval
+        let fireDelay = RefreshPhasePlanner.nextDelay(
+            offset: phaseOffset,
+            interval: interval,
+            anchor: refreshAnchor
+        )
+        let timer = Timer(
+            fire: Date(timeIntervalSinceNow: fireDelay),
+            interval: interval,
+            repeats: true
+        ) { [weak self] _ in
             Task { @MainActor in
                 // 后台周期禁 Keychain UI：授权弹窗无人响应；失败保留缓存提示手动刷新
                 self?.refresh(allowKeychainUI: false)
             }
         }
+        timer.tolerance = RefreshPhasePlanner.tolerance(for: interval)
+        RunLoop.main.add(timer, forMode: .default)
+        self.timer = timer
     }
 
     /// 手动刷新（顶栏）：允许 Keychain 授权弹窗，完成一次授权后后续周期读取即可复用。

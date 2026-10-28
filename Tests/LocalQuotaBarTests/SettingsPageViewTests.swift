@@ -64,10 +64,14 @@ final class SettingsPageViewTests: XCTestCase {
         XCTAssertTrue(changes.isEmpty)
 
         let popups = descendants(of: page).compactMap { $0 as? DarkPopUpButton }
-        let refresh = try XCTUnwrap(popups.first { $0.itemTitles.first == "1 分钟" })
+        // 自动刷新与冷却的档位标题相同（均为 5-60 分钟），按视图顺序区分：
+        // 通用区在前 → 第一个是自动刷新，第二个是冷却。
+        let minutePopups = popups.filter { $0.itemTitles.first == "5 分钟" }
+        XCTAssertEqual(minutePopups.count, 2)
+        let refresh = try XCTUnwrap(minutePopups.first)
         let warning = try XCTUnwrap(popups.first { $0.itemTitles.first == "50%" })
         let reset = try XCTUnwrap(popups.first { $0.itemTitles.contains("关闭") })
-        let cooldown = try XCTUnwrap(popups.first { $0.itemTitles.first == "5 分钟" })
+        let cooldown = try XCTUnwrap(minutePopups.last)
         XCTAssertEqual(popups.count, 4)
 
         refresh.menu?.performActionForItem(at: refresh.indexOfItem(withTitle: "15 分钟"))
@@ -97,7 +101,8 @@ final class SettingsPageViewTests: XCTestCase {
         controller.onReminderConfigurationChange = { saved = $0 }
         let popups = descendants(of: controller.view).compactMap { $0 as? DarkPopUpButton }
         let warning = try XCTUnwrap(popups.first { $0.itemTitles.first == "50%" })
-        let cooldown = try XCTUnwrap(popups.first { $0.itemTitles.first == "5 分钟" })
+        // 自动刷新档位与冷却相同（5 分钟起），设置页内通用区在前，冷却取最后一个
+        let cooldown = try XCTUnwrap(popups.filter { $0.itemTitles.first == "5 分钟" }.last)
         warning.menu?.performActionForItem(at: warning.indexOfItem(withTitle: "20%"))
         // 模拟刷新额度后同步静音状态，不能用旧的30%覆盖刚选的20%。
         controller.setUnmuteButtonVisible(false)

@@ -374,6 +374,7 @@ private struct ParsedWindow {
 enum CodexRateLimitError: LocalizedError {
     case appServerNotFound(String)
     case processLaunchFailed(String)
+    case connectionDropped
     case timeout
     case serverError(String)
     case malformedResponse
@@ -385,6 +386,8 @@ enum CodexRateLimitError: LocalizedError {
             return "找不到 ChatGPT.app 内置的 Codex 可执行文件：\(path)"
         case .processLaunchFailed(let detail):
             return "启动 ChatGPT app-server 失败：\(detail)"
+        case .connectionDropped:
+            return "与 Codex app-server 的连接已断开"
         case .timeout:
             return "读取 ChatGPT app-server 超时"
         case .serverError(let message):
@@ -404,56 +407,32 @@ enum CodexResetOutcome: String {
 }
 
 final class CodexRateLimitClient {
-    let appServerExecutablePath: String
-    let requestTimeout: TimeInterval
+    let session: CodexAppServerSession
 
-    init(
-        appServerExecutablePath: String = CodexAppServerLocator.defaultExecutablePath(),
-        // rateLimits/read 背后有网络请求，延迟波动大（实测 2s ~ 15s+），超时不能太紧。
-        requestTimeout: TimeInterval = 30
-    ) {
-        self.appServerExecutablePath = appServerExecutablePath
-        self.requestTimeout = requestTimeout
+    /// 默认走全应用共享的常驻会话；测试注入独立会话（自选可执行路径与超时）。
+    init(session: CodexAppServerSession = .shared) {
+        self.session = session
     }
 
     func readRateLimits(planType: String?) async throws -> QuotaSnapshot {
-        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
-            let results = try Self.readAppServerResultsBlocking(
-                appServerExecutablePath: appServerExecutablePath,
-                requestTimeout: requestTimeout,
-                shouldReadAccount: false,
-                shouldReadRateLimits: true
-            )
-            return try Self.parseSnapshot(
-                rateLimits: results.rateLimits ?? [:],
-                planType: planType
-            )
+        try await Task.detached(priority: .userInitiated) { [session] in
+            let result = try session.send(id: 3, method: "account/rateLimits/read", params: NSNull())
+            return try Self.parseSnapshot(rateLimits: result, planType: planType)
         }.value
     }
 
     func readAccountPlanType() async throws -> String? {
-        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
-            let results = try Self.readAppServerResultsBlocking(
-                appServerExecutablePath: appServerExecutablePath,
-                requestTimeout: requestTimeout,
-                shouldReadAccount: true,
-                shouldReadRateLimits: false
-            )
-            return results.account.flatMap(Self.planType(from:))
+        try await Task.detached(priority: .userInitiated) { [session] in
+            let result = try session.send(id: 2, method: "account/read", params: [:])
+            return Self.planType(from: result)
         }.value
     }
 
     func consumeRateLimitResetCredit(creditID: String, idempotencyKey: String) async throws -> CodexResetOutcome {
-        try await Task.detached(priority: .userInitiated) { [appServerExecutablePath, requestTimeout] in
+        try await Task.detached(priority: .userInitiated) { [session] in
             let params = try Self.resetCreditParams(creditID: creditID, idempotencyKey: idempotencyKey)
-            let results = try Self.readAppServerResultsBlocking(
-                appServerExecutablePath: appServerExecutablePath,
-                requestTimeout: requestTimeout,
-                shouldReadAccount: false,
-                shouldReadRateLimits: false,
-                resetCreditParams: params
-            )
-            return try Self.parseResetOutcome(results.resetCredit ?? [:])
+            let result = try session.send(id: 4, method: "account/rateLimitResetCredit/consume", params: params)
+            return try Self.parseResetOutcome(result)
         }.value
     }
 
@@ -472,180 +451,6 @@ final class CodexRateLimitClient {
             throw CodexRateLimitError.malformedResponse
         }
         return outcome
-    }
-
-    private struct AppServerResults {
-        let rateLimits: [String: Any]?
-        let account: [String: Any]?
-        let resetCredit: [String: Any]?
-    }
-
-    private static func readAppServerResultsBlocking(
-        appServerExecutablePath: String,
-        requestTimeout: TimeInterval,
-        shouldReadAccount: Bool,
-        shouldReadRateLimits: Bool,
-        resetCreditParams: [String: String]? = nil
-    ) throws -> AppServerResults {
-        guard FileManager.default.isExecutableFile(atPath: appServerExecutablePath) else {
-            throw CodexRateLimitError.appServerNotFound(appServerExecutablePath)
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: appServerExecutablePath)
-        process.arguments = ["app-server", "--listen", "stdio://"]
-
-        let stdinPipe = Pipe()
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardInput = stdinPipe
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        var targetIDs = Set<Int>()
-        if shouldReadAccount { targetIDs.insert(2) }
-        if shouldReadRateLimits { targetIDs.insert(3) }
-        if resetCreditParams != nil { targetIDs.insert(4) }
-        let initializationCollector = JSONLineResponseCollector(targetIDs: [1])
-        let collector = JSONLineResponseCollector(targetIDs: targetIDs)
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty {
-                collector.append(data)
-                initializationCollector.append(data)
-            }
-        }
-
-        // Drain stderr so the child process cannot block if it logs.
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            _ = handle.availableData
-        }
-
-        defer { cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe) }
-
-        do {
-            try process.run()
-        } catch {
-            throw CodexRateLimitError.processLaunchFailed(error.localizedDescription)
-        }
-
-        let initializeMessage: [String: Any] = [
-            "id": 1,
-            "method": "initialize",
-            "params": [
-                "clientInfo": [
-                    "name": "codex_touchbar_quota",
-                    "title": "Codex Touch Bar Quota",
-                    "version": "1.0.0"
-                ]
-            ]
-        ]
-        // app-server 要求客户端先收到 initialize 响应，再发送 initialized 和业务请求。
-        // 旧实现一次性写入所有消息；网络稍慢时业务请求会被服务端拒绝，表现为
-        // “刷新失败”，即使 Codex 客户端自身已经成功更新了余额。
-        try writeJSONLines([initializeMessage], to: stdinPipe.fileHandleForWriting)
-        guard initializationCollector.wait(timeout: requestTimeout) else {
-            throw CodexRateLimitError.timeout
-        }
-        guard let initialized = initializationCollector.response(for: 1) else {
-            throw CodexRateLimitError.malformedResponse
-        }
-        _ = try result(from: initialized)
-
-        var messages: [[String: Any]] = [
-            [
-                "method": "initialized",
-                "params": [:]
-            ]
-        ]
-        if shouldReadAccount {
-            messages.append([
-                "id": 2,
-                "method": "account/read",
-                "params": [:]
-            ])
-        }
-        if shouldReadRateLimits {
-            messages.append([
-                "id": 3,
-                "method": "account/rateLimits/read",
-                "params": NSNull()
-            ])
-        }
-        if let resetCreditParams {
-            messages.append([
-                "id": 4,
-                "method": "account/rateLimitResetCredit/consume",
-                "params": resetCreditParams
-            ])
-        }
-
-        do {
-            try writeJSONLines(messages, to: stdinPipe.fileHandleForWriting)
-        } catch {
-            cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
-            throw error
-        }
-
-        let waitResult = collector.wait(timeout: requestTimeout)
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-
-        guard waitResult else {
-            cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
-            throw CodexRateLimitError.timeout
-        }
-
-        if shouldReadRateLimits, collector.response(for: 3) == nil {
-            cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
-            throw CodexRateLimitError.malformedResponse
-        }
-        if shouldReadAccount, collector.response(for: 2) == nil {
-            cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
-            throw CodexRateLimitError.malformedResponse
-        }
-
-        cleanup(process: process, stdoutPipe: stdoutPipe, stderrPipe: stderrPipe)
-
-        return AppServerResults(
-            rateLimits: try collector.response(for: 3).map(result(from:)),
-            account: try collector.response(for: 2).map(result(from:)),
-            resetCredit: try collector.response(for: 4).map(result(from:))
-        )
-    }
-
-    private static func result(from response: [String: Any]) throws -> [String: Any] {
-        if let error = response["error"] as? [String: Any] {
-            let code = (error["code"] as? NSNumber)?.intValue
-            let message = error["message"] as? String ?? "unknown error"
-            if let code {
-                throw CodexRateLimitError.serverError("\(message) (code \(code))")
-            } else {
-                throw CodexRateLimitError.serverError(message)
-            }
-        }
-
-        guard let result = response["result"] as? [String: Any] else {
-            throw CodexRateLimitError.malformedResponse
-        }
-        return result
-    }
-
-    private static func writeJSONLines(_ messages: [[String: Any]], to handle: FileHandle) throws {
-        for message in messages {
-            let json = try JSONSerialization.data(withJSONObject: message, options: [])
-            handle.write(json)
-            handle.write(Data("\n".utf8))
-        }
-    }
-
-    private static func cleanup(process: Process, stdoutPipe: Pipe, stderrPipe: Pipe) {
-        stdoutPipe.fileHandleForReading.readabilityHandler = nil
-        stderrPipe.fileHandleForReading.readabilityHandler = nil
-        try? (process.standardInput as? Pipe)?.fileHandleForWriting.close()
-        if process.isRunning {
-            process.terminate()
-        }
     }
 
     private static func planType(from account: [String: Any]) -> String? {
@@ -810,54 +615,6 @@ final class CodexRateLimitClient {
     }
 }
 
-private final class JSONLineResponseCollector {
-    private let targetIDs: Set<Int>
-    private let queue = DispatchQueue(label: "local.codex.touchbar.quota.jsonline")
-    private let semaphore = DispatchSemaphore(value: 0)
-    private var buffer = Data()
-    private var storedResponses: [Int: [String: Any]] = [:]
-    private var didSignal = false
-
-    init(targetIDs: Set<Int>) {
-        self.targetIDs = targetIDs
-    }
-
-    func response(for id: Int) -> [String: Any]? {
-        queue.sync { storedResponses[id] }
-    }
-
-    func append(_ data: Data) {
-        queue.async {
-            self.buffer.append(data)
-            self.parseAvailableLines()
-        }
-    }
-
-    func wait(timeout: TimeInterval) -> Bool {
-        semaphore.wait(timeout: .now() + timeout) == .success
-    }
-
-    private func parseAvailableLines() {
-        while let newlineRange = buffer.firstRange(of: Data("\n".utf8)) {
-            let line = buffer.subdata(in: buffer.startIndex..<newlineRange.lowerBound)
-            buffer.removeSubrange(buffer.startIndex..<newlineRange.upperBound)
-
-            guard !line.isEmpty else { continue }
-            guard let object = try? JSONSerialization.jsonObject(with: line, options: []),
-                  let message = object as? [String: Any]
-            else { continue }
-
-            if let id = message["id"] as? NSNumber, targetIDs.contains(id.intValue) {
-                storedResponses[id.intValue] = message
-                if !didSignal && storedResponses.count == targetIDs.count {
-                    didSignal = true
-                    semaphore.signal()
-                }
-            }
-        }
-    }
-}
-
 // MARK: - Store / refresh lifecycle
 
 @MainActor
@@ -906,12 +663,30 @@ final class RateLimitStore {
         scheduleTimer()
     }
 
+    /// 错峰相位（基准 5 分钟档位下的秒偏移）：Codex 主链路 0s，其余 store 依次错开。
+    private static let refreshPhaseOffset: TimeInterval = 0
+    /// 相位锚点（store 创建时刻）；改档位重建定时器后相位关系保持不变。
+    private let refreshAnchor = Date()
+
     private func scheduleTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let interval = refreshInterval
+        let fireDelay = RefreshPhasePlanner.nextDelay(
+            offset: Self.refreshPhaseOffset,
+            interval: interval,
+            anchor: refreshAnchor
+        )
+        let timer = Timer(
+            fire: Date(timeIntervalSinceNow: fireDelay),
+            interval: interval,
+            repeats: true
+        ) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh(force: false)
             }
         }
+        timer.tolerance = RefreshPhasePlanner.tolerance(for: interval)
+        RunLoop.main.add(timer, forMode: .default)
+        self.timer = timer
     }
 
     func setAccountID(_ accountID: String?) {
@@ -1124,7 +899,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let codeBuddyStore = CodeBuddyStore()
     private let codeBuddyCNStore = CodeBuddyStore(
         domain: CodeBuddyCookieImporter.domesticDomain,
-        client: CodeBuddyClient(endpoints: .init(host: "www.codebuddy.cn")))
+        client: CodeBuddyClient(endpoints: .init(host: "www.codebuddy.cn")),
+        phaseOffset: 180)
     private var presentedResetScopeID: String?
     private let authManager = CodexAuthManager()
     private let reminderCenter = ReminderCenter()
@@ -1717,6 +1493,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         deepSeekStore.stop()
         codeBuddyStore.stop()
         codeBuddyCNStore.stop()
+        // 常驻 app-server 子进程随应用退出回收（CodexAppServerRestartService 的
+        // ppid 排除只保证它不被外部重启流程误杀，退出时仍需自己收尾）。
+        CodexAppServerSession.shared.invalidate()
     }
 
     @objc private func handleStatusItemClick(_ sender: Any?) {
@@ -2002,6 +1781,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         do {
             try authManager.switchAccount(to: fileName)
+            // app-server 启动时读取一次 auth.json，常驻会话持有的是旧账号凭证；
+            // 立即失效，让随后的 refresh(force: true) 透明重拉新进程读新凭证。
+            CodexAppServerSession.shared.invalidate()
             initializeAccountSwitcher()
 
             // 没有外部 Codex app-server 时不需要询问“立即重启”，直接提示用户启动 Codex。

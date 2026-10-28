@@ -48,12 +48,30 @@ final class DeepSeekStore {
         scheduleTimer()
     }
 
+    /// 错峰相位（基准 5 分钟档位下的秒偏移）：DeepSeek 在 Codex 后 90s。
+    private static let refreshPhaseOffset: TimeInterval = 90
+    /// 相位锚点（store 创建时刻）；改档位重建定时器后相位关系保持不变。
+    private let refreshAnchor = Date()
+
     private func scheduleTimer() {
-        timer = Timer.scheduledTimer(withTimeInterval: refreshInterval, repeats: true) { [weak self] _ in
+        let interval = refreshInterval
+        let fireDelay = RefreshPhasePlanner.nextDelay(
+            offset: Self.refreshPhaseOffset,
+            interval: interval,
+            anchor: refreshAnchor
+        )
+        let timer = Timer(
+            fire: Date(timeIntervalSinceNow: fireDelay),
+            interval: interval,
+            repeats: true
+        ) { [weak self] _ in
             Task { @MainActor in
                 self?.refresh()
             }
         }
+        timer.tolerance = RefreshPhasePlanner.tolerance(for: interval)
+        RunLoop.main.add(timer, forMode: .default)
+        self.timer = timer
     }
 
     /// 手动 / 自动刷新共用入口：导入 token → 请求余额与用量 → 组装快照。
