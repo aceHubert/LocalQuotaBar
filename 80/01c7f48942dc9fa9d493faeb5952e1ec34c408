@@ -1,0 +1,123 @@
+Sources/LocalQuotaBar/zcode/ZCodeUsageDB.swift
+  s_f42dddc4f3c0b6::t_77f5da14e8a94b 291,293,296,299,301-302,313,316-325,327-333,338
+  s_f42dddc4f3c0b6::t_38a057035984dd 290,292
+  s_f42dddc4f3c0b6::t_1568b3ae471d02 159-171,177
+  s_f42dddc4f3c0b6::t_b8c916aa2f7d88 151-152,155-158
+  s_f42dddc4f3c0b6::t_029ac384a4b35f 153-154
+  s_f42dddc4f3c0b6::t_085ec57e00fdea 326
+Sources/LocalQuotaBar/ui/DailyUsageChartView.swift
+  s_f42dddc4f3c0b6::t_274430af0f3f98 35
+  s_f42dddc4f3c0b6::t_bf8327c16013ec 274
+Sources/LocalQuotaBar/codebuddy/CodeBuddyClient.swift
+  s_3e8b561a6e18ae::t_c5bd7e0c505e92 128-129
+  s_3e8b561a6e18ae::t_d3953fe1c550bb 134-135
+  s_3e8b561a6e18ae::t_132ef177026383 1,6-16
+  s_3e8b561a6e18ae::t_709233a04a1af7 219,221
+  s_3e8b561a6e18ae::t_f7f8526e71e6a0 98-106
+  s_3e8b561a6e18ae::t_b66c14894f2cf9 185-188,191,196
+  s_3e8b561a6e18ae::t_01c2840a39a7fe 189-190
+  s_3e8b561a6e18ae::t_d5f36e6912e35c 121-122
+  s_3e8b561a6e18ae::t_cd1f03157a14c6 195,197
+  s_3e8b561a6e18ae::t_6c2a78e803bb73 220
+  s_3e8b561a6e18ae::t_9f130fcd589aa2 108-109,112-120,123-127,130-133,136-137
+  s_3e8b561a6e18ae::t_6ba6e7b1b8e30e 17
+docs/histories/2026-10/20261030-1618-codebuddy-401-selfheal.md
+  s_3e8b561a6e18ae::t_7a7e415bf3824e 1-65
+Tests/LocalQuotaBarTests/CodeBuddyStoreTests.swift
+  s_ceebbf75dc173a::t_ec11ee4a5340eb 1-32
+docs/histories/2026-11/20261101-1827-zai-plan-usage-split.md
+  s_f42dddc4f3c0b6::t_97c390d8d2ddc7 31-32
+  s_f42dddc4f3c0b6::t_8006dd96048025 39-42,48-49,53,55-56
+  s_f42dddc4f3c0b6::t_499c7f4d035c6e 1-24,26-30,33-38,43-47,50-52,54,57-63
+  s_f42dddc4f3c0b6::t_52deb5b57867da 25
+Sources/LocalQuotaBar/codebuddy/CodeBuddyCookieImporter.swift
+  s_ceebbf75dc173a::t_03392b24a9f47b 2,61-66,98-145,149
+  s_ceebbf75dc173a::t_f7cb56fa6092a8 146-148
+  s_ceebbf75dc173a::t_262b2df89a3c0d 150
+docs/histories/2026-11/20261111-0941-zcode-credential-keychain.md
+  s_3173644713eddb::t_ee17d4478a0219 17,19,27,34-35,39-41
+  s_3173644713eddb::t_d5b05dedc27512 1-16,18,20-26,28-33,36-38
+Tests/LocalQuotaBarTests/CodeBuddyCookieImporterTests.swift
+  s_ceebbf75dc173a::t_e9d7452df30fff 2,17-23,27-34,36-44,46-72
+  s_ceebbf75dc173a::t_7781fb51442003 24-26
+  s_ceebbf75dc173a::t_5e6f84f6e8f350 8-16,35,45
+docs/histories/2026-10/20261028-1144-release-auto-version.md
+  s_12900010116ebb::t_68ebb3340456e6 39-40,44
+Sources/LocalQuotaBar/ui/ProviderPanelSections.swift
+  s_f42dddc4f3c0b6::t_e8895ed84162eb 425
+  s_f42dddc4f3c0b6::t_4e8edf69b0ba43 426-427
+Tests/LocalQuotaBarTests/ZAICredentialCipherTests.swift
+  s_3173644713eddb::t_0e22690eec9291 1-30,51-84,108-121
+  s_3173644713eddb::t_b12c2ca5358720 31-50
+  s_3173644713eddb::t_c913ac5238aee6 85-107
+docs/histories/2026-10/20261028-1510-split-auto-tag-release.md
+  s_12900010116ebb::t_fdc1542abcc965 1-49
+docs/histories/2026-11/20261109-0951-codebuddy-chrome-cookie-refresh.md
+  s_ceebbf75dc173a::t_c0ea3042477e74 1-42
+Sources/LocalQuotaBar/zcode/ZAICredentialCipher.swift
+  s_3173644713eddb::t_8584ccc641dd7d 1-4,6-9,15-35,37-38,40-60,85-96,105-167
+  s_3173644713eddb::t_785f064b49f7c5 5,97-104
+  s_3173644713eddb::t_9ad5725ac1d0f7 10-14,36,39,61-84
+Sources/LocalQuotaBar/codebuddy/CodeBuddyStore.swift
+  s_ceebbf75dc173a::t_afe2f4ebc80b9a 21,58,97-99,101,114-118,122,139,141,148,151,157-168,171-172,175-177
+  s_ceebbf75dc173a::t_f9c05a7ed1ab4a 7-10,12,14,37-41,46-47,96,107-108
+  s_ceebbf75dc173a::t_0d34584f3c2cb6 13
+  s_3e8b561a6e18ae::t_a25c179334ba7a 113,125-127,138,140,142,155-156,169-170,173-174,178
+  s_ceebbf75dc173a::t_d3b875e37c2fb7 179
+Sources/LocalQuotaBar/main.swift
+  s_f42dddc4f3c0b6::t_cccb44f826a732 1128,1131,1135-1136,1139-1143,1152,1154-1158
+  s_f42dddc4f3c0b6::t_89323150f4cdef 1130,1132-1134,1144-1151,1153,1159
+  s_f42dddc4f3c0b6::t_9d9f71434ee7ef 1160
+  s_f42dddc4f3c0b6::t_e5e89eb6d16283 1129
+Sources/LocalQuotaBar/zcode/ZAIQuota.swift
+  s_3173644713eddb::t_b112155cba516a 401,410,675-676,705,711,779
+  s_3173644713eddb::t_0a6408a457f4ef 396,572,665,671-674,677-681,695,701,706,735,767,776,780-781,788
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "8001c7f48942dc9fa9d493faeb5952e1ec34c408",
+  "prompts": {},
+  "sessions": {
+    "s_12900010116ebb": {
+      "agent_id": {
+        "tool": "zcode",
+        "id": "session_11b1f2d97afb07e71f6ea6ad1bafc193",
+        "model": "GLM-5.3"
+      },
+      "human_author": "hubert <hubert@lejian.com>"
+    },
+    "s_3173644713eddb": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1c83c-c58e-7c41-8090-7c59bfe8ce9c",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "hubert <hubert@lejian.com>"
+    },
+    "s_3e8b561a6e18ae": {
+      "agent_id": {
+        "tool": "zcode",
+        "id": "sess_23a36796-9908-47b1-99d5-4467758f17bc",
+        "model": "GLM-5.3"
+      },
+      "human_author": "hubert <hubert@lejian.com>"
+    },
+    "s_ceebbf75dc173a": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a1bdfa-4526-7c62-82f4-512244fc36d3",
+        "model": "gpt-6.1-sol"
+      },
+      "human_author": "hubert <hubert@lejian.com>"
+    },
+    "s_f42dddc4f3c0b6": {
+      "agent_id": {
+        "tool": "zcode",
+        "id": "sess_bc941653-d631-4d96-8956-ca11d29e3ac2",
+        "model": "GLM-5.3"
+      },
+      "human_author": "hubert <hubert@lejian.com>"
+    }
+  }
+}
