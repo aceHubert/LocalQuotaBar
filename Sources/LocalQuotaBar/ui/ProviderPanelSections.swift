@@ -422,7 +422,9 @@ final class ZAIPanelSection: NSView {
         resetCards = snapshot?.resetCreditCards ?? []
         renderResetCards(rebuild: true)
 
-        // 本机日用量是全渠道统计，不受 API Key 是否支持余额查询限制。
+        // 日用量图不受 API Key 是否支持余额查询限制；数据口径由接线层
+        // 按套餐视图决定（API Key = 本机全渠道，start-plan = 本机套餐渠道，
+        // coding-plan = 服务端套餐 + 本机第三方）。
         section.usageChart.isHidden = false
         let modeHint: String?
         switch kind {

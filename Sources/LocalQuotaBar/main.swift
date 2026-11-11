@@ -1125,30 +1125,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Z.AI 用量组合（服务端套餐 + 本机非套餐，不双计）
+    // MARK: - Z.AI 用量组合（套餐视图各自的口径，互不混入对方套餐）
 
-    /// coding-plan 模式：总量 = 服务端套餐日桶（账号维度、全设备，已含本机套餐
-    /// 部分）+ 本机非套餐渠道日桶；叠加高亮 = 服务端套餐。其余模式仅本机全渠道。
-    /// 服务端缓存未建立时展示空图，不回落全渠道。
+    /// 用量图按套餐视图分流：
+    /// - coding-plan：总量 = 服务端套餐日桶（账号维度、全设备，已含本机套餐部分）
+    ///   + 本机第三方渠道日桶；叠加高亮 = 服务端套餐（绿 = 套餐、橙 = 第三方）。
+    /// - start-plan：仅本机体验套餐渠道，单色总量、不叠加（体验套餐无服务端
+    ///   时序接口，图表只反映本机 CLI 消耗；订阅与第三方渠道均不混入）。
+    /// - API Key / 其他：仅本机全渠道（单色）。
+    /// 对应数据源未就绪时展示空图，不回落全渠道。
     private func recomputeZAIUsage() {
         guard let selection = ZAISettings.resolveProviderSelection() else { return }
-        guard selection.kind == .codingPlan else {
+        switch selection.kind {
+        case .codingPlan:
+            guard let serverDays = zaiServerUsageStore.last30DayUsage() else {
+                quotaViewController.applyZAIUsage(nil, channelDays: nil)
+                return
+            }
+            let thirdPartyByDay = Dictionary(
+                (zaiUsageStore.thirdPartyDays ?? []).map { (ZAIServerUsageCacheLogic.dayKey($0.date), $0.tokens) },
+                uniquingKeysWith: { first, _ in first }
+            )
+            let combined = serverDays.map { day -> DayUsage in
+                let key = ZAIServerUsageCacheLogic.dayKey(day.date)
+                return DayUsage(date: day.date, tokens: day.tokens + (thirdPartyByDay[key] ?? 0))
+            }
+            quotaViewController.applyZAIUsage(combined, channelDays: serverDays)
+        case .startPlan:
+            guard let startPlanDays = zaiUsageStore.startPlanDays else {
+                quotaViewController.applyZAIUsage(nil, channelDays: nil)
+                return
+            }
+            quotaViewController.applyZAIUsage(startPlanDays, channelDays: nil)
+        case .apiKey:
             quotaViewController.applyZAIUsage(zaiUsageStore.days, channelDays: nil)
-            return
         }
-        guard let serverDays = zaiServerUsageStore.last30DayUsage() else {
-            quotaViewController.applyZAIUsage(nil, channelDays: nil)
-            return
-        }
-        let thirdPartyByDay = Dictionary(
-            (zaiUsageStore.thirdPartyDays ?? []).map { (ZAIServerUsageCacheLogic.dayKey($0.date), $0.tokens) },
-            uniquingKeysWith: { first, _ in first }
-        )
-        let combined = serverDays.map { day -> DayUsage in
-            let key = ZAIServerUsageCacheLogic.dayKey(day.date)
-            return DayUsage(date: day.date, tokens: day.tokens + (thirdPartyByDay[key] ?? 0))
-        }
-        quotaViewController.applyZAIUsage(combined, channelDays: serverDays)
     }
 
     // MARK: - 周配速图接线（额度刷新与用量刷新任一到达都重算）

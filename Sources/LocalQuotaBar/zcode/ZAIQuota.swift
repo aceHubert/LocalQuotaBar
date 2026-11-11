@@ -1,4 +1,3 @@
-import CryptoKit
 import Foundation
 
 // MARK: - ZAI 配额数据模型
@@ -394,16 +393,12 @@ enum ZAISettings {
     /// 否则 JWT 无法解析时会形成递归调用。
     static func currentAccountIdentity() -> String? {
         let domain = (loadSettingObject()?["providerFamilyDomain"] as? String) ?? "zai"
-        guard let v2 = zcodeV2URL,
-              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else { return nil }
-        let cipher = ZAICredentialCipher()
+        guard let object = loadCredentialObject() else { return nil }
         // 与 loadCredentials 的键选择保持一致：先精确 domain，再回退 zai。
         let encryptedUser = object["oauth:\(domain):user_info"] ?? object["oauth:zai:user_info"]
         if let encryptedUser,
            !encryptedUser.isEmpty,
-           let plain = try? cipher.decrypt(encryptedUser),
+           let plain = try? credentialCipher.decrypt(encryptedUser),
            let jsonData = plain.data(using: .utf8),
            let userInfo = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
            let identity = accountIdentity(from: userInfo) {
@@ -412,7 +407,7 @@ enum ZAISettings {
         let encryptedToken = object["oauth:\(domain):access_token"] ?? object["oauth:zai:access_token"]
         if let encryptedToken,
            !encryptedToken.isEmpty,
-           let token = try? cipher.decrypt(encryptedToken),
+           let token = try? credentialCipher.decrypt(encryptedToken),
            let subject = tokenSubject(token) {
             return "sub:\(subject)"
         }
@@ -574,10 +569,7 @@ enum ZAISettings {
     }
 
     static func hasOAuthCredential(domain: String) -> Bool {
-        guard let v2 = zcodeV2URL,
-              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else { return false }
+        guard let object = loadCredentialObject() else { return false }
         return hasOAuthCredential(object: object, domain: domain)
     }
 
@@ -670,10 +662,21 @@ enum ZAISettings {
         return mode == "oauth" ? .codingPlan : .apiKey
     }
 
-    private static var zcodeV2URL: URL? {
+    private static var zcodeV2URL: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".zcode", isDirectory: true)
             .appendingPathComponent("v2", isDirectory: true)
+    }
+
+    private static var credentialsURL: URL {
+        zcodeV2URL.appendingPathComponent("credentials.json")
+    }
+
+    private static let credentialCipher = ZAICredentialCipher(credentialsURL: credentialsURL)
+
+    private static func loadCredentialObject() -> [String: String]? {
+        guard let data = try? Data(contentsOf: credentialsURL) else { return nil }
+        return try? JSONSerialization.jsonObject(with: data) as? [String: String]
     }
 
     private static var settingURLs: [URL] {
@@ -689,33 +692,23 @@ enum ZAISettings {
     /// 文件监控实际关注的文件，固定顺序（stamps 数组按此对齐）：
     /// setting.json 兼容根目录与 v2 两处，credentials.json 只存在于 v2。
     static var settingsFileURLs: [URL] {
-        var urls = settingURLs
-        if let v2 = zcodeV2URL {
-            urls.append(v2.appendingPathComponent("credentials.json"))
-        }
-        return urls
+        settingURLs + [credentialsURL]
     }
 
     /// 从 credentials.json 解密出 OAuth access token 与用户信息。
     /// bigmodel 渠道优先找 oauth:bigmodel:*，回退 oauth:zai:*（两渠道共用 zai OAuth 的历史布局）。
     static func loadCredentials(domain: String = "zai", allowZaiFallback: Bool = true) throws -> (accessToken: String, userInfo: [String: Any]?) {
-        guard let v2 = zcodeV2URL else { throw ZAIQuotaError.credentialsMissing }
-        let credsURL = v2.appendingPathComponent("credentials.json")
-        guard let data = try? Data(contentsOf: credsURL),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String]
-        else { throw ZAIQuotaError.credentialsMissing }
-
-        let cipher = ZAICredentialCipher()
-
+        guard let object = loadCredentialObject() else { throw ZAIQuotaError.credentialsMissing }
         let encryptedToken = object["oauth:\(domain):access_token"]
             ?? (allowZaiFallback ? object["oauth:zai:access_token"] : nil) ?? ""
         guard !encryptedToken.isEmpty else { throw ZAIQuotaError.credentialsMissing }
-        let token = try cipher.decrypt(encryptedToken)
+        let token = try credentialCipher.decrypt(encryptedToken)
+        guard !token.isEmpty else { throw ZAIQuotaError.credentialsMissing }
 
         var userInfo: [String: Any]?
         let encryptedUser = object["oauth:\(domain):user_info"] ?? (allowZaiFallback ? object["oauth:zai:user_info"] : nil)
         if let encryptedUser, !encryptedUser.isEmpty {
-            if let plain = try? cipher.decrypt(encryptedUser),
+            if let plain = try? credentialCipher.decrypt(encryptedUser),
                let jsonData = plain.data(using: .utf8),
                let parsed = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
                 userInfo = parsed
@@ -739,8 +732,7 @@ enum ZAISettings {
 
     /// 读取 config.json 中某个 provider 的配置块。
     static func providerConfig(_ providerID: String) -> [String: Any]? {
-        guard let v2 = zcodeV2URL,
-              let data = try? Data(contentsOf: v2.appendingPathComponent("config.json")),
+        guard let data = try? Data(contentsOf: zcodeV2URL.appendingPathComponent("config.json")),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let provider = object["provider"] as? [String: Any]
         else { return nil }
@@ -772,6 +764,7 @@ enum ZAISettings {
     /// 回退解密 credentials.json 的 zcodejwttoken。
     static func loadStartPlanToken(domain: String) throws -> String {
         if let jwt = providerAPIKey("builtin:\(domain)-start-plan"),
+           !jwt.hasPrefix("enc:"),
            jwt.split(separator: ".").count == 3 {
             return jwt
         }
@@ -780,20 +773,19 @@ enum ZAISettings {
 
     /// coding-plan 重置额度接口的凭证之一：credentials.json 的 zcodejwttoken。
     static func loadZCodeJWTToken() throws -> String {
-        guard let v2 = zcodeV2URL,
-              let data = try? Data(contentsOf: v2.appendingPathComponent("credentials.json")),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+        guard let object = loadCredentialObject(),
               let encrypted = object["zcodejwttoken"], !encrypted.isEmpty
         else { throw ZAIQuotaError.credentialsMissing }
-        return try ZAICredentialCipher().decrypt(encrypted)
+        let token = try credentialCipher.decrypt(encrypted)
+        guard !token.isEmpty else { throw ZAIQuotaError.credentialsMissing }
+        return token
     }
 
     /// 设备标识（对齐 zcode.cjs 的 readExistingDeviceMid）：
     /// 读 ~/.zcode/v2/telemetry-state.json 的 deviceMid，只读不生成。
     /// zcode.z.ai 网关对缺该头的 billing/balance 返回 400 "parameter error"。
     static func loadDeviceMid() -> String? {
-        guard let v2 = zcodeV2URL,
-              let data = try? Data(contentsOf: v2.appendingPathComponent("telemetry-state.json")),
+        guard let data = try? Data(contentsOf: zcodeV2URL.appendingPathComponent("telemetry-state.json")),
               let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mid = object["deviceMid"] as? String
         else { return nil }
@@ -807,55 +799,6 @@ enum ZAISettings {
         let parts = selectedKey.split(separator: ":").map(String.init)
         guard parts.count >= 2 else { return "builtin:\(domain)" }
         return parts[1...].joined(separator: ":")
-    }
-}
-
-/// 与 zcode.cjs 对齐的 AES-256-GCM 凭证加解密。
-/// Key 派生：sha256("zcode-credential-fallback:<platform>:<homedir>:<username>")。
-/// 密文格式：enc:v1:<iv>.<authTag>.<ciphertext>（均为 base64url）。
-struct ZAICredentialCipher {
-    private let key: SymmetricKey
-
-    init() {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let username = NSUserName()
-        let platform = "darwin"
-        let fallback = "zcode-credential-fallback:\(platform):\(home):\(username)"
-        let configuredSecret = ProcessInfo.processInfo.environment["ZCODE_CREDENTIAL_SECRET"]?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let secret = configuredSecret?.isEmpty == false ? configuredSecret! : fallback
-        let digest = SHA256.hash(data: Data(secret.utf8))
-        key = SymmetricKey(data: Data(digest))
-    }
-
-    func decrypt(_ value: String) throws -> String {
-        let prefix = "enc:v1:"
-        guard value.hasPrefix(prefix) else { return value }
-        let body = String(value.dropFirst(prefix.count))
-        let parts = body.split(separator: ".").map(String.init)
-        guard parts.count == 3,
-              let iv = Data(base64URLEncoded: parts[0]),
-              let tag = Data(base64URLEncoded: parts[1]),
-              let ciphertext = Data(base64URLEncoded: parts[2])
-        else { throw ZAIQuotaError.decryptionFailed("invalid ciphertext") }
-
-        let sealed = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: iv),
-                                           ciphertext: ciphertext,
-                                           tag: tag)
-        let plaintext = try AES.GCM.open(sealed, using: key)
-        return String(data: plaintext, encoding: .utf8) ?? ""
-    }
-}
-
-private extension Data {
-    /// 解析 base64url（RFC 4648 §5），对齐 zcode 的 IV/tag/ciphertext 编码。
-    init?(base64URLEncoded input: String) {
-        var s = input
-            .replacingOccurrences(of: "-", with: "+")
-            .replacingOccurrences(of: "_", with: "/")
-        let pad = (4 - s.count % 4) % 4
-        if pad > 0 { s.append(String(repeating: "=", count: pad)) }
-        guard let data = Data(base64Encoded: s) else { return nil }
-        self = data
     }
 }
 

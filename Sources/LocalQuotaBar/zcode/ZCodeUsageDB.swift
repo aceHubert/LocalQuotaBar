@@ -148,17 +148,33 @@ enum ZCodeUsageDB {
         }
     }
 
-    /// 近 30 天"排除套餐渠道"的日聚合（本机非套餐 = 自定义 UUID provider、
-    /// API Key 模式与 start-plan 等本机渠道；本机套餐部分已含在服务端口径，
-    /// 排除以避免双计）。排除集合用域内宽松匹配 `provider_id LIKE '%coding-plan'`
-    /// （覆盖 builtin:/account: 双前缀形态，且不误伤 `-start-plan`）。
-    static func last30DaysExcludingCodingPlan() -> [DayUsage]? {
+    /// 近 30 天"第三方渠道"的日聚合：本机非任何 Z.AI 套餐的用量（自定义 UUID
+    /// provider、API Key 模式、deepseek 等）。套餐渠道全部排除——coding-plan
+    /// 订阅部分已含在服务端口径（避免双计），start-plan 部分属于体验套餐视图，
+    /// 都不能算"第三方"。宽松匹配覆盖 builtin:/account: 双前缀形态。
+    static func last30DaysThirdParty() -> [DayUsage]? {
+        last30DaysFiltered(
+            "provider_id NOT LIKE '%coding-plan' AND provider_id NOT LIKE '%start-plan'"
+        )
+    }
+
+    /// 近 30 天 start-plan 渠道的日聚合（体验套餐视图专用）。宽松匹配
+    /// `provider_id LIKE '%start-plan'`（覆盖 builtin:/account: 双前缀形态）；
+    /// 订阅（coding-plan）用量属于另一套餐视图，不得混入——否则体验套餐
+    /// 视图的图表会被订阅用量主导，看起来"就是订阅的数据"。
+    static func last30DaysStartPlan() -> [DayUsage]? {
+        last30DaysFiltered("provider_id LIKE '%start-plan'")
+    }
+
+    /// 按渠道谓词过滤的近 30 天日聚合（30 天对齐、缺日补 0；读库失败为 nil）。
+    /// 谓词仅限本文件内的字面量，不接收外部输入，无注入面。
+    private static func last30DaysFiltered(_ providerPredicate: String) -> [DayUsage]? {
         let rows = query(
             sql: """
             SELECT date(started_at / 1000, 'unixepoch', 'localtime') AS day,
                    SUM(computed_total_tokens) AS tokens
             FROM model_usage
-            WHERE started_at >= ? AND provider_id NOT LIKE '%coding-plan'
+            WHERE started_at >= ? AND \(providerPredicate)
             GROUP BY day
             """,
             binds: [.double(thirtyDaysAgoMs())]
@@ -271,15 +287,19 @@ struct ChannelSplitDayUsage: Equatable {
 }
 
 /// Z.AI 用量 Store：本地 SQLite 快查，每次额度刷新后重查。
-/// coding-plan 模式只查"排除套餐渠道"的本机非套餐日用量（本机套餐部分已含在
-/// 服务端套餐口径里，避免双计）；其余模式查询本机全渠道。
+/// 套餐视图各自只认自己的渠道，两个套餐互不混入：
+/// - coding-plan：本机第三方日用量（订阅部分由服务端 credit-usage 口径提供）；
+/// - start-plan：本机体验套餐渠道（单色展示，不叠加第三方）；
+/// - 其余模式：本机全渠道。
 @MainActor
 final class ZAIUsageStore {
-    /// 全渠道 30 天日桶（非 coding-plan 模式使用）。
+    /// 全渠道 30 天日桶（API Key / 未知模式使用）。
     private(set) var days: [DayUsage]?
     private(set) var splitDays: [ChannelSplitDayUsage]?
-    /// coding-plan 模式的本机非套餐日用量（30 天对齐、缺日补 0；读库失败为 nil）。
+    /// 套餐视图共用的本机第三方日用量（30 天对齐、缺日补 0；读库失败为 nil）。
     private(set) var thirdPartyDays: [DayUsage]?
+    /// start-plan 视图的体验套餐渠道日用量（口径同上）。
+    private(set) var startPlanDays: [DayUsage]?
     private var isRefreshing = false
     private var isPaceRefreshing = false
 
@@ -290,15 +310,32 @@ final class ZAIUsageStore {
     func refresh() {
         guard !isRefreshing else { return }
         isRefreshing = true
-        let isCodingPlan = ZAISettings.resolveProviderSelection()?.kind == .codingPlan
+        let kind = ZAISettings.resolveProviderSelection()?.kind
 
         Task.detached(priority: .utility) { [weak self] in
-            let thirdParty = isCodingPlan ? ZCodeUsageDB.last30DaysExcludingCodingPlan() : nil
-            let allChannels = isCodingPlan ? nil : ZCodeUsageDB.last30Days()
+            // 订阅/体验两个套餐视图互不混入对方的渠道；第三方两边都叠加。
+            let thirdParty: [DayUsage]?
+            let startPlan: [DayUsage]?
+            let allChannels: [DayUsage]?
+            switch kind {
+            case .codingPlan:
+                thirdParty = ZCodeUsageDB.last30DaysThirdParty()
+                startPlan = nil
+                allChannels = nil
+            case .startPlan:
+                thirdParty = nil
+                startPlan = ZCodeUsageDB.last30DaysStartPlan()
+                allChannels = nil
+            case .apiKey, nil:
+                thirdParty = nil
+                startPlan = nil
+                allChannels = ZCodeUsageDB.last30Days()
+            }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isRefreshing = false
                 self.thirdPartyDays = thirdParty
+                self.startPlanDays = startPlan
                 self.days = allChannels
                 self.splitDays = nil
                 self.onChange?(allChannels, nil)

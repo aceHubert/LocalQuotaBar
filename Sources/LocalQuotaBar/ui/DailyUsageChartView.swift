@@ -32,7 +32,7 @@ struct ChartBarLayout: Equatable {
 
 /// 30 根细柱 + 日均值 + 周刻度 + 今日高亮；hover 显示某天明细。
 /// Z.AI 实例传入渠道拆分数据后支持「总量 / 叠加」两种显示：叠加模式下柱子
-/// 下段为套餐（服务端 credit-usage，全设备，绿），上段为本机非套餐渠道（橙），
+/// 下段为套餐（服务端 credit-usage，全设备，绿），上段为本机第三方渠道（橙），
 /// 两段不重叠、总计即账号全部消耗；Codex 实例维持总量单色。
 enum UsageDisplayMode: String {
     case total
@@ -271,7 +271,7 @@ final class DailyUsageChartView: NSView {
                 continue
             }
 
-            // 叠加：下段套餐（服务端、全设备，绿），上段本机非套餐渠道（橙）。
+            // 叠加：下段套餐（服务端、全设备，绿），上段本机第三方渠道（橙）。
             // 两段不重叠，柱高 = 总计（账号全部消耗），总量/叠加模式可直观对照。
             let channelTokens = min(channelTokensByDay?[day.date] ?? 0, day.tokens)
             let totalHeight = max(2, rect.height * CGFloat(day.tokens / maxTokens))

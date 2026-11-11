@@ -1,6 +1,19 @@
+import CryptoKit
 import Foundation
 
 // MARK: - CodeBuddy 个人中心资源接口（国际版 www.codebuddy.ai / 国内版 www.codebuddy.cn）
+
+/// 刷新链路诊断日志：只输出状态码与 Cookie 指纹（SHA256 前 16 位），不落任何凭证。
+enum CodeBuddyDiagnostics {
+    static func cookieFingerprint(_ header: String) -> String {
+        let digest = SHA256.hash(data: Data(header.utf8))
+        return digest.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func log(_ message: String) {
+        NSLog("[CodeBuddy] \(message)")
+    }
+}
 
 /// 本机 Chrome 版本检测：会话 Cookie 绑定登录浏览器的 UA 版本，
 /// 网关按 UA 版本校验会话（Chrome 升级后旧版本号会被判 401），因此 UA 不能写死版本。
@@ -82,14 +95,46 @@ final class CodeBuddyClient {
         self.chromeMajorVersion = chromeMajorVersion
     }
 
+    /// 会话失效重试专用配置：全新连接池，且完全关闭 Cookie 自动处理（不读不存）。
+    static func recoveryConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.httpCookieStorage = nil
+        return configuration
+    }
+
     /// 一次完整刷新：统一资源接口返回主套餐、购买积分和奖励包。
+    /// 401/403 时先用全新 ephemeral 会话重试一次（全新连接池、空 Cookie 存储与缓存，
+    /// 等价于进程内重启传输层），规避共享 URLSession 长命状态钉住旧会话导致的持续 401。
     func fetchSnapshot(cookieHeader: String, profileID: String, profileName: String) async throws -> CodeBuddySnapshot {
         let fetchedAt = now()
-        let responseBody = try await post(
-            endpoints.resource,
-            cookieHeader: cookieHeader,
-            body: resourceRequestBody(at: fetchedAt)
-        )
+        let body = resourceRequestBody(at: fetchedAt)
+        let fingerprint = CodeBuddyDiagnostics.cookieFingerprint(cookieHeader)
+
+        let responseBody: [String: Any]
+        do {
+            responseBody = try await post(
+                endpoints.resource,
+                cookieHeader: cookieHeader,
+                body: body,
+                session: session,
+                attempt: "shared"
+            )
+        } catch CodeBuddyAPIError.sessionExpired(let host, let detail) {
+            CodeBuddyDiagnostics.log(
+                "host=\(host) 主会话\(detail) cookie=\(fingerprint)，ephemeral 会话重试"
+            )
+            let recovery = URLSession(configuration: Self.recoveryConfiguration())
+            defer { recovery.finishTasksAndInvalidate() }
+            responseBody = try await post(
+                endpoints.resource,
+                cookieHeader: cookieHeader,
+                body: body,
+                session: recovery,
+                attempt: "ephemeral"
+            )
+        }
         let resources = try CodeBuddyParser.parseResource(json: responseBody)
 
         return CodeBuddySnapshot(
@@ -137,10 +182,19 @@ final class CodeBuddyClient {
         "\"Chromium\";v=\"\(chromeMajor)\", \"Google Chrome\";v=\"\(chromeMajor)\", \"Not A(Brand\";v=\"99\""
     }
 
-    private func post(_ url: URL, cookieHeader: String, body: [String: Any]) async throws -> [String: Any] {
+    private func post(
+        _ url: URL,
+        cookieHeader: String,
+        body: [String: Any],
+        session: URLSession,
+        attempt: String
+    ) async throws -> [String: Any] {
         let chromeMajor = chromeMajorVersion() ?? Self.fallbackChromeMajorVersion
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // Cookie 完全由导入值决定：关闭请求级自动 Cookie 处理，
+        // 防止响应 Set-Cookie 写入共享存储后干扰后续请求（实测会发生）。
+        request.httpShouldHandleCookies = false
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json, text/plain, */*", forHTTPHeaderField: "Accept")
         request.setValue("web", forHTTPHeaderField: "X-Client-Platform")
@@ -162,6 +216,9 @@ final class CodeBuddyClient {
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status == 401 || status == 403 {
             // 当前接口在有效登录态下不会返回 401；走到这里视为该站点会话失效。
+            CodeBuddyDiagnostics.log(
+                "host=\(endpoints.host) status=\(status) cookie=\(CodeBuddyDiagnostics.cookieFingerprint(cookieHeader)) session=\(attempt)"
+            )
             throw CodeBuddyAPIError.sessionExpired(host: endpoints.host, detail: "HTTP \(status)")
         }
         guard (200..<300).contains(status) else {

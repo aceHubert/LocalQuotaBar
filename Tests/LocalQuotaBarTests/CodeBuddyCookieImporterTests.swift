@@ -1,9 +1,75 @@
 import Foundation
+import SQLite3
 import SweetCookieKit
 import XCTest
 @testable import LocalQuotaBar
 
 final class CodeBuddyCookieImporterTests: XCTestCase {
+    func testSnapshotReadsCommittedCookieFromRollbackJournalDatabase() throws {
+        try assertSnapshotReadsNewSession(journalMode: "DELETE")
+    }
+
+    func testSnapshotReadsCommittedCookieFromWAL() throws {
+        try assertSnapshotReadsNewSession(journalMode: "WAL")
+    }
+
+    private func assertSnapshotReadsNewSession(journalMode: String) throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let source = directory.appendingPathComponent("Cookies")
+        var writer: OpaquePointer?
+        defer { sqlite3_close(writer) }
+        guard sqlite3_open(source.path, &writer) == SQLITE_OK else {
+            return XCTFail("无法创建临时 SQLite 数据库")
+        }
+        let store = BrowserCookieStore(
+            browser: .chrome,
+            profile: BrowserProfile(id: "Default", name: "Default"),
+            kind: .primary,
+            label: "Chrome Default",
+            databaseURL: source
+        )
+        let prepare = """
+            PRAGMA journal_mode=\(journalMode);
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE cookies (name TEXT PRIMARY KEY, value TEXT);
+            INSERT INTO cookies VALUES ('session', 'old');
+            PRAGMA wal_checkpoint(TRUNCATE);
+            BEGIN;
+            UPDATE cookies SET value = 'new' WHERE name = 'session';
+            """
+        XCTAssertEqual(sqlite3_exec(writer, prepare, nil, nil, nil), SQLITE_OK)
+
+        // Chrome 仍持有数据库连接。提交前保持旧值，提交后立即读到新值。
+        XCTAssertEqual(try readSessionFromSnapshot(of: store), "old")
+        XCTAssertEqual(sqlite3_exec(writer, "COMMIT", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(try readSessionFromSnapshot(of: store), "new")
+    }
+
+    private func readSessionFromSnapshot(of store: BrowserCookieStore) throws -> String {
+        try CodeBuddyCookieImporter.withCookieStoreSnapshot(of: store) { readableStore in
+            let snapshot = try XCTUnwrap(readableStore.databaseURL)
+            XCTAssertNotEqual(snapshot, store.databaseURL)
+            XCTAssertEqual(readableStore.profile, store.profile)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: snapshot.path + "-wal"))
+
+            var db: OpaquePointer?
+            defer { sqlite3_close(db) }
+            XCTAssertEqual(sqlite3_open_v2(snapshot.path, &db, SQLITE_OPEN_READONLY, nil), SQLITE_OK)
+            var statement: OpaquePointer?
+            defer { sqlite3_finalize(statement) }
+            let sql = "SELECT value FROM cookies WHERE name = 'session'"
+            XCTAssertEqual(sqlite3_prepare_v2(db, sql, -1, &statement, nil), SQLITE_OK)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                XCTFail("快照缺少会话 Cookie")
+                return ""
+            }
+            return String(cString: try XCTUnwrap(sqlite3_column_text(statement, 0)))
+        }
+    }
+
     func testCookieHeaderKeepsTargetCookiesAndDeduplicatesBySpecificity() {
         let now = Date(timeIntervalSince1970: 1_790_000_000)
         let records = [
